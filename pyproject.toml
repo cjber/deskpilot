@@ -1,0 +1,24 @@
+[project]
+name = "deskpilot"
+version = "0.1.0"
+description = "Desktop control for agents on Hyprland: window-relative clicks and typing through a virtual uinput device"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["evdev>=1.7", "pillow>=10", "mcp>=2.3"]
+
+[project.scripts]
+deskpilot = "deskpilot.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
