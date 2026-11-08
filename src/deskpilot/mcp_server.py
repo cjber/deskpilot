@@ -1,0 +1,78 @@
+"""MCP server over stdio. One virtual input device lives for the whole session, so clicks skip the settle delay."""
+
+from __future__ import annotations
+
+from mcp.server.mcpserver import Image, MCPServer
+
+from .desk import Desk
+
+mcp = MCPServer("deskpilot")
+desk = Desk()
+
+
+@mcp.tool()
+def windows() -> list[dict]:
+    """List mapped windows: address, class, title, global position and size, focus."""
+    return [w.to_dict() for w in desk.windows()]
+
+
+@mcp.tool()
+def focus(window: str) -> dict:
+    """Focus a window by address, class, or a substring of class or title."""
+    return desk.focus(window).to_dict()
+
+
+@mcp.tool()
+def shot(window: str, max_width: int = 1400) -> Image:
+    """Screenshot a window. Later move/click/scroll points are pixels in this image."""
+    taken = desk.shot(window, max_width=max_width)
+    return Image(path=str(taken.path))
+
+
+@mcp.tool()
+def click(window: str, x: float, y: float, button: str = "left", double: bool = False) -> dict:
+    """Click a point given in pixels of the window's last screenshot."""
+    gx, gy = desk.click(window, x, y, button, 2 if double else 1)
+    return {"x": gx, "y": gy}
+
+
+@mcp.tool()
+def move(window: str, x: float, y: float) -> dict:
+    """Hover a point given in pixels of the window's last screenshot."""
+    gx, gy = desk.move(window, x, y)
+    return {"x": gx, "y": gy}
+
+
+@mcp.tool()
+def scroll(window: str, x: float, y: float, dy: int) -> dict:
+    """Scroll at a point of the window's last screenshot; positive dy scrolls up."""
+    gx, gy = desk.scroll(window, x, y, dy)
+    return {"x": gx, "y": gy}
+
+
+@mcp.tool()
+def key(combo: str, window: str | None = None) -> str:
+    """Press a key or chord such as Return, ctrl+a or alt+F4, focusing the window first if given."""
+    desk.key(combo, window)
+    return "ok"
+
+
+@mcp.tool()
+def type_text(text: str, window: str | None = None, delay: float = 0.03) -> str:
+    """Type text on a US layout. Use delay 0.1 or more for games."""
+    desk.type(text, window, delay)
+    return "ok"
+
+
+@mcp.tool()
+def wait_for(window: str, timeout: float = 60, gone: bool = False) -> dict | str:
+    """Wait for a window to appear, or with gone=True to close."""
+    win = desk.wait_for(window, timeout, gone)
+    return win.to_dict() if win else "gone"
+
+
+def serve() -> None:
+    try:
+        mcp.run()
+    finally:
+        desk.close()
