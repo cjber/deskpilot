@@ -8,6 +8,7 @@ set by the compositor (see hypr.Hyprland.move_cursor); this device only presses 
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 
 from . import keys
 
@@ -23,7 +24,7 @@ class VirtualInput:
 
         self._e = e
         key_codes = sorted({getattr(e, name) for name in BUTTONS.values()} | set(keys.all_codes()))
-        caps = {e.EV_KEY: key_codes, e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL]}
+        caps: dict[int, Sequence[int]] = {e.EV_KEY: key_codes, e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL]}
         self._ui = UInput(caps, name="deskpilot")
         time.sleep(settle)
 

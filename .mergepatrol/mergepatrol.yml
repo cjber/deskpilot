@@ -1,0 +1,20 @@
+# Mergepatrol reads this file from the default branch. The dashboard opens a PR to change it.
+version: 1
+label: mergepatrol
+batch_size: 4
+resolver:
+  provider: anthropic
+  model: claude-opus-5-5
+  effort: medium
+# Run in Mergepatrol's sandbox after an agent resolves a conflict or commits a fix, before anything is pushed.
+# They mirror CI's lint and test jobs. The job image has no uv, so the first command installs the version CI uses.
+verify:
+  - curl -LsSf https://astral.sh/uv/0.12.18/install.sh | sh
+  - ~/.local/bin/uv sync --locked
+  - ~/.local/bin/uv run --no-sync ruff check .
+  - ~/.local/bin/uv run --no-sync ruff format --check .
+  - ~/.local/bin/uv run --no-sync ty check
+  - ~/.local/bin/uv run --no-sync pytest -q
+fix_ci:
+  enabled: true
+  attempts: 2

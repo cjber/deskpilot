@@ -40,6 +40,12 @@ compositor treats as real hardware. Tools that synthesize input another way, suc
 uv tool install git+https://github.com/cjber/deskpilot
 ```
 
+The agent skill, which teaches an agent the steps below, installs in Claude Code with:
+
+```text
+/plugin install deskpilot --marketplace cjber/deskpilot
+```
+
 ## Use
 
 ```sh
@@ -89,3 +95,8 @@ claude mcp add deskpilot -- deskpilot mcp
 - Each CLI action that uses the input device opens a new one and waits about a second for libinput to add it. The MCP server
   avoids that wait.
 - Hyprland only, Linux only.
+
+## Development
+
+[AGENTS.md](AGENTS.md) has the checks, the layout and the rules a change must keep, and
+[CONTRIBUTING.md](CONTRIBUTING.md) how to report a bug or send a change.

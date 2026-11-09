@@ -1,0 +1,29 @@
+name: Bug
+description: deskpilot did the wrong thing
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what happened instead. A click or key that reached the wrong window is the most serious kind of bug, so say so.
+    validations:
+      required: true
+  - type: textarea
+    id: window
+    attributes:
+      label: Target window
+      description: The window's entry from `deskpilot --json windows`, and whether it is native Wayland, XWayland or Wine.
+      render: json
+  - type: input
+    id: hyprland
+    attributes:
+      label: Hyprland version
+      description: Output of `hyprctl version | head -1`.
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin status
+      description: Output of `deskpilot plugin status`.

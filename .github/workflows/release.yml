@@ -1,0 +1,49 @@
+name: Release
+
+# Pushing a vX.Y.Z tag publishes a GitHub release whose notes are that version's CHANGELOG.md entry. The tag must be
+# on main, where CI has already checked the commit.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the tag is on main and matches both versions
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          plugin=$(jq -r .version .claude-plugin/plugin.json)
+          if [ "v$version" != "$GITHUB_REF_NAME" ] || [ "$plugin" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, pyproject.toml $version and plugin.json $plugin must match"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/changelog.py "$VERSION" > "$RUNNER_TEMP/notes.md"
+          # A rerun finds the release already there and leaves it.
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
