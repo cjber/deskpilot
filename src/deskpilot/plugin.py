@@ -1,12 +1,14 @@
-"""The deskpilot Hyprland plugin: building it, loading it and asking it to click.
+"""The deskpilot Hyprland plugin: building it, loading it and asking it to click and press keys.
 
-The plugin (`plugin/deskpilot.cpp`) runs each click or scroll inside the compositor: it holds the user's mouse
-input, presses on the target window and puts the user's pointer and keyboard focus back. Hyprland plugins must be
-built against the exact running Hyprland, so the build is named after its commit and rebuilt after an upgrade.
+The plugin (`plugin/deskpilot.cpp`) runs each click, scroll and keystroke inside the compositor: it holds the user's
+input, delivers the event to the target window and puts the user's pointer and keyboard focus back. Hyprland plugins
+must be built against the exact running Hyprland, so the build is named after its commit and rebuilt after an
+upgrade.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -16,7 +18,6 @@ from pathlib import Path
 from .hypr import HyprctlError, Runner, run_hyprctl
 
 SOURCE = Path(__file__).parent / "plugin"
-VERSION = "1"
 BUTTON_CODES = {"left": 272, "right": 273, "middle": 274}
 
 
@@ -29,8 +30,16 @@ def build_dir() -> Path:
     return Path(base) / "deskpilot"
 
 
+def source_hash() -> str:
+    """Names a build after its source, so a changed plugin is rebuilt and reloaded rather than mistaken for current."""
+    digest = hashlib.sha256()
+    for name in ("deskpilot.cpp", "Makefile"):
+        digest.update((SOURCE / name).read_bytes())
+    return digest.hexdigest()[:12]
+
+
 def build_path(commit: str) -> Path:
-    return build_dir() / f"deskpilot-{commit[:12]}.so"
+    return build_dir() / f"deskpilot-{commit[:12]}-{source_hash()}.so"
 
 
 def parse_reply(text: str) -> dict:
@@ -60,7 +69,7 @@ class Plugin:
 
     def loaded(self) -> bool:
         try:
-            return self._call("status").get("version") == VERSION
+            return self._call("status").get("version") == source_hash()
         except PluginError:
             return False
 
@@ -73,6 +82,22 @@ class Plugin:
     def scroll(self, address: str, gx: int, gy: int, dy: int) -> dict:
         return self._call("scroll", address, str(gx), str(gy), str(dy))
 
+    def keys(self, address: str, events: list[tuple[int, bool]]) -> dict:
+        """Press and release key codes in a window without focusing it."""
+        return self._call("keys", address, *(f"{'+' if down else '-'}{code}" for code, down in events))
+
+    def unload(self) -> None:
+        """Unload whatever deskpilot build is loaded. A build too old to report its path names it in the error."""
+        try:
+            status = self.status()
+        except PluginError:
+            return
+        if not status.get("path"):
+            raise PluginError("an older deskpilot plugin is loaded: unload it with `hyprctl plugin unload <its .so>`")
+        out = self.run(["plugin", "unload", status["path"]]).strip()
+        if out not in ("ok", ""):
+            raise PluginError(f"hyprctl plugin unload {status['path']}: {out}")
+
     def commit(self) -> str:
         return json.loads(self.run(["-j", "version"]))["commit"]
 
@@ -80,17 +105,22 @@ class Plugin:
         out = build_path(self.commit())
         out.parent.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            ["make", "-C", str(SOURCE), f"OUT={out}"], capture_output=True, text=True, check=False, timeout=600
+            ["make", "-C", str(SOURCE), f"OUT={out}", f"SOURCE_HASH={source_hash()}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=600,
         )
         if result.returncode != 0:
             raise PluginError(f"building the plugin failed:\n{result.stderr.strip()[-2000:]}")
         return out
 
     def load(self) -> Path:
-        """Build the plugin for the running Hyprland if needed and load it. A loaded current version is left as is."""
+        """Build the plugin for the running Hyprland if needed and load it, replacing a loaded build of other source."""
         path = build_path(self.commit())
         if self.loaded():
             return path
+        self.unload()
         if not path.exists():
             path = self.build()
         out = self.run(["plugin", "load", str(path)]).strip()

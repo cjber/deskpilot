@@ -3,8 +3,9 @@
 Coordinates for move, click and scroll are pixels in the window's last `deskpilot shot`, so read the screenshot,
 pick a point, click it. Pass --scale 1 to give window pixels instead.
 
-Clicks and scrolls run inside the compositor through the deskpilot Hyprland plugin (`deskpilot plugin load`), so the
-user's pointer and keyboard focus stay where they are. --take-pointer moves the user's own pointer instead.
+Clicks, scrolls, and keys and text sent to a --window run inside the compositor through the deskpilot Hyprland plugin
+(`deskpilot plugin load`), so the user's pointer and keyboard focus stay where they are. --take-pointer and
+--take-focus move the user's own pointer or focus instead.
 """
 
 from __future__ import annotations
@@ -69,13 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("plugin", help="build, load or check the deskpilot Hyprland plugin")
     s.add_argument("action", choices=["build", "load", "status"])
 
+    focus_help = "focus the window and press through the input device instead of leaving focus in place"
     s = sub.add_parser("key", help="press a key or chord, e.g. Return, ctrl+a, alt+F4")
     s.add_argument("combo")
-    s.add_argument("--window", help="focus this window first")
+    s.add_argument("--window", help="press it in this window; without it the keys go to the focused window")
+    s.add_argument("--take-focus", action="store_true", help=focus_help)
 
     s = sub.add_parser("type", help="type text (US layout)")
     s.add_argument("text")
-    s.add_argument("--window", help="focus this window first")
+    s.add_argument("--window", help="type into this window; without it the keys go to the focused window")
+    s.add_argument("--take-focus", action="store_true", help=focus_help)
     s.add_argument("--delay", type=float, default=0.03, help="seconds between keys; games want 0.1 or more")
 
     s = sub.add_parser("wait-for", help="wait for a window to appear (or --gone to close)")
@@ -107,10 +111,10 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             gx, gy = desk.scroll(args.window, args.x, args.y, args.dy, args.scale, args.take_pointer)
             return {"x": gx, "y": gy}
         case "key":
-            desk.key(args.combo, args.window)
+            desk.key(args.combo, args.window, args.take_focus)
             return "ok"
         case "type":
-            desk.type(args.text, args.window, args.delay)
+            desk.type(args.text, args.window, args.delay, args.take_focus)
             return "ok"
         case "wait-for":
             win = desk.wait_for(args.window, args.timeout, args.gone)

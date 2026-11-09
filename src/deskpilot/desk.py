@@ -1,8 +1,8 @@
 """The actions an agent takes, shared by the CLI and the MCP server.
 
-Clicks and scrolls go through the deskpilot Hyprland plugin, which leaves the user's pointer and keyboard focus
-where they were; the agent cursor overlay shows where they land. `take_pointer` instead moves the user's own pointer
-and presses through the uinput device, for a hover the app must see or a machine without the plugin.
+Clicks, scrolls and keys for a named window go through the deskpilot Hyprland plugin, which leaves the user's
+pointer and keyboard focus where they were; the agent cursor overlay shows where clicks land. `take_pointer` and
+`take_focus` instead move the user's own pointer or focus and press through the uinput device.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from . import screen
+from . import keys, screen
 from .hypr import Hyprland, Window, WindowNotFound
 from .overlay import AgentCursor
 from .plugin import Plugin
@@ -116,13 +116,25 @@ class Desk:
             self.plugin.scroll(win.address, gx, gy, dy)
         return gx, gy
 
-    def key(self, combo: str, query: str | None = None) -> None:
+    def key(self, combo: str, query: str | None = None, take_focus: bool = False) -> None:
+        """Press a chord in a window without focusing it, or with take_focus focus it and press through uinput.
+        With no window the keys go to whatever has focus."""
+        if query and not take_focus:
+            self.plugin.keys(self.window(query).address, keys.chord_events(combo))
+            return
         if query:
             self.focus(query)
             time.sleep(0.1)
         self.input.chord(combo)
 
-    def type(self, text: str, query: str | None = None, delay: float = 0.03) -> None:
+    def type(self, text: str, query: str | None = None, delay: float = 0.03, take_focus: bool = False) -> None:
+        if query and not take_focus:
+            strokes = keys.text_strokes(text)
+            address = self.window(query).address
+            for code, shift in strokes:
+                self.plugin.keys(address, keys.stroke_events(code, shift))
+                time.sleep(delay)
+            return
         if query:
             self.focus(query)
             time.sleep(0.1)

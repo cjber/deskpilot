@@ -55,16 +55,17 @@ def scroll(window: str, x: float, y: float, dy: int, take_pointer: bool = False)
 
 
 @mcp.tool()
-def key(combo: str, window: str | None = None) -> str:
-    """Press a key or chord such as Return, ctrl+a or alt+F4, focusing the window first if given."""
-    desk.key(combo, window)
+def key(combo: str, window: str | None = None, take_focus: bool = False) -> str:
+    """Press a key or chord such as Return, ctrl+a or alt+F4 in a window without focusing it. take_focus focuses
+    the window first instead; with no window the keys go to the focused one."""
+    desk.key(combo, window, take_focus)
     return "ok"
 
 
 @mcp.tool()
-def type_text(text: str, window: str | None = None, delay: float = 0.03) -> str:
-    """Type text on a US layout. Use delay 0.1 or more for games."""
-    desk.type(text, window, delay)
+def type_text(text: str, window: str | None = None, delay: float = 0.03, take_focus: bool = False) -> str:
+    """Type text on a US layout into a window without focusing it. Use delay 0.1 or more for games."""
+    desk.type(text, window, delay, take_focus)
     return "ok"
 
 

@@ -156,6 +156,9 @@ class FakePlugin:
     def scroll(self, *args):
         self.calls.append(("scroll", *args))
 
+    def keys(self, *args):
+        self.calls.append(("keys", *args))
+
 
 def make_desk(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
@@ -189,6 +192,27 @@ def test_move_only_glides_the_agent_cursor(tmp_path, monkeypatch):
     desk.move("battle", 100, 50)
     assert cursor.glides == [(2727, 1066)]
     assert not any(c[0] == "dispatch" and "cursor.move" in c[1] for c in fake.calls)
+
+
+def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
+    desk, fake, inp, plugin, _ = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda s: None)
+    desk.key("ctrl+a", "battle")
+    desk.type("Hi", "battle")
+    a, h, i = keys.key_code("a"), keys.key_code("h"), keys.key_code("i")
+    assert plugin.calls == [
+        ("keys", "0xabc", [(keys.CTRL, True), (a, True), (a, False), (keys.CTRL, False)]),
+        ("keys", "0xabc", [(keys.SHIFT, True), (h, True), (h, False), (keys.SHIFT, False)]),
+        ("keys", "0xabc", [(i, True), (i, False)]),
+    ]
+    assert not any(c[0] == "dispatch" and "focus" in c[1] for c in fake.calls)
+    assert inp.events == []
+
+
+def test_plugin_formats_key_events():
+    calls = []
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", [(29, True), (30, True), (30, False)])
+    assert calls[-1] == ["deskpilot", "keys", "0xabc", "+29", "+30", "-30"]
 
 
 def test_plugin_sends_button_codes_and_reads_replies():
