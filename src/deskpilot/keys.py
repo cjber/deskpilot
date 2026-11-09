@@ -56,6 +56,18 @@ def parse_chord(combo: str) -> list[int]:
     return [key_code(part) for part in combo.split("+") if part]
 
 
+def chord_events(combo: str) -> list[tuple[int, bool]]:
+    """'ctrl+a' -> ctrl down, a down, a up, ctrl up, as (key code, pressed)."""
+    codes = parse_chord(combo)
+    return [(code, True) for code in codes] + [(code, False) for code in reversed(codes)]
+
+
+def stroke_events(code: int, shift: bool) -> list[tuple[int, bool]]:
+    """One typed character as (key code, pressed), wrapped in shift when it needs it."""
+    events = [(code, True), (code, False)]
+    return [(SHIFT, True), *events, (SHIFT, False)] if shift else events
+
+
 def text_strokes(text: str) -> list[tuple[int, bool]]:
     """Each character as (key code, needs shift). Characters a US keyboard cannot type are an error, not skipped."""
     missing = sorted({ch for ch in text if ch not in CHARS})

@@ -1,4 +1,4 @@
-"""MCP server over stdio. One virtual input device lives for the whole session, so clicks skip the settle delay."""
+"""MCP server over stdio. The agent cursor and the virtual input device live for the whole session."""
 
 from __future__ import annotations
 
@@ -30,37 +30,42 @@ def shot(window: str, max_width: int = 1400) -> Image:
 
 
 @mcp.tool()
-def click(window: str, x: float, y: float, button: str = "left", double: bool = False) -> dict:
-    """Click a point given in pixels of the window's last screenshot."""
-    gx, gy = desk.click(window, x, y, button, 2 if double else 1)
+def click(
+    window: str, x: float, y: float, button: str = "left", double: bool = False, take_pointer: bool = False
+) -> dict:
+    """Click a point given in pixels of the window's last screenshot. The user's pointer stays put unless
+    take_pointer is set."""
+    gx, gy = desk.click(window, x, y, button, 2 if double else 1, take_pointer=take_pointer)
     return {"x": gx, "y": gy}
 
 
 @mcp.tool()
-def move(window: str, x: float, y: float) -> dict:
-    """Hover a point given in pixels of the window's last screenshot."""
-    gx, gy = desk.move(window, x, y)
+def move(window: str, x: float, y: float, take_pointer: bool = False) -> dict:
+    """Show the agent cursor at a point of the window's last screenshot. take_pointer also moves the user's pointer
+    there, for a hover the app must see."""
+    gx, gy = desk.move(window, x, y, take_pointer=take_pointer)
     return {"x": gx, "y": gy}
 
 
 @mcp.tool()
-def scroll(window: str, x: float, y: float, dy: int) -> dict:
+def scroll(window: str, x: float, y: float, dy: int, take_pointer: bool = False) -> dict:
     """Scroll at a point of the window's last screenshot; positive dy scrolls up."""
-    gx, gy = desk.scroll(window, x, y, dy)
+    gx, gy = desk.scroll(window, x, y, dy, take_pointer=take_pointer)
     return {"x": gx, "y": gy}
 
 
 @mcp.tool()
-def key(combo: str, window: str | None = None) -> str:
-    """Press a key or chord such as Return, ctrl+a or alt+F4, focusing the window first if given."""
-    desk.key(combo, window)
+def key(combo: str, window: str | None = None, take_focus: bool = False) -> str:
+    """Press a key or chord such as Return, ctrl+a or alt+F4 in a window without focusing it. take_focus focuses
+    the window first instead; with no window the keys go to the focused one."""
+    desk.key(combo, window, take_focus)
     return "ok"
 
 
 @mcp.tool()
-def type_text(text: str, window: str | None = None, delay: float = 0.03) -> str:
-    """Type text on a US layout. Use delay 0.1 or more for games."""
-    desk.type(text, window, delay)
+def type_text(text: str, window: str | None = None, delay: float = 0.03, take_focus: bool = False) -> str:
+    """Type text on a US layout into a window without focusing it. Use delay 0.1 or more for games."""
+    desk.type(text, window, delay, take_focus)
     return "ok"
 
 
