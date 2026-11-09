@@ -7,12 +7,15 @@
 //      onMouseWheel, which see the device as well as the event: a replayed release must name the device that
 //      pressed, or Hyprland drops it and the button stays held. Nothing the user does can move the pointer mid-click.
 //   2. The cursor image is hidden, the pointer warps to the point, and the window under it must be <window>;
-//      anything else on top refuses before any press is sent.
+//      anything else on top refuses before any press is sent. Only the seat's pointer focus moves: Hyprland's
+//      focus-follows-mouse and click-to-focus never run, so keyboard focus stays on the user's window and the
+//      target is not raised.
 //   3. Presses and releases are spaced by event-loop timers, so the client sees them as separate events. Before each
 //      press or wheel notch the target must still be under the pointer, so a window that closes mid-sequence never
 //      passes its click on to the one behind it. Releases always go, so no button is left down.
 //   4. The pointer goes back to where the user left it plus the motion they made meanwhile, keyboard focus goes
-//      back to the surface that had it, the cursor's visibility is restored and the held input is replayed.
+//      back to the surface that had it if anything moved it, the cursor's visibility is restored and the held input
+//      is replayed.
 //
 // `hyprctl deskpilot keys <window> <+code|-code>...` presses and releases evdev key codes in <window> without focusing
 // it. Only the seat's keyboard focus moves to the window for the keystroke and comes straight back; Hyprland's own
@@ -72,11 +75,12 @@ constexpr const char* VERSION = DESKPILOT_SOURCE;
 inline HANDLE PHANDLE = nullptr;
 
 namespace {
-    using MoveFn   = void (*)(CInputManager*, IPointer::SMotionEvent);
-    using ButtonFn = void (*)(CInputManager*, IPointer::SButtonEvent, SP<IPointer>);
-    using WheelFn  = void (*)(CInputManager*, IPointer::SAxisEvent, SP<IPointer>);
-    using KeyFn    = void (*)(CInputManager*, const IKeyboard::SKeyEvent&, SP<IKeyboard>);
-    using ModFn    = void (*)(CInputManager*, SP<IKeyboard>);
+    using MoveFn     = void (*)(CInputManager*, IPointer::SMotionEvent);
+    using ButtonFn   = void (*)(CInputManager*, IPointer::SButtonEvent, SP<IPointer>);
+    using ActivateFn = void (*)(Desktop::View::CWindow*, bool);
+    using WheelFn    = void (*)(CInputManager*, IPointer::SAxisEvent, SP<IPointer>);
+    using KeyFn      = void (*)(CInputManager*, const IKeyboard::SKeyEvent&, SP<IKeyboard>);
+    using ModFn      = void (*)(CInputManager*, SP<IKeyboard>);
 
     // How long an XWayland key step may take to show in the X server before the sequence gives up.
     constexpr auto X_WAIT = std::chrono::milliseconds(500);
@@ -105,11 +109,12 @@ namespace {
         std::string                          error;
     };
 
-    CFunctionHook*       g_moveHook   = nullptr;
-    CFunctionHook*       g_buttonHook = nullptr;
-    CFunctionHook*       g_wheelHook  = nullptr;
-    CFunctionHook*       g_keyHook    = nullptr;
-    CFunctionHook*       g_modHook    = nullptr;
+    CFunctionHook*       g_moveHook     = nullptr;
+    CFunctionHook*       g_buttonHook   = nullptr;
+    CFunctionHook*       g_wheelHook    = nullptr;
+    CFunctionHook*       g_keyHook      = nullptr;
+    CFunctionHook*       g_modHook      = nullptr;
+    CFunctionHook*       g_activateHook = nullptr;
     std::optional<SOp>   g_op;
     bool                 g_injecting = false;
 
@@ -152,6 +157,17 @@ namespace {
             return;
         }
         reinterpret_cast<ButtonFn>(g_buttonHook->m_original)(self, e, mouse);
+    }
+
+    // A client clicked or typed into while unfocused asks to be activated (an X client sends _NET_ACTIVE_WINDOW), and
+    // with misc:focus_on_activate Hyprland focuses it, raises it and warps the pointer to it. A real click would have
+    // focused the window first, so the request would be a no-op; here it would take the user's focus. Requests from
+    // the target while deskpilot acts on it are dropped. A forced activation comes from a dispatcher, not the client.
+    void hkActivate(Desktop::View::CWindow* self, bool force) {
+        const bool TARGET = (g_op && reinterpret_cast<uintptr_t>(self) == g_op->window) || (g_keyOp && g_keyOp->window.lock().get() == self);
+        if (TARGET && !force)
+            return;
+        reinterpret_cast<ActivateFn>(g_activateHook->m_original)(self, force);
     }
 
     void hkOnMouseWheel(CInputManager* self, IPointer::SAxisEvent e, SP<IPointer> pointer) {
@@ -198,6 +214,17 @@ namespace {
         return HLSURFACE ? Desktop::View::CWindow::fromView(HLSURFACE->view()) : nullptr;
     }
 
+    // Pointer focus to the surface under the pointer, with an enter at the pointer's position, and nothing else:
+    // simulateMouseMovement would also run focus-follows-mouse and move keyboard focus. Leaving first makes the enter
+    // carry the new position even when the pointer was already on that surface, since setPointerFocus skips a
+    // surface it already has and refocusPointer sends no motion.
+    void enterUnderPointer() {
+        g_pSeatManager->setPointerFocus(nullptr, {});
+        g_pInputManager->refocusPointer();
+        // Xwayland applies pointer events per frame: without one, the press arrives before the motion.
+        g_pSeatManager->sendPointerFrame();
+    }
+
     void inject(const std::function<void()>& fn) {
         g_injecting = true;
         fn();
@@ -213,8 +240,7 @@ namespace {
         }
 
         Pointer::mgr()->warpTo(op.saved + op.heldMotion);
-        g_pInputManager->simulateMouseMovement();
-        g_pSeatManager->sendPointerFrame();
+        enterUnderPointer();
         // Keyboard focus goes back to the window, layer surface or nothing that had it. One that closed meanwhile
         // leaves focus where Hyprland put it.
         const auto WINDOW  = op.focusWindow.lock();
@@ -265,9 +291,7 @@ namespace {
         op.steps.push_back([] {
             inject([] {
                 Pointer::mgr()->warpTo(g_op->target);
-                g_pInputManager->simulateMouseMovement();
-                // Xwayland applies pointer events per frame: without one, the press arrives before the motion.
-                g_pSeatManager->sendPointerFrame();
+                enterUnderPointer();
             });
             targetUnderPointer();
         });
@@ -292,7 +316,8 @@ namespace {
                     if (state == WL_POINTER_BUTTON_STATE_PRESSED && !targetUnderPointer())
                         return;
                     inject([state] {
-                        g_pInputManager->onMouseButton(IPointer::SButtonEvent{.timeMs = now(), .button = g_op->button, .state = state}, nullptr);
+                        // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
+                        g_pSeatManager->sendPointerButton(now(), g_op->button, state);
                         g_pSeatManager->sendPointerFrame();
                     });
                 });
@@ -628,16 +653,17 @@ namespace {
     }
 }
 
-static CFunctionHook* hook(HANDLE handle, const std::string& name, void* replacement) {
+// `owner::name(` in the demangled signature, so `CWindow::activate` does not also match `activateGroupMembers`.
+static CFunctionHook* hook(HANDLE handle, const std::string& owner, const std::string& name, void* replacement) {
     for (const auto& fn : HyprlandAPI::findFunctionsByName(handle, name)) {
-        if (fn.demangled.contains("CInputManager::" + name)) {
+        if (fn.demangled.contains(owner + "::" + name + "(")) {
             const auto HOOK = HyprlandAPI::createFunctionHook(handle, fn.address, replacement);
             if (HOOK && HOOK->hook())
                 return HOOK;
             break;
         }
     }
-    throw std::runtime_error("deskpilot: could not hook CInputManager::" + name);
+    throw std::runtime_error("deskpilot: could not hook " + owner + "::" + name);
 }
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -652,11 +678,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("deskpilot: built for another Hyprland version, rebuild it with `deskpilot plugin build`");
     }
 
-    g_moveHook   = hook(handle, "onMouseMoved", reinterpret_cast<void*>(&hkOnMouseMoved));
-    g_buttonHook = hook(handle, "onMouseButton", reinterpret_cast<void*>(&hkOnMouseButton));
-    g_wheelHook  = hook(handle, "onMouseWheel", reinterpret_cast<void*>(&hkOnMouseWheel));
-    g_keyHook    = hook(handle, "onKeyboardKey", reinterpret_cast<void*>(&hkOnKeyboardKey));
-    g_modHook    = hook(handle, "onKeyboardMod", reinterpret_cast<void*>(&hkOnKeyboardMod));
+    g_moveHook     = hook(handle, "CInputManager", "onMouseMoved", reinterpret_cast<void*>(&hkOnMouseMoved));
+    g_buttonHook   = hook(handle, "CInputManager", "onMouseButton", reinterpret_cast<void*>(&hkOnMouseButton));
+    g_wheelHook    = hook(handle, "CInputManager", "onMouseWheel", reinterpret_cast<void*>(&hkOnMouseWheel));
+    g_keyHook      = hook(handle, "CInputManager", "onKeyboardKey", reinterpret_cast<void*>(&hkOnKeyboardKey));
+    g_modHook      = hook(handle, "CInputManager", "onKeyboardMod", reinterpret_cast<void*>(&hkOnKeyboardMod));
+    g_activateHook = hook(handle, "CWindow", "activate", reinterpret_cast<void*>(&hkActivate));
 
     HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{.name = "deskpilot", .match = IPC::Socket1::COMMAND_MATCH_PREFIX, .handler = onCommand});
     return {"deskpilot", "Clicks, scrolls and keys for agents that leave the user's pointer and focus in place", "cjber", VERSION};

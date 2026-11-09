@@ -4,9 +4,10 @@ Desktop control for agents on Hyprland. An agent takes a screenshot of a window,
 or types there, in any app: native Wayland, XWayland and Wine programs such as the Battle.net launcher and games.
 
 The user keeps their own pointer and keyboard focus. Clicks, scrolls and keys run inside the compositor through
-the deskpilot Hyprland plugin: in one step it holds the user's input, delivers the event to the target window, then
-puts the pointer and keyboard focus back where they were, applying any mouse motion the user made meanwhile. A press goes through
-Hyprland's own input path, so Wayland, XWayland and Wine clients all receive it as a real click. The plugin refuses
+the deskpilot Hyprland plugin: in one step it holds the user's mouse input, delivers the event to the target window
+through the user's own seat, then puts the pointer back where it was, applying any mouse motion the user made
+meanwhile. Only pointer focus moves, so keyboard focus stays on the user's window and the target is not raised, even
+with `focus_on_activate` set. Wayland, XWayland and Wine clients all receive the press as a real click. The plugin refuses
 a click when another window covers the point.
 
 An agent cursor shows where deskpilot acts: [cua-driver](https://github.com/trycua/cua)'s overlay arrow glides to
