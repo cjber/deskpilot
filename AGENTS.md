@@ -1,0 +1,48 @@
+# deskpilot
+
+Desktop control for agents on Hyprland: screenshot a window, click or type at a point in it, and leave the user's
+own pointer and keyboard focus where they were. The CLI and the MCP server are thin layers over the same `Desk`.
+
+## Checks
+
+```sh
+uv sync --locked
+uv run ruff check . && uv run ruff format --check .
+uv run ty check
+uv run pytest
+python3 scripts/changelog.py --check
+claude plugin validate --strict .   # if the Claude Code CLI is installed
+```
+
+CI also runs actionlint, zizmor and gitleaks. The plugin is not built in CI: it needs the exact Hyprland it loads
+into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` on a real session.
+
+## Layout
+
+- `src/deskpilot/cli.py`: argument parsing and output; every command calls `Desk`
+- `src/deskpilot/mcp_server.py`: the same actions as MCP tools over stdio, one `Desk` for the session
+- `src/deskpilot/desk.py`: the actions an agent takes, shared by the CLI and the MCP server
+- `src/deskpilot/hypr.py`: hyprctl: windows, monitors, focus, the cursor, and picking the live instance
+- `src/deskpilot/plugin.py`: builds, loads and talks to the compositor plugin
+- `src/deskpilot/plugin/deskpilot.cpp`: the Hyprland plugin that runs each click, scroll and keystroke inside the
+  compositor and puts the user's pointer and focus back
+- `src/deskpilot/screen.py`: grim screenshots and the mapping from screenshot pixels back to the screen
+- `src/deskpilot/overlay.py`: the agent cursor, drawn by `cua-driver`
+- `src/deskpilot/uinput.py`: the virtual mouse and keyboard behind `--take-pointer` and `--take-focus`
+- `src/deskpilot/keys.py`: key names, chords and US-layout text to Linux key codes
+
+## Rules
+
+- The user's pointer and focus are theirs. Only `--take-pointer` and `--take-focus` may move them; every other
+  action goes through the plugin, which must restore both and replay input the user made meanwhile.
+- A plugin build loads only into the Hyprland it was built against. Builds are named after the Hyprland commit and
+  the plugin source hash, so a changed source or an upgrade rebuilds rather than reusing a stale build.
+- Each dispatcher tries Hyprland 0.57's Lua form first and falls back to the string form. Keep both working.
+- A window name that matches several windows is an error listing them, and a point outside the window or under
+  another window is refused. Never guess a target.
+- The agent cursor is feedback, never input: any overlay failure turns it off and the action goes ahead.
+- Text is typed on a US layout. A character it cannot type is an error, never skipped.
+- Tests never touch the real compositor, `/dev/uinput`, `grim` or `cua-driver`. Pass fakes into `Desk` and
+  `Hyprland`, as `tests/test_core.py` does.
+- Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change
+  updates `README.md` and `skills/deskpilot/SKILL.md` too.

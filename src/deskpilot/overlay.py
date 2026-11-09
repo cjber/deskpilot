@@ -61,6 +61,7 @@ class AgentCursor:
         return line
 
     def _start(self) -> None:
+        assert self._binary is not None
         env = {**os.environ, "CUA_DRIVER_RS_ENABLE_WAYLAND": "1"}
         self._proc = subprocess.Popen(
             [self._binary, "mcp"],

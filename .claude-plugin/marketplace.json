@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "deskpilot",
+  "description": "deskpilot: desktop control for agents on Hyprland, without taking the user's pointer.",
+  "owner": {
+    "name": "Cillian Berragan",
+    "url": "https://github.com/cjber"
+  },
+  "plugins": [
+    {
+      "name": "deskpilot",
+      "description": "Click, scroll and type in Hyprland windows from a screenshot, in Wayland, XWayland and Wine apps, while the user keeps their pointer and focus.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

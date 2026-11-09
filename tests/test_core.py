@@ -70,7 +70,7 @@ def test_find_by_title_substring_and_address():
 
 def test_find_ambiguous_names_both_and_missing_is_an_error():
     wins = [win("0x1", "kitty", "a"), win("0x2", "kitty", "b")]
-    with pytest.raises(AmbiguousWindow, match="0x1.*0x2"):
+    with pytest.raises(AmbiguousWindow, match=r"0x1.*0x2"):
         find_window(wins, "kitty")
     with pytest.raises(WindowNotFound):
         find_window(wins, "firefox")
@@ -250,7 +250,7 @@ def test_pick_instance_falls_back_to_the_one_live_socket(tmp_path):
 
 
 def test_pick_instance_names_every_live_socket_or_none(tmp_path):
-    with pytest.raises(HyprctlError, match="stale has no live socket.*one: x, y"):
+    with pytest.raises(HyprctlError, match=r"stale has no live socket.*one: x, y"):
         pick_instance("stale", tmp_path, sockets(tmp_path, ["stale", "x", "y"], {"x", "y"}))
     with pytest.raises(HyprctlError, match="No running Hyprland"):
         pick_instance("stale", tmp_path, sockets(tmp_path, ["stale"], set()))
@@ -268,7 +268,7 @@ def test_run_hyprctl_reports_hyprctls_own_error(monkeypatch):
         return subprocess.CompletedProcess(cmd, 3, "", "Couldn't connect to socket\nmore\n")
 
     monkeypatch.setattr(hypr.subprocess, "run", fake_run)
-    with pytest.raises(HyprctlError, match="exited 3: Couldn't connect to socket$"):
+    with pytest.raises(HyprctlError, match=r"exited 3: Couldn't connect to socket$"):
         run_hyprctl(["-j", "clients"])
 
 
