@@ -80,7 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text")
     s.add_argument("--window", help="type into this window; without it the keys go to the focused window")
     s.add_argument("--take-focus", action="store_true", help=focus_help)
-    s.add_argument("--delay", type=float, default=0.03, help="seconds between keys; games want 0.1 or more")
+    s.add_argument(
+        "--delay", type=float, default=0.03, help="seconds each key is held and between keys; games want 0.1 or more"
+    )
 
     s = sub.add_parser("wait-for", help="wait for a window to appear (or --gone to close)")
     s.add_argument("window")

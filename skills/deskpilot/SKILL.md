@@ -22,8 +22,9 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    window's last `shot` at whatever scale it was taken, so never rescale them yourself; `--scale 1` means window
    pixels. A point outside the window, or one another window covers, is refused.
 5. Type with `deskpilot type "TEXT" --window WINDOW` and press keys with `deskpilot key ctrl+a --window WINDOW`. Games
-   read keys once per frame, so add `--delay 0.1` or more for them. Text is typed on a US layout, and a character it
-   cannot type is an error.
+   read keys once per frame, so add `--delay 0.1` or more for them: each key is held that long, with the same gap
+   before the next. Text is typed on a US layout, and a character it cannot type is an error. Several agents may act
+   at once: actions run one after another in arrival order, and one `type` is never interleaved with another's keys.
 6. Take a new `shot` after each action that changes the window, and confirm the result before the next step.
    `deskpilot wait-for WINDOW --timeout 120` waits for a window to open, and `--gone` for it to close.
 

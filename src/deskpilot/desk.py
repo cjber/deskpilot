@@ -129,11 +129,8 @@ class Desk:
 
     def type(self, text: str, query: str | None = None, delay: float = 0.03, take_focus: bool = False) -> None:
         if query and not take_focus:
-            strokes = keys.text_strokes(text)
-            address = self.window(query).address
-            for code, shift in strokes:
-                self.plugin.keys(address, keys.stroke_events(code, shift))
-                time.sleep(delay)
+            events = [event for code, shift in keys.text_strokes(text) for event in keys.stroke_events(code, shift)]
+            self.plugin.keys(self.window(query).address, events, hold=delay, gap=delay)
             return
         if query:
             self.focus(query)

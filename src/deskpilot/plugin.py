@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,11 @@ from .hypr import HyprctlError, Runner, run_hyprctl
 
 SOURCE = Path(__file__).parent / "plugin"
 BUTTON_CODES = {"left": 272, "right": 273, "middle": 274}
+
+# Hyprland takes a request as whatever its socket holds when it reads, so a request must reach it in one piece. The
+# kernel queues a Unix stream write of up to 32 KiB of page fragments (UNIX_SKB_FRAGS_SZ) as one buffer; a longer key
+# sequence is staged in parts that size.
+REQUEST_BYTES = 32 * 1024
 
 
 class PluginError(RuntimeError):
@@ -56,16 +62,39 @@ def parse_reply(text: str) -> dict:
     return reply
 
 
+def request_size(args: list[str]) -> int:
+    """Bytes hyprctl sends for `hyprctl deskpilot <args>`: its flags (none here), a slash, then the words."""
+    return len("/" + " ".join(["deskpilot", *args]))
+
+
+def fitting(words: list[str], head: list[str]) -> int:
+    """How many of `words`, from the first, fit in one request after `head`."""
+    size = request_size(head)
+    for count, word in enumerate(words):
+        size += 1 + len(word)
+        if size > REQUEST_BYTES:
+            return count
+    return len(words)
+
+
 @dataclass
 class Plugin:
     run: Runner = run_hyprctl
 
-    def _call(self, *args: str) -> dict:
+    def _request(self, *args: str) -> dict:
         try:
             out = self.run(["deskpilot", *args])
         except HyprctlError as error:
             raise PluginError(str(error)) from error
         return parse_reply(out)
+
+    def _call(self, *args: str) -> dict:
+        """The reply once the action has finished. Actions queue in the plugin, which answers within hyprctl's five
+        second read timeout: an action still queued or running answers with a ticket to wait on again."""
+        reply = self._request(*args)
+        while "pending" in reply:
+            reply = self._request("wait", str(reply["pending"]))
+        return reply
 
     def loaded(self) -> bool:
         try:
@@ -82,9 +111,22 @@ class Plugin:
     def scroll(self, address: str, gx: int, gy: int, dy: int) -> dict:
         return self._call("scroll", address, str(gx), str(gy), str(dy))
 
-    def keys(self, address: str, events: list[tuple[int, bool]]) -> dict:
-        """Press and release key codes in a window without focusing it."""
-        return self._call("keys", address, *(f"{'+' if down else '-'}{code}" for code, down in events))
+    def keys(self, address: str, events: list[tuple[int, bool]], hold: float = 0.0, gap: float = 0.0) -> dict:
+        """Press and release key codes in a window without focusing it, as one action. Each press is held `hold`
+        seconds, and keystrokes (runs of events that end with no key down) are `gap` seconds apart. A sequence too long
+        for one request is staged ahead in parts and queued whole by the last, so no other keys land in between."""
+        words = [f"{'+' if down else '-'}{code}" for code, down in events]
+        head = ["keys", address, str(round(hold * 1000)), str(round(gap * 1000))]
+        if request_size([*head, "none", *words]) <= REQUEST_BYTES:
+            return self._call(*head, "none", *words)
+        txn = secrets.token_hex(8)
+        last = len(words) - fitting(words[::-1], [*head, txn])
+        start = 0
+        while start < last:
+            count = fitting(words[start:last], ["stage", txn])
+            self._call("stage", txn, *words[start : start + count])
+            start += count
+        return self._call(*head, txn, *words[last:])
 
     def unload(self) -> None:
         """Unload whatever deskpilot build is loaded. A build too old to report its path names it in the error."""
