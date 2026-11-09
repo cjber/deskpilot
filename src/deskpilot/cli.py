@@ -2,6 +2,9 @@
 
 Coordinates for move, click and scroll are pixels in the window's last `deskpilot shot`, so read the screenshot,
 pick a point, click it. Pass --scale 1 to give window pixels instead.
+
+Clicks and scrolls run inside the compositor through the deskpilot Hyprland plugin (`deskpilot plugin load`), so the
+user's pointer and keyboard focus stay where they are. --take-pointer moves the user's own pointer instead.
 """
 
 from __future__ import annotations
@@ -12,7 +15,8 @@ import sys
 from pathlib import Path
 
 from .desk import Desk
-from .hypr import AmbiguousWindow, WindowNotFound
+from .hypr import AmbiguousWindow, HyprctlError, WindowNotFound
+from .plugin import PluginError
 
 
 def _print(data, as_json: bool) -> None:
@@ -42,12 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-o", "--out", type=Path)
     s.add_argument("--max-width", type=int, default=1400, help="scale down wider windows to this width")
 
-    for name, helptext in (("move", "move the cursor to a point"), ("click", "click a point")):
+    take_help = "move the user's own pointer there instead of leaving it in place"
+    for name, helptext in (("move", "show the agent cursor at a point"), ("click", "click a point")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("window")
         s.add_argument("x", type=float)
         s.add_argument("y", type=float)
         s.add_argument("--scale", type=float, help="the screenshot scale the point is in (default: the last shot)")
+        s.add_argument("--take-pointer", action="store_true", help=take_help)
         if name == "click":
             s.add_argument("--button", choices=["left", "right", "middle"], default="left")
             s.add_argument("--double", action="store_true")
@@ -58,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("y", type=float)
     s.add_argument("dy", type=int)
     s.add_argument("--scale", type=float)
+    s.add_argument("--take-pointer", action="store_true", help=take_help)
+
+    s = sub.add_parser("plugin", help="build, load or check the deskpilot Hyprland plugin")
+    s.add_argument("action", choices=["build", "load", "status"])
 
     s = sub.add_parser("key", help="press a key or chord, e.g. Return, ctrl+a, alt+F4")
     s.add_argument("combo")
@@ -87,13 +97,14 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
         case "shot":
             return desk.shot(args.window, args.out, args.max_width).to_dict()
         case "move":
-            gx, gy = desk.move(args.window, args.x, args.y, args.scale)
+            gx, gy = desk.move(args.window, args.x, args.y, args.scale, args.take_pointer)
             return {"x": gx, "y": gy}
         case "click":
-            gx, gy = desk.click(args.window, args.x, args.y, args.button, 2 if args.double else 1, args.scale)
+            count = 2 if args.double else 1
+            gx, gy = desk.click(args.window, args.x, args.y, args.button, count, args.scale, args.take_pointer)
             return {"x": gx, "y": gy}
         case "scroll":
-            gx, gy = desk.scroll(args.window, args.x, args.y, args.dy, args.scale)
+            gx, gy = desk.scroll(args.window, args.x, args.y, args.dy, args.scale, args.take_pointer)
             return {"x": gx, "y": gy}
         case "key":
             desk.key(args.combo, args.window)
@@ -104,6 +115,12 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
         case "wait-for":
             win = desk.wait_for(args.window, args.timeout, args.gone)
             return win.to_dict() if win else "gone"
+        case "plugin":
+            if args.action == "build":
+                return {"path": str(desk.plugin.build())}
+            if args.action == "load":
+                return {"path": str(desk.plugin.load()), **desk.plugin.status()}
+            return desk.plugin.status()
         case "cursor":
             x, y = desk.hypr.cursor()
             return {"x": x, "y": y}
@@ -120,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     desk = Desk()
     try:
         _print(run(args, desk), args.json)
-    except (WindowNotFound, AmbiguousWindow, ValueError, TimeoutError) as error:
+    except (WindowNotFound, AmbiguousWindow, HyprctlError, PluginError, ValueError, TimeoutError) as error:
         print(f"deskpilot: {error}", file=sys.stderr)
         return 2
     finally:

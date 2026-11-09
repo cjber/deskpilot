@@ -1,7 +1,7 @@
 [project]
 name = "deskpilot"
 version = "0.1.0"
-description = "Desktop control for agents on Hyprland: window-relative clicks and typing through a virtual uinput device"
+description = "Desktop control for agents on Hyprland: window-relative clicks that leave the user's pointer alone, and typing"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["evdev>=1.7", "pillow>=10", "mcp>=2.3"]

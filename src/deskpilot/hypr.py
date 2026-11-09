@@ -7,15 +7,63 @@ Each dispatcher here tries the Lua form first and falls back to the string form,
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 Runner = Callable[[list[str]], str]
 
 
+class HyprctlError(RuntimeError):
+    pass
+
+
+def socket_alive(path: Path) -> bool:
+    """Whether a Hyprland control socket accepts a connection. A crashed or ended session leaves its file behind."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        try:
+            sock.connect(str(path))
+        except OSError:
+            return False
+    return True
+
+
+def pick_instance(signature: str | None, hypr_dir: Path, alive: Callable[[Path], bool] = socket_alive) -> str:
+    """The Hyprland instance to talk to: the environment's, unless its socket is dead, then the only live one.
+
+    A shell started before Hyprland restarted keeps the old session's HYPRLAND_INSTANCE_SIGNATURE, and hyprctl then
+    fails on every call. Several live instances are an error naming them, never a guess.
+    """
+    if signature and alive(hypr_dir / signature / ".socket.sock"):
+        return signature
+    folders = sorted(p.name for p in hypr_dir.iterdir() if p.is_dir()) if hypr_dir.is_dir() else []
+    live = [name for name in folders if alive(hypr_dir / name / ".socket.sock")]
+    stale = f"HYPRLAND_INSTANCE_SIGNATURE={signature} has no live socket. " if signature else ""
+    if len(live) == 1:
+        return live[0]
+    if not live:
+        raise HyprctlError(f"{stale}No running Hyprland instance under {hypr_dir}.")
+    raise HyprctlError(
+        f"{stale}Several Hyprland instances are running, set HYPRLAND_INSTANCE_SIGNATURE to one: {', '.join(live)}"
+    )
+
+
+def current_instance() -> str:
+    """Chosen per call, not once: a long-lived MCP server outlives a Hyprland restart. It costs one connect."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return pick_instance(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"), Path(runtime) / "hypr")
+
+
 def run_hyprctl(args: list[str]) -> str:
-    result = subprocess.run(["hyprctl", *args], capture_output=True, text=True, check=False, timeout=10)
+    cmd = ["hyprctl", "-i", current_instance(), *args]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip() or "no output").splitlines()[0]
+        raise HyprctlError(f"hyprctl {' '.join(args)} exited {result.returncode}: {detail}")
     return result.stdout
 
 
@@ -106,12 +154,15 @@ class Hyprland:
         return int(pos.get("x", 0)), int(pos.get("y", 0))
 
     def _dispatch(self, lua: str, legacy: str) -> None:
-        out = self._run(["dispatch", lua])
-        if out.strip() == "ok":
-            return
+        """Run the Lua dispatcher, or the string one on Hyprland before 0.57. Either failing exits non-zero."""
+        try:
+            if self._run(["dispatch", lua]).strip() == "ok":
+                return
+        except HyprctlError:
+            pass
         out = self._run(["dispatch", *legacy.split(" ", 1)])
         if out.strip() != "ok":
-            raise RuntimeError(f"hyprctl dispatch failed: {out.strip()}")
+            raise HyprctlError(f"hyprctl dispatch {legacy} failed: {out.strip()}")
 
     def move_cursor(self, gx: int, gy: int) -> None:
         self._dispatch(f"hl.dsp.cursor.move({{x={gx},y={gy}}})", f"movecursor {gx} {gy}")

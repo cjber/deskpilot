@@ -1,4 +1,9 @@
-"""The actions an agent takes, shared by the CLI and the MCP server."""
+"""The actions an agent takes, shared by the CLI and the MCP server.
+
+Clicks and scrolls go through the deskpilot Hyprland plugin, which leaves the user's pointer and keyboard focus
+where they were; the agent cursor overlay shows where they land. `take_pointer` instead moves the user's own pointer
+and presses through the uinput device, for a hover the app must see or a machine without the plugin.
+"""
 
 from __future__ import annotations
 
@@ -7,11 +12,15 @@ from pathlib import Path
 
 from . import screen
 from .hypr import Hyprland, Window, WindowNotFound
+from .overlay import AgentCursor
+from .plugin import Plugin
 
 
 class Desk:
-    def __init__(self, hypr: Hyprland | None = None, input_factory=None):
+    def __init__(self, hypr: Hyprland | None = None, input_factory=None, plugin=None, cursor=None):
         self.hypr = hypr or Hyprland()
+        self.plugin = plugin or Plugin()
+        self.cursor = cursor or AgentCursor()
         self._input_factory = input_factory
         self._input = None
 
@@ -26,6 +35,7 @@ class Desk:
         return self._input
 
     def close(self) -> None:
+        self.cursor.close()
         if self._input is not None:
             self._input.close()
             self._input = None
@@ -41,40 +51,69 @@ class Desk:
         self.hypr.focus(win)
         return win
 
+    def _shown(self, win: Window) -> Window:
+        """The window, with its workspace showing: a screenshot or a click reaches only what is on screen."""
+        if self.hypr.visible(win):
+            return win
+        self.hypr.focus(win)
+        time.sleep(0.4)
+        return self.window(win.address)
+
     def shot(self, query: str, out: Path | None = None, max_width: int = screen.DEFAULT_MAX_WIDTH) -> screen.Shot:
-        win = self.window(query)
-        if not self.hypr.visible(win):
-            # grim captures the screen, not the window: show the window's workspace first.
-            self.hypr.focus(win)
-            time.sleep(0.4)
-            win = self.window(win.address)
-        return screen.capture(win, out, max_width)
+        return screen.capture(self._shown(self.window(query)), out, max_width)
 
     def point(self, query: str, x: float, y: float, scale: float | None = None) -> tuple[Window, int, int]:
         """Resolve a point in the window's last screenshot (or at `scale`) to a global position."""
-        win = self.window(query)
+        win = self._shown(self.window(query))
         used = screen.last_scale(win.address) if scale is None else scale
         gx, gy = screen.to_global(win, x, y, used)
         return win, gx, gy
 
-    def move(self, query: str, x: float, y: float, scale: float | None = None) -> tuple[int, int]:
-        win, gx, gy = self.point(query, x, y, scale)
+    def _take_pointer(self, win: Window, gx: int, gy: int) -> None:
         self.hypr.focus(win)
         self.hypr.move_cursor(gx, gy)
         time.sleep(0.15)
         self.input.nudge()
+
+    def move(
+        self, query: str, x: float, y: float, scale: float | None = None, take_pointer: bool = False
+    ) -> tuple[int, int]:
+        """Show the agent cursor at a point. take_pointer also moves the user's pointer, for a hover."""
+        win, gx, gy = self.point(query, x, y, scale)
+        self.cursor.glide(gx, gy)
+        if take_pointer:
+            self._take_pointer(win, gx, gy)
         return gx, gy
 
     def click(
-        self, query: str, x: float, y: float, button: str = "left", count: int = 1, scale: float | None = None
+        self,
+        query: str,
+        x: float,
+        y: float,
+        button: str = "left",
+        count: int = 1,
+        scale: float | None = None,
+        take_pointer: bool = False,
     ) -> tuple[int, int]:
-        gx, gy = self.move(query, x, y, scale)
-        self.input.click(button, count)
+        win, gx, gy = self.point(query, x, y, scale)
+        self.cursor.glide(gx, gy)
+        if take_pointer:
+            self._take_pointer(win, gx, gy)
+            self.input.click(button, count)
+        else:
+            self.plugin.click(win.address, gx, gy, button, count)
         return gx, gy
 
-    def scroll(self, query: str, x: float, y: float, dy: int, scale: float | None = None) -> tuple[int, int]:
-        gx, gy = self.move(query, x, y, scale)
-        self.input.scroll(dy=dy)
+    def scroll(
+        self, query: str, x: float, y: float, dy: int, scale: float | None = None, take_pointer: bool = False
+    ) -> tuple[int, int]:
+        win, gx, gy = self.point(query, x, y, scale)
+        self.cursor.glide(gx, gy)
+        if take_pointer:
+            self._take_pointer(win, gx, gy)
+            self.input.scroll(dy=dy)
+        else:
+            self.plugin.scroll(win.address, gx, gy, dy)
         return gx, gy
 
     def key(self, combo: str, query: str | None = None) -> None:

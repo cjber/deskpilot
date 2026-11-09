@@ -4,7 +4,17 @@ import pytest
 
 from deskpilot import keys, screen
 from deskpilot.desk import Desk
-from deskpilot.hypr import AmbiguousWindow, Hyprland, Window, WindowNotFound, find_window
+from deskpilot.hypr import (
+    AmbiguousWindow,
+    HyprctlError,
+    Hyprland,
+    Window,
+    WindowNotFound,
+    find_window,
+    pick_instance,
+    run_hyprctl,
+)
+from deskpilot.plugin import Plugin, PluginError, parse_reply
 
 
 def win(address="0x1", cls="wow.exe", title="World of Warcraft", x=1440, y=560, w=3440, h=1440):
@@ -125,14 +135,117 @@ class FakeInput:
         pass
 
 
-def test_click_moves_to_the_screenshot_point_then_clicks(tmp_path, monkeypatch):
+class FakeCursor:
+    def __init__(self):
+        self.glides = []
+
+    def glide(self, x, y):
+        self.glides.append((x, y))
+
+    def close(self):
+        pass
+
+
+class FakePlugin:
+    def __init__(self):
+        self.calls = []
+
+    def click(self, *args):
+        self.calls.append(("click", *args))
+
+    def scroll(self, *args):
+        self.calls.append(("scroll", *args))
+
+
+def make_desk(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    fake, inp = FakeHyprctl([CLIENT]), FakeInput()
-    desk = Desk(Hyprland(fake), lambda: inp)
+    fake, inp, plugin, cursor = FakeHyprctl([CLIENT]), FakeInput(), FakePlugin(), FakeCursor()
+    desk = Desk(Hyprland(fake), lambda: inp, plugin=plugin, cursor=cursor)
     screen.remember_scale("0xabc", 0.5)
-    assert desk.click("battle", 100, 50) == (2527 + 200, 966 + 100)
+    return desk, fake, inp, plugin, cursor
+
+
+def test_click_goes_through_the_plugin_and_leaves_the_pointer_alone(tmp_path, monkeypatch):
+    desk, fake, inp, plugin, cursor = make_desk(tmp_path, monkeypatch)
+    assert desk.click("battle", 100, 50, "right", 2) == (2527 + 200, 966 + 100)
+    assert plugin.calls == [("click", "0xabc", 2727, 1066, "right", 2)]
+    assert cursor.glides == [(2727, 1066)]
+    assert inp.events == []
+    assert not any(c[0] == "dispatch" and "cursor.move" in c[1] for c in fake.calls)
+    desk.scroll("battle", 100, 50, -3)
+    assert plugin.calls[-1] == ("scroll", "0xabc", 2727, 1066, -3)
+
+
+def test_take_pointer_moves_the_user_pointer_then_clicks(tmp_path, monkeypatch):
+    desk, fake, inp, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk.click("battle", 100, 50, take_pointer=True)
     assert ["dispatch", "hl.dsp.cursor.move({x=2727,y=1066})"] in fake.calls
     assert inp.events == ["nudge", ("click", "left", 1)]
+    assert plugin.calls == []
+
+
+def test_move_only_glides_the_agent_cursor(tmp_path, monkeypatch):
+    desk, fake, _, _, cursor = make_desk(tmp_path, monkeypatch)
+    desk.move("battle", 100, 50)
+    assert cursor.glides == [(2727, 1066)]
+    assert not any(c[0] == "dispatch" and "cursor.move" in c[1] for c in fake.calls)
+
+
+def test_plugin_sends_button_codes_and_reads_replies():
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        return '{"ok":true,"x":1,"y":2}'
+
+    Plugin(run).click("0xabc", 10, 20, "right", 2)
+    assert calls[-1] == ["deskpilot", "click", "0xabc", "10", "20", "273", "2"]
+    with pytest.raises(PluginError, match="not loaded"):
+        parse_reply("unknown request")
+    with pytest.raises(PluginError, match="is on top"):
+        parse_reply('{"ok":false,"error":"window 0x1 (x) is on top at 1,2"}')
+    assert not Plugin(lambda args: "unknown request").loaded()
+
+
+def sockets(tmp_path, folders, live):
+    """Instance folders with socket files; only those in `live` accept a connection."""
+    for name in folders:
+        (tmp_path / name).mkdir(exist_ok=True)
+        (tmp_path / name / ".socket.sock").touch()
+    return lambda path: path.parent.name in live
+
+
+def test_pick_instance_keeps_a_live_signature(tmp_path):
+    assert pick_instance("a", tmp_path, sockets(tmp_path, ["a", "b"], {"a", "b"})) == "a"
+
+
+def test_pick_instance_falls_back_to_the_one_live_socket(tmp_path):
+    alive = sockets(tmp_path, ["stale", "live"], {"live"})
+    assert pick_instance("stale", tmp_path, alive) == "live"
+    assert pick_instance(None, tmp_path, alive) == "live"
+
+
+def test_pick_instance_names_every_live_socket_or_none(tmp_path):
+    with pytest.raises(HyprctlError, match="stale has no live socket.*one: x, y"):
+        pick_instance("stale", tmp_path, sockets(tmp_path, ["stale", "x", "y"], {"x", "y"}))
+    with pytest.raises(HyprctlError, match="No running Hyprland"):
+        pick_instance("stale", tmp_path, sockets(tmp_path, ["stale"], set()))
+
+
+def test_run_hyprctl_reports_hyprctls_own_error(monkeypatch):
+    import subprocess
+
+    from deskpilot import hypr
+
+    monkeypatch.setattr(hypr, "current_instance", lambda: "sig")
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[:3] == ["hyprctl", "-i", "sig"]
+        return subprocess.CompletedProcess(cmd, 3, "", "Couldn't connect to socket\nmore\n")
+
+    monkeypatch.setattr(hypr.subprocess, "run", fake_run)
+    with pytest.raises(HyprctlError, match="exited 3: Couldn't connect to socket$"):
+        run_hyprctl(["-j", "clients"])
 
 
 def test_visible_compares_the_window_workspace_with_the_monitors():
