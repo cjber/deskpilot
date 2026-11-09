@@ -17,7 +17,7 @@ from deskpilot.hypr import (
     pick_instance,
     run_hyprctl,
 )
-from deskpilot.plugin import Plugin, PluginError, parse_reply
+from deskpilot.plugin import REQUEST_BYTES, Plugin, PluginError, parse_reply, request_size
 
 
 def win(address="0x1", cls="wow.exe", title="World of Warcraft", x=1440, y=560, w=3440, h=1440):
@@ -219,8 +219,8 @@ class FakePlugin:
     def scroll(self, *args):
         self.calls.append(("scroll", *args))
 
-    def keys(self, *args):
-        self.calls.append(("keys", *args))
+    def keys(self, *args, **timing):
+        self.calls.append(("keys", *args, timing))
 
 
 def make_desk(tmp_path, monkeypatch):
@@ -268,14 +268,18 @@ def test_move_only_glides_the_agent_cursor(tmp_path, monkeypatch):
 
 def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
     desk, fake, inp, plugin, _ = make_desk(tmp_path, monkeypatch)
-    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda s: None)
     desk.key("ctrl+a", "battle")
-    desk.type("Hi", "battle")
+    desk.type("Hi", "battle", delay=0.05)
     a, h, i = keys.key_code("a"), keys.key_code("h"), keys.key_code("i")
     assert plugin.calls == [
-        ("keys", "0xabc", [(keys.CTRL, True), (a, True), (a, False), (keys.CTRL, False)]),
-        ("keys", "0xabc", [(keys.SHIFT, True), (h, True), (h, False), (keys.SHIFT, False)]),
-        ("keys", "0xabc", [(i, True), (i, False)]),
+        ("keys", "0xabc", [(keys.CTRL, True), (a, True), (a, False), (keys.CTRL, False)], {}),
+        # The whole text is one action, timed inside the plugin, so no other caller's keys land between characters.
+        (
+            "keys",
+            "0xabc",
+            [(keys.SHIFT, True), (h, True), (h, False), (keys.SHIFT, False), (i, True), (i, False)],
+            {"hold": 0.05, "gap": 0.05},
+        ),
     ]
     assert not any(c[0] == "dispatch" and "focus" in c[1] for c in fake.calls)
     assert inp.events == []
@@ -283,8 +287,33 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
 
 def test_plugin_formats_key_events():
     calls = []
-    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", [(29, True), (30, True), (30, False)])
-    assert calls[-1] == ["deskpilot", "keys", "0xabc", "+29", "+30", "-30"]
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", [(29, True), (30, True)], hold=0.03, gap=0.1)
+    assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "+30"]]
+
+
+def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
+    calls = []
+    events = [(30, down) for _ in range(5000) for down in (True, False)]
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", events)
+    *stages, last = calls
+    assert stages and all(c[:2] == ["deskpilot", "stage"] for c in stages)
+    txn = stages[0][2]
+    assert all(c[2] == txn for c in stages) and last[:6] == ["deskpilot", "keys", "0xabc", "0", "0", txn]
+    sent = [w for c in stages for w in c[3:]] + last[6:]
+    assert sent == [f"{'+' if down else '-'}{code}" for code, down in events]
+    assert all(request_size(c[1:]) <= REQUEST_BYTES for c in calls)
+    # The fewest requests: every one but the first staged is full, and the keys request takes all that fit after it.
+    assert len(calls) == -(-request_size(["keys", "0xabc", "0", "0", txn, *sent]) // REQUEST_BYTES)
+
+
+def test_plugin_waits_on_a_queued_action_until_it_finishes():
+    replies = iter(['{"ok":true,"pending":7}', '{"ok":true,"pending":7}', '{"ok":true,"x":1,"y":2}'])
+    calls = []
+    reply = Plugin(lambda args: calls.append(args) or next(replies)).click("0xabc", 1, 2)
+    assert reply == {"ok": True, "x": 1, "y": 2}
+    assert calls[1:] == [["deskpilot", "wait", "7"], ["deskpilot", "wait", "7"]]
+    with pytest.raises(PluginError, match="queue is full"):
+        Plugin(lambda args: '{"ok":false,"error":"the deskpilot queue is full"}').scroll("0xabc", 1, 2, 3)
 
 
 def test_plugin_sends_button_codes_and_reads_replies():

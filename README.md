@@ -81,7 +81,11 @@ the one instance whose socket answers, and with several live instances it stops 
 `key` and `type` without `--window` press keys into whatever has focus. `--take-focus` focuses the window and
 leaves it focused, for an app that ignores keys while unfocused.
 
-Games read keys once per frame, so type into them with `--delay 0.1` or more.
+Games read keys once per frame, so type into them with `--delay 0.1` or more: each key is held that long, with the
+same gap before the next.
+
+Clicks, scrolls and keys from several agents at once run one after another in the order they arrive, so one `type`
+is never interleaved with another's keys. Up to 32 wait behind the running one; past that an action is refused.
 
 ## MCP
 
