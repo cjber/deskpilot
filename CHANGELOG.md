@@ -7,6 +7,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Clicks keep your keyboard focus.** A click or scroll no longer focuses or raises the target window while it runs,
+  so keys you type meanwhile stay in your own window. An XWayland app that asks to be activated when clicked is not
+  given focus while deskpilot acts on it.
+
 ## [0.1.0] - 2026-11-09
 
 - **Clicks that leave your pointer alone.** `deskpilot click`, `scroll` and keys sent with `--window` run inside
