@@ -11,9 +11,30 @@ import time
 from pathlib import Path
 
 from . import keys, screen
-from .hypr import Hyprland, Window, WindowNotFound
+from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound
 from .overlay import AgentCursor
-from .plugin import Plugin
+from .plugin import Plugin, PluginError
+
+
+class NotVisible(LookupError):
+    pass
+
+
+# Failures an agent should read and act on: a refusal, a missing window, a tool that failed. Anything else is a bug.
+EXPECTED = (
+    WindowNotFound,
+    AmbiguousWindow,
+    NotVisible,
+    HyprctlError,
+    PluginError,
+    ValueError,
+    TimeoutError,
+    RuntimeError,
+)
+
+# How long `show` waits for a focused window to come on screen: a workspace switch or a scrolling layout's
+# animation has to finish before the window's area is its own.
+SHOW_TIMEOUT = 3.0
 
 
 class Desk:
@@ -51,22 +72,48 @@ class Desk:
         self.hypr.focus(win)
         return win
 
-    def _shown(self, win: Window) -> Window:
-        """The window, with its workspace showing: a screenshot or a click reaches only what is on screen."""
-        if self.hypr.visible(win):
+    def _on_screen(self, win: Window, show: bool) -> Window:
+        """The window, on screen: a screenshot or a click reaches only what is showing. A hidden window is an error
+        unless `show`, which focuses it, since that switches the user's workspace or scrolls their layout."""
+        if win.visible:
             return win
+        if not show:
+            raise NotVisible(
+                f"{win.cls} ({win.address}) is not on screen: its workspace {win.workspace} is not showing or it is "
+                "scrolled off its monitor. Pass --show (show over MCP) to bring it into view, which focuses it"
+            )
         self.hypr.focus(win)
-        time.sleep(0.4)
-        return self.window(win.address)
+        deadline = time.monotonic() + SHOW_TIMEOUT
+        while time.monotonic() < deadline:
+            win = self.window(win.address)
+            if win.visible:
+                return win
+            time.sleep(0.05)
+        raise NotVisible(f"{win.cls} ({win.address}) did not come on screen within {SHOW_TIMEOUT}s of focusing it")
 
-    def shot(self, query: str, out: Path | None = None, max_width: int = screen.DEFAULT_MAX_WIDTH) -> screen.Shot:
-        return screen.capture(self._shown(self.window(query)), out, max_width)
+    def shot(
+        self, query: str, out: Path | None = None, max_width: int = screen.DEFAULT_MAX_WIDTH, show: bool = False
+    ) -> screen.Shot:
+        return screen.capture(self._on_screen(self.window(query), show), out, max_width)
 
-    def point(self, query: str, x: float, y: float, scale: float | None = None) -> tuple[Window, int, int]:
-        """Resolve a point in the window's last screenshot (or at `scale`) to a global position."""
-        win = self._shown(self.window(query))
-        used = screen.last_scale(win.address) if scale is None else scale
-        gx, gy = screen.to_global(win, x, y, used)
+    def point(
+        self,
+        query: str,
+        x: float,
+        y: float,
+        scale: float | None = None,
+        shot: str | None = None,
+        show: bool = False,
+    ) -> tuple[Window, int, int]:
+        """Resolve a point to a global position. The point is in pixels of `shot`, or of the window's latest shot,
+        or at `scale` (1 for window pixels); with no shot at all it is in window pixels."""
+        win = self._on_screen(self.window(query), show)
+        if scale is None:
+            taken = screen.load(shot) if shot else screen.latest(win.address)
+            if taken:
+                taken.check(win)
+            scale = taken.scale if taken else 1.0
+        gx, gy = screen.to_global(win, x, y, scale)
         return win, gx, gy
 
     def _take_pointer(self, win: Window, gx: int, gy: int) -> None:
@@ -76,10 +123,18 @@ class Desk:
         self.input.nudge()
 
     def move(
-        self, query: str, x: float, y: float, scale: float | None = None, take_pointer: bool = False
+        self,
+        query: str,
+        x: float,
+        y: float,
+        scale: float | None = None,
+        take_pointer: bool = False,
+        *,
+        shot: str | None = None,
+        show: bool = False,
     ) -> tuple[int, int]:
         """Show the agent cursor at a point. take_pointer also moves the user's pointer, for a hover."""
-        win, gx, gy = self.point(query, x, y, scale)
+        win, gx, gy = self.point(query, x, y, scale, shot, show)
         self.cursor.glide(gx, gy)
         if take_pointer:
             self._take_pointer(win, gx, gy)
@@ -94,8 +149,11 @@ class Desk:
         count: int = 1,
         scale: float | None = None,
         take_pointer: bool = False,
+        *,
+        shot: str | None = None,
+        show: bool = False,
     ) -> tuple[int, int]:
-        win, gx, gy = self.point(query, x, y, scale)
+        win, gx, gy = self.point(query, x, y, scale, shot, show)
         self.cursor.glide(gx, gy)
         if take_pointer:
             self._take_pointer(win, gx, gy)
@@ -105,9 +163,18 @@ class Desk:
         return gx, gy
 
     def scroll(
-        self, query: str, x: float, y: float, dy: int, scale: float | None = None, take_pointer: bool = False
+        self,
+        query: str,
+        x: float,
+        y: float,
+        dy: int,
+        scale: float | None = None,
+        take_pointer: bool = False,
+        *,
+        shot: str | None = None,
+        show: bool = False,
     ) -> tuple[int, int]:
-        win, gx, gy = self.point(query, x, y, scale)
+        win, gx, gy = self.point(query, x, y, scale, shot, show)
         self.cursor.glide(gx, gy)
         if take_pointer:
             self._take_pointer(win, gx, gy)

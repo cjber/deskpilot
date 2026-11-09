@@ -1,7 +1,12 @@
 """Window screenshots with grim, and the mapping from screenshot pixels back to the screen.
 
-An agent reads a scaled-down screenshot and names a point in it. `shot` records each window's last scale, so a
-later click in screenshot coordinates lands on the same spot whatever size the image was.
+An agent reads a scaled-down screenshot and names a point in it. Each shot gets an id and keeps the window's size
+and the image's scale, so a later click in its pixels lands on the same spot, and a click against a window that has
+since changed size is refused instead of landing somewhere else.
+
+grim captures the window itself by its toplevel identifier, so another window on top does not show in the image.
+The scale is read from the image grim wrote, never assumed: on a scaled output the buffer is larger than the
+window's logical size.
 """
 
 from __future__ import annotations
@@ -9,12 +14,21 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from PIL import Image
 
 from .hypr import Window
 
 DEFAULT_MAX_WIDTH = 1400
+# Shots kept per window. Older ones are deleted, so an id that old is stale.
+KEEP = 20
+
+
+class StaleShot(ValueError):
+    pass
 
 
 def state_dir() -> Path:
@@ -22,64 +36,93 @@ def state_dir() -> Path:
     return Path(base) / "deskpilot"
 
 
+def shots_dir(folder: Path | None = None) -> Path:
+    return (folder or state_dir()) / "shots"
+
+
 @dataclass(frozen=True)
 class Shot:
-    path: Path
-    window: Window
-    scale: float
-    width: int
+    id: str
+    path: str
+    address: str
+    width: int  # image pixels
     height: int
+    scale: float  # image pixels per window pixel
+    window_width: int
+    window_height: int
 
     def to_dict(self) -> dict:
         return {
-            "path": str(self.path),
-            "window": self.window.address,
+            "shot": self.id,
+            "path": self.path,
+            "window": self.address,
             "scale": self.scale,
             "width": self.width,
             "height": self.height,
         }
 
+    def check(self, window: Window) -> None:
+        """Refuse the shot for a point in `window` if it is of another window or the window has changed size."""
+        if window.address != self.address:
+            raise StaleShot(f"shot {self.id} is of window {self.address}, not {window.address}")
+        if (window.width, window.height) != (self.window_width, self.window_height):
+            raise StaleShot(
+                f"{window.cls} is {window.width}x{window.height} now, {self.window_width}x{self.window_height} in "
+                f"shot {self.id}: take a new shot"
+            )
 
-def scale_for(width: int, max_width: int) -> float:
-    return 1.0 if width <= max_width else round(max_width / width, 4)
+
+def _grim(window: Window, path: Path) -> None:
+    cmd = ["grim", "-T", window.stable_id] if window.stable_id else ["grim", "-s", "1", "-g", _geometry(window)]
+    result = subprocess.run([*cmd, str(path)], capture_output=True, text=True, check=False, timeout=20)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        raise RuntimeError(f"grim could not capture {window.cls} ({window.address}): {detail}")
+
+
+def _geometry(window: Window) -> str:
+    return f"{window.x},{window.y} {window.width}x{window.height}"
 
 
 def capture(window: Window, out: Path | None = None, max_width: int = DEFAULT_MAX_WIDTH) -> Shot:
-    scale = scale_for(window.width, max_width)
-    folder = state_dir()
+    folder = shots_dir()
     folder.mkdir(parents=True, exist_ok=True)
-    path = out or folder / f"shot-{window.address.removeprefix('0x')}.png"
-    geometry = f"{window.x},{window.y} {window.width}x{window.height}"
-    cmd = ["grim", "-g", geometry]
-    if scale != 1.0:
-        cmd += ["-s", str(scale)]
-    subprocess.run([*cmd, str(path)], check=True, timeout=20)
-    shot = Shot(path, window, scale, round(window.width * scale), round(window.height * scale))
-    remember_scale(window.address, scale, folder)
+    shot_id = f"{window.address.removeprefix('0x')}-{time.time_ns() // 1_000_000}"
+    path = out or folder / f"{shot_id}.png"
+    _grim(window, path)
+    with Image.open(path) as image:
+        width, height = image.size
+        if width > max_width:
+            height = round(height * max_width / width)
+            width = max_width
+            image.resize((width, height), Image.Resampling.LANCZOS).save(path)
+    shot = Shot(shot_id, str(path), window.address, width, height, width / window.width, window.width, window.height)
+    (folder / f"{shot_id}.json").write_text(json.dumps(asdict(shot)))
+    _prune(folder, window.address)
     return shot
 
 
-def _scales_file(folder: Path) -> Path:
-    return folder / "scales.json"
+def _records(folder: Path, address: str) -> list[Path]:
+    """This window's shot records, oldest first. Ids end in milliseconds, so name order is time order."""
+    return sorted(folder.glob(f"{address.removeprefix('0x')}-*.json"))
 
 
-def remember_scale(address: str, scale: float, folder: Path | None = None) -> None:
-    folder = folder or state_dir()
-    folder.mkdir(parents=True, exist_ok=True)
-    path = _scales_file(folder)
+def _prune(folder: Path, address: str) -> None:
+    for record in _records(folder, address)[:-KEEP]:
+        record.with_suffix(".png").unlink(missing_ok=True)
+        record.unlink(missing_ok=True)
+
+
+def load(shot_id: str, folder: Path | None = None) -> Shot:
     try:
-        scales = json.loads(path.read_text())
-    except (OSError, ValueError):
-        scales = {}
-    scales[address] = scale
-    path.write_text(json.dumps(scales))
+        return Shot(**json.loads((shots_dir(folder) / f"{shot_id}.json").read_text()))
+    except (OSError, ValueError, TypeError) as error:
+        raise StaleShot(f"no shot {shot_id}: take a new one") from error
 
 
-def last_scale(address: str, folder: Path | None = None) -> float:
-    try:
-        return float(json.loads(_scales_file(folder or state_dir()).read_text()).get(address, 1.0))
-    except (OSError, ValueError):
-        return 1.0
+def latest(address: str, folder: Path | None = None) -> Shot | None:
+    records = _records(shots_dir(folder), address)
+    return load(records[-1].stem, folder) if records else None
 
 
 def to_global(window: Window, x: float, y: float, scale: float) -> tuple[int, int]:

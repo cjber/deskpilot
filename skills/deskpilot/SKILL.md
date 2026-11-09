@@ -11,16 +11,19 @@ actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `key`,
 If `deskpilot` is not on `PATH`, ask the user before installing it with
 `uv tool install git+https://github.com/cjber/deskpilot`.
 
-1. Run `deskpilot plugin load` once per session, and again after Hyprland is upgraded. It builds the plugin for the
-   running Hyprland and loads it. `deskpilot plugin status` reports the loaded build. Clicks, scrolls and keys sent
-   to a window fail with "plugin is not loaded" until this succeeds.
+1. The first click, scroll or key loads the plugin for the running Hyprland, building it if needed, which can take
+   a minute once per Hyprland version. `deskpilot plugin status` reports the loaded build.
 2. Run `deskpilot windows` and pick the target by address, class, or part of its class or title. A name that matches
-   several windows is an error that lists them: pick one by address rather than guessing.
-3. Run `deskpilot shot WINDOW`, read the image it prints, and choose a point in that image.
-4. Act with that point as given: `deskpilot click WINDOW X Y` (`--button right`, `--double`), `deskpilot scroll WINDOW
-   X Y DY` (positive is up), or `deskpilot move WINDOW X Y` to show the agent cursor there. Points are pixels in the
-   window's last `shot` at whatever scale it was taken, so never rescale them yourself; `--scale 1` means window
-   pixels. A point outside the window, or one another window covers, is refused.
+   several windows is an error that lists them: pick one by address rather than guessing. `visible` is false for a
+   window on a hidden workspace or scrolled off screen; acting on it is refused unless you pass `--show`, which
+   focuses it and moves the user's view, so ask the user first.
+3. Run `deskpilot shot WINDOW`, read the image at the `path` it prints, and choose a point in that image. Note its
+   `shot` id.
+4. Act with that point as given, passing the id: `deskpilot click WINDOW X Y --shot ID` (`--button right`,
+   `--double`), `deskpilot scroll WINDOW X Y DY --shot ID` (positive is up), or `deskpilot move WINDOW X Y --shot ID`
+   to show the agent cursor there. Points are pixels in that shot, so never rescale them yourself; `--scale 1` means
+   window pixels. A point outside the window, one another window covers, or a window resized since the shot is
+   refused.
 5. Type with `deskpilot type "TEXT" --window WINDOW` and press keys with `deskpilot key ctrl+a --window WINDOW`. Games
    read keys once per frame, so add `--delay 0.1` or more for them. Text is typed on a US layout, and a character it
    cannot type is an error.
@@ -44,7 +47,9 @@ also press into whatever has focus, which may be the user's own window: always p
 
 ## Errors
 
-- "plugin is not loaded": run `deskpilot plugin load`. A build failure names the missing headers or compiler.
+- "is not on screen": the window is on a hidden workspace or scrolled off. Ask the user before passing `--show`.
+- "take a new shot": the window changed size since the shot. Shoot again and pick the point anew.
+- A plugin build failure names the missing headers or compiler.
 - A stale `HYPRLAND_INSTANCE_SIGNATURE` is handled: deskpilot finds the live Hyprland, and stops with a list when
   several are live. Ask the user which one to use.
 - A refused click names why. Take a new `shot`, since the window may have moved, resized or been covered.

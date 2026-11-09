@@ -25,6 +25,10 @@ class PluginError(RuntimeError):
     pass
 
 
+class PluginNotLoaded(PluginError):
+    pass
+
+
 def build_dir() -> Path:
     base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
     return Path(base) / "deskpilot"
@@ -46,7 +50,7 @@ def parse_reply(text: str) -> dict:
     """The plugin's JSON answer, or a PluginError carrying its refusal. `unknown request` means it is not loaded."""
     text = text.strip()
     if text == "unknown request" or not text:
-        raise PluginError("the deskpilot Hyprland plugin is not loaded: run `deskpilot plugin load`")
+        raise PluginNotLoaded("the deskpilot Hyprland plugin is not loaded: run `deskpilot plugin load`")
     try:
         reply = json.loads(text)
     except ValueError as error:
@@ -60,21 +64,30 @@ def parse_reply(text: str) -> dict:
 class Plugin:
     run: Runner = run_hyprctl
 
-    def _call(self, *args: str) -> dict:
+    def _send(self, *args: str) -> dict:
         try:
             out = self.run(["deskpilot", *args])
         except HyprctlError as error:
             raise PluginError(str(error)) from error
         return parse_reply(out)
 
+    def _call(self, *args: str) -> dict:
+        """Send a command, loading the plugin first if Hyprland has none, as after a restart or an upgrade. A
+        loaded build of other source is left alone: another checkout may be using it."""
+        try:
+            return self._send(*args)
+        except PluginNotLoaded:
+            self.load()
+            return self._send(*args)
+
     def loaded(self) -> bool:
         try:
-            return self._call("status").get("version") == source_hash()
+            return self.status().get("version") == source_hash()
         except PluginError:
             return False
 
     def status(self) -> dict:
-        return self._call("status")
+        return self._send("status")
 
     def click(self, address: str, gx: int, gy: int, button: str = "left", count: int = 1) -> dict:
         return self._call("click", address, str(gx), str(gy), str(BUTTON_CODES[button]), str(count))
