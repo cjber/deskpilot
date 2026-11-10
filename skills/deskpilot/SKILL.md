@@ -51,6 +51,8 @@ them instead:
   opens on mouse-over.
 - `--take-focus` on `key` or `type` focuses the window and leaves it focused. Use it only for an app that ignores
   keys while unfocused, after a plain `--window` attempt did nothing.
+- `--take-focus` on `click` does the same before clicking. Use it when a menu or dropdown you clicked open is gone
+  in the next `shot`: its app closes popups while its window is not the focused one.
 
 Both interrupt whatever the user is doing, so tell the user before using them. `key` and `type` without `--window`
 press into the focused window, which may be the user's own: always pass `--window`.

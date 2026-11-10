@@ -154,7 +154,12 @@ class Desk:
         *,
         shot: str | None = None,
         show: bool = False,
+        take_focus: bool = False,
     ) -> tuple[int, int]:
+        """Click a point. take_focus focuses the window first and leaves it focused, for a menu or dropdown that
+        closes when its window is not the focused one."""
+        if take_focus:
+            self.focus(query)
         win, gx, gy = self.point(query, x, y, scale, shot, show)
         self.cursor.glide(gx, gy)
         if take_pointer:

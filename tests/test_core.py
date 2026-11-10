@@ -285,6 +285,15 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
     assert inp.events == []
 
 
+def test_click_with_take_focus_focuses_the_window_before_the_plugin_clicks(tmp_path, monkeypatch):
+    desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk.click("battle", 10, 10, take_focus=True)
+    focus = ["dispatch", 'hl.dsp.focus({window="address:0xabc"})']
+    assert focus in fake.calls and plugin.calls[-1][0] == "click"
+    desk.click("battle", 10, 10)
+    assert fake.calls.count(focus) == 1
+
+
 def test_keys_without_a_window_go_to_the_focused_one_and_take_focus_focuses_first(tmp_path, monkeypatch):
     desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
     desk.key("Return")

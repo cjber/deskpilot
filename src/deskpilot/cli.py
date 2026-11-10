@@ -80,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = _point_parser(sub, "click", "click a point")
     s.add_argument("--button", choices=["left", "right", "middle"], default="left")
     s.add_argument("--double", action="store_true")
+    s.add_argument(
+        "--take-focus",
+        action="store_true",
+        help="focus the window first and leave it focused, for a menu or dropdown that closes when it is not focused",
+    )
     s = _point_parser(sub, "scroll", "scroll at a point; positive is up")
     s.add_argument("dy", type=int)
 
@@ -157,6 +162,7 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 args.take_pointer,
                 shot=args.shot,
                 show=args.show,
+                take_focus=args.take_focus,
             )
             return {"x": gx, "y": gy}
         case "scroll":

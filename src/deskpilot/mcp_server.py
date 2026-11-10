@@ -63,10 +63,14 @@ def click(
     shot: str | None = None,
     show: bool = False,
     take_pointer: bool = False,
+    take_focus: bool = False,
 ) -> dict:
     """Click a point given in pixels of `shot`, or of the window's latest screenshot. The user's pointer and
-    keyboard focus stay put unless take_pointer is set."""
-    gx, gy = desk.click(window, x, y, button, 2 if double else 1, take_pointer=take_pointer, shot=shot, show=show)
+    keyboard focus stay put unless take_pointer is set, or take_focus, which focuses the window first and leaves it
+    focused: use it for a menu or dropdown that closes as soon as it opens."""
+    gx, gy = desk.click(
+        window, x, y, button, 2 if double else 1, take_pointer=take_pointer, shot=shot, show=show, take_focus=take_focus
+    )
     return {"x": gx, "y": gy}
 
 
