@@ -56,48 +56,120 @@ def shot(window: str, max_width: int = 1400, show: bool = False) -> list:
 @_tool()
 def click(
     window: str,
-    x: float,
-    y: float,
+    x: float | None = None,
+    y: float | None = None,
     button: Literal["left", "right", "middle"] = "left",
     double: bool = False,
     shot: str | None = None,
     show: bool = False,
     take_pointer: bool = False,
     take_focus: bool = False,
+    element: str | None = None,
 ) -> dict:
-    """Click a point given in pixels of `shot`, or of the window's latest screenshot. The user's pointer and
-    keyboard focus stay put unless take_pointer is set, or take_focus, which focuses the window first and leaves it
-    focused: use it for a menu or dropdown that closes as soon as it opens."""
+    """Click a point given in pixels of `shot`, or of the window's latest screenshot, or the centre of an element id
+    from `elements`. The user's pointer and keyboard focus stay put unless take_pointer is set, or take_focus, which
+    focuses the window first and leaves it focused: use it for a menu or dropdown that closes as soon as it opens."""
     gx, gy = desk.click(
-        window, x, y, button, 2 if double else 1, take_pointer=take_pointer, shot=shot, show=show, take_focus=take_focus
+        window,
+        x,
+        y,
+        button,
+        2 if double else 1,
+        take_pointer=take_pointer,
+        shot=shot,
+        show=show,
+        take_focus=take_focus,
+        element=element,
     )
     return {"x": gx, "y": gy}
 
 
 @_tool()
 def move(
-    window: str, x: float, y: float, shot: str | None = None, show: bool = False, take_pointer: bool = False
+    window: str,
+    x: float | None = None,
+    y: float | None = None,
+    shot: str | None = None,
+    show: bool = False,
+    take_pointer: bool = False,
+    element: str | None = None,
 ) -> dict:
-    """Show the agent cursor at a point of the window's last screenshot. take_pointer also moves the user's pointer
-    there, for a hover the app must see."""
-    gx, gy = desk.move(window, x, y, take_pointer=take_pointer, shot=shot, show=show)
+    """Show the agent cursor at a point of the window's last screenshot, or at an element. take_pointer also moves
+    the user's pointer there. For a hover the app must see, use hover, which leaves the user's pointer alone."""
+    gx, gy = desk.move(window, x, y, take_pointer=take_pointer, shot=shot, show=show, element=element)
     return {"x": gx, "y": gy}
 
 
 @_tool()
 def scroll(
-    window: str, x: float, y: float, dy: int, shot: str | None = None, show: bool = False, take_pointer: bool = False
+    window: str,
+    dy: int,
+    x: float | None = None,
+    y: float | None = None,
+    shot: str | None = None,
+    show: bool = False,
+    take_pointer: bool = False,
+    element: str | None = None,
 ) -> dict:
-    """Scroll at a point of `shot` or the window's latest screenshot; positive dy scrolls up."""
-    gx, gy = desk.scroll(window, x, y, dy, take_pointer=take_pointer, shot=shot, show=show)
+    """Scroll at a point of `shot` or the window's latest screenshot, or at an element; positive dy scrolls up."""
+    gx, gy = desk.scroll(window, x, y, dy, take_pointer=take_pointer, shot=shot, show=show, element=element)
+    return {"x": gx, "y": gy}
+
+
+@_tool(structured_output=False)
+def hover(
+    window: str,
+    x: float | None = None,
+    y: float | None = None,
+    wait: float = 1.0,
+    shot: str | None = None,
+    show: bool = False,
+    element: str | None = None,
+    then_click: tuple[float, float] | None = None,
+    button: Literal["left", "right", "middle"] = "left",
+) -> list:
+    """Rest the pointer on a point (or element) for `wait` seconds, up to 5, without moving the user's pointer, and
+    return a screenshot taken while it rests there: tooltips and hover states show in it. With then_click, a point
+    in the same pixels, click there next before the pointer leaves, as a menu that opens on hover needs."""
+    result = desk.hover(window, x, y, wait, shot=shot, show=show, element=element, then_click=then_click, button=button)
+    if isinstance(result, tuple):
+        return [{"x": result[0], "y": result[1]}]
+    return [Image(path=result.path), result.to_dict()]
+
+
+@_tool()
+def drag(
+    window: str,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    button: Literal["left", "right", "middle"] = "left",
+    duration: float = 0.3,
+    shot: str | None = None,
+    show: bool = False,
+) -> dict:
+    """Press at (x1, y1), move to (x2, y2) over duration seconds (up to 5) and release, in pixels of `shot` or the
+    window's latest screenshot: sliders, text selection, drawing and drag and drop within the window. The user's
+    pointer stays put."""
+    gx, gy = desk.drag(window, (x1, y1), (x2, y2), button, duration, shot=shot, show=show)
     return {"x": gx, "y": gy}
 
 
 @_tool()
-def key(combo: str, window: str | None = None, take_focus: bool = False) -> str:
+def elements(window: str, show: bool = False) -> dict:
+    """The window's accessibility tree: each element's id, role, name, states, text and bounds in window pixels.
+    click, hover, move and scroll take an id as `element` and act on where the app says it is now. An app that
+    exposes no tree is an error saying so."""
+    return desk.elements(window, show).to_dict()
+
+
+@_tool()
+def key(combo: str, window: str | None = None, take_focus: bool = False, hold: float = 0.0) -> str:
     """Press a key or chord such as Return, ctrl+a or alt+F4 in a window without focusing it. take_focus focuses
-    the window first instead; with no window the keys go to the focused one."""
-    desk.key(combo, window, take_focus)
+    the window first instead; with no window the keys go to the focused one. hold keeps each key down that many
+    seconds, up to 10, for auto-repeat or a game's movement."""
+    desk.key(combo, window, take_focus, hold)
     return "ok"
 
 

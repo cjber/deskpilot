@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Drag, hover and hold keys without taking your pointer.** `deskpilot drag` presses, moves and releases for
+  sliders, text selection and drag and drop within a window. `deskpilot hover` rests the pointer on a point and
+  returns a screenshot taken meanwhile, so tooltips show, and `--click` clicks next for a menu that opens on hover.
+  `key --hold` keeps a key down. Each holds your pointer input only while it runs and always lets go of its button
+  (MCP `drag`, `hover`, and `hold` on `key`).
+- **Target elements of the accessibility tree.** `deskpilot elements` prints an app's AT-SPI tree with roles, names,
+  states, text and bounds, and `--element ID` on `click`, `move`, `scroll` and `hover` acts where the app says the
+  element is now (MCP `elements` and `element`). An app that exposes no tree says so.
+- **Clicks move the pointer before pressing.** Each click and scroll now sends a motion event at its point before
+  the press, as a real pointer does, for clients that track the pointer from motion.
+
 ## [0.3.0] - 2026-11-10
 
 - **Text arrives as written on any keyboard layout.** `type` and `key` used US key positions, so another layout or

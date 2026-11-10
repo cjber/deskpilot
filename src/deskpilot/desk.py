@@ -12,10 +12,10 @@ from pathlib import Path
 
 from PIL import Image, ImageChops
 
-from . import clipboard, keys, screen
+from . import a11y, clipboard, keys, screen
 from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound
 from .overlay import AgentCursor
-from .plugin import Plugin, PluginError
+from .plugin import BUTTON_CODES, Plugin, PluginError
 
 
 class NotVisible(LookupError):
@@ -37,6 +37,14 @@ EXPECTED = (
 # How long `show` waits for a focused window to come on screen: a workspace switch or a scrolling layout's
 # animation has to finish before the window's area is its own.
 SHOW_TIMEOUT = 3.0
+
+# A drag's pointer path: a point about every frame, so the app sees it travel, and a pause on each side of the press and
+# release, as a hand makes, so a slider or a drag threshold sees the press before the motion.
+DRAG_STEP = 1 / 60
+DRAG_PAUSE_MS = 60
+# How long beyond its own wait a hover holds the pointer for its screenshot. The plugin ends the hover when the shot is
+# taken; this bounds it if deskpilot dies first.
+HOVER_SHOT_MS = 5000
 
 
 class Desk:
@@ -101,15 +109,23 @@ class Desk:
     def point(
         self,
         query: str,
-        x: float,
-        y: float,
+        x: float | None,
+        y: float | None,
         scale: float | None = None,
         shot: str | None = None,
         show: bool = False,
+        element: str | None = None,
     ) -> tuple[Window, int, int]:
         """Resolve a point to a global position. The point is in pixels of `shot`, or of the window's latest shot,
-        or at `scale` (1 for window pixels); with no shot at all it is in window pixels."""
+        or at `scale` (1 for window pixels); with no shot at all it is in window pixels. With `element` it is the
+        centre of that element of the window's accessibility tree, where the app says it is now."""
+        if (element is None) == (x is None or y is None):
+            raise ValueError("give a point (x and y) or an element, not both or neither")
         win = self._on_screen(self.window(query), show)
+        if element is not None:
+            ex, ey, ew, eh = a11y.locate(win, element)
+            return win, *screen.to_global(win, ex + ew / 2, ey + eh / 2, 1.0)
+        assert x is not None and y is not None
         if scale is None:
             taken = screen.load(shot) if shot else screen.latest(win.address)
             if taken:
@@ -127,16 +143,17 @@ class Desk:
     def move(
         self,
         query: str,
-        x: float,
-        y: float,
+        x: float | None,
+        y: float | None,
         scale: float | None = None,
         take_pointer: bool = False,
         *,
         shot: str | None = None,
         show: bool = False,
+        element: str | None = None,
     ) -> tuple[int, int]:
-        """Show the agent cursor at a point. take_pointer also moves the user's pointer, for a hover."""
-        win, gx, gy = self.point(query, x, y, scale, shot, show)
+        """Show the agent cursor at a point. take_pointer also moves the user's pointer there."""
+        win, gx, gy = self.point(query, x, y, scale, shot, show, element)
         self.cursor.glide(gx, gy)
         if take_pointer:
             self._take_pointer(win, gx, gy)
@@ -145,8 +162,8 @@ class Desk:
     def click(
         self,
         query: str,
-        x: float,
-        y: float,
+        x: float | None,
+        y: float | None,
         button: str = "left",
         count: int = 1,
         scale: float | None = None,
@@ -155,12 +172,13 @@ class Desk:
         shot: str | None = None,
         show: bool = False,
         take_focus: bool = False,
+        element: str | None = None,
     ) -> tuple[int, int]:
         """Click a point. take_focus focuses the window first and leaves it focused, for a menu or dropdown that
         closes when its window is not the focused one."""
         if take_focus:
             self.focus(query)
-        win, gx, gy = self.point(query, x, y, scale, shot, show)
+        win, gx, gy = self.point(query, x, y, scale, shot, show, element)
         self.cursor.glide(gx, gy)
         if take_pointer:
             self._take_pointer(win, gx, gy)
@@ -172,16 +190,17 @@ class Desk:
     def scroll(
         self,
         query: str,
-        x: float,
-        y: float,
+        x: float | None,
+        y: float | None,
         dy: int,
         scale: float | None = None,
         take_pointer: bool = False,
         *,
         shot: str | None = None,
         show: bool = False,
+        element: str | None = None,
     ) -> tuple[int, int]:
-        win, gx, gy = self.point(query, x, y, scale, shot, show)
+        win, gx, gy = self.point(query, x, y, scale, shot, show, element)
         self.cursor.glide(gx, gy)
         if take_pointer:
             self._take_pointer(win, gx, gy)
@@ -190,10 +209,83 @@ class Desk:
             self.plugin.scroll(win.address, gx, gy, dy)
         return gx, gy
 
-    def key(self, combo: str, query: str | None = None, take_focus: bool = False) -> None:
+    def drag(
+        self,
+        query: str,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        button: str = "left",
+        duration: float = 0.3,
+        scale: float | None = None,
+        *,
+        shot: str | None = None,
+        show: bool = False,
+    ) -> tuple[int, int]:
+        """Press at `start`, move to `end` over `duration` seconds and release there, for a slider, a selection or a
+        drag and drop within the window. Both points are in the same shot's pixels. The user's pointer stays put."""
+        win, x1, y1 = self.point(query, *start, scale, shot, show)
+        _, x2, y2 = self.point(query, *end, scale, shot, show)
+        if not 0 < duration <= 5:
+            raise ValueError("a drag takes more than 0 and at most 5 seconds")
+        moves = max(2, round(duration / DRAG_STEP))
+        wait = max(0, round(duration * 1000 / moves) - 8)
+        code = BUTTON_CODES[button]
+        steps = [f"m{x1},{y1}", f"d{DRAG_PAUSE_MS}", f"p{code}", f"d{DRAG_PAUSE_MS}"]
+        for i in range(1, moves + 1):
+            steps += [f"m{x1 + (x2 - x1) * i / moves:g},{y1 + (y2 - y1) * i / moves:g}", f"d{wait}"]
+        steps += [f"d{DRAG_PAUSE_MS}", f"r{code}"]
+        self.cursor.glide(x1, y1)
+        self.plugin.path(win.address, steps)
+        self.cursor.glide(x2, y2)
+        return x2, y2
+
+    def hover(
+        self,
+        query: str,
+        x: float | None,
+        y: float | None,
+        wait: float = 1.0,
+        scale: float | None = None,
+        *,
+        shot: str | None = None,
+        show: bool = False,
+        element: str | None = None,
+        then_click: tuple[float, float] | None = None,
+        button: str = "left",
+        max_width: int = screen.DEFAULT_MAX_WIDTH,
+    ) -> screen.Shot | tuple[int, int]:
+        """Rest the pointer on a point for `wait` seconds without moving the user's, for a tooltip or a menu that
+        opens on hover. Returns a screenshot taken while it rests there. With `then_click`, a point in the same
+        pixels, it clicks there next instead, before the pointer leaves, and returns that point."""
+        if not 0 <= wait <= 5:
+            raise ValueError("a hover waits 0 to 5 seconds")
+        win, gx, gy = self.point(query, x, y, scale, shot, show, element)
+        self.cursor.glide(gx, gy)
+        if then_click is not None:
+            _, cx, cy = self.point(query, *then_click, scale, shot, show)
+            code = BUTTON_CODES[button]
+            steps = [f"m{gx},{gy}", f"d{round(wait * 1000)}", f"m{cx},{cy}", f"p{code}", f"r{code}"]
+            self.plugin.path(win.address, steps)
+            self.cursor.glide(cx, cy)
+            return cx, cy
+        reply = self.plugin.path(win.address, [f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"])
+        try:
+            time.sleep(wait)
+            return screen.capture(win, max_width=max_width)
+        finally:
+            self.plugin.end(reply["ticket"])
+
+    def elements(self, query: str, show: bool = False) -> a11y.Element:
+        """The window's accessibility tree, whose element ids click, hover, move and scroll take."""
+        return a11y.snapshot(self._on_screen(self.window(query), show))
+
+    def key(self, combo: str, query: str | None = None, take_focus: bool = False, hold: float = 0.0) -> None:
         """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
-        keys go to the focused window."""
-        self.plugin.keys(self._key_target(query, take_focus).address, keys.chord_words(combo))
+        keys go to the focused window. Each key is held `hold` seconds, up to 10, for an app that acts while a key is
+        down (auto-repeat, a game's movement)."""
+        if not 0 <= hold <= 10:
+            raise ValueError("a key is held 0 to 10 seconds")
+        self.plugin.keys(self._key_target(query, take_focus).address, keys.chord_words(combo), hold=hold)
 
     def type(self, text: str, query: str | None = None, delay: float = 0.03, take_focus: bool = False) -> None:
         """Type text as written, on the user's own keymap. Each key is held `delay` seconds, and the next follows

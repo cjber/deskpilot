@@ -31,6 +31,7 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 - `src/deskpilot/uinput.py`: the virtual mouse behind `--take-pointer`
 - `src/deskpilot/keys.py`: key names, chords and text as the plugin's key events
 - `src/deskpilot/clipboard.py`: the user's clipboard through wl-clipboard
+- `src/deskpilot/a11y.py`: the target app's AT-SPI accessibility tree over D-Bus, and element ids for actions
 
 ## Rules
 
@@ -48,6 +49,10 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
   A character no key on that keymap gives is an error, never skipped.
 - A paste offers its text to the target window's client alone and never sets the seat's selection, so the user's
   clipboard is untouched. A client that can only read the shared clipboard (XWayland) is refused.
+- A pointer action (click, scroll, drag, hover) holds the user's pointer input while it runs, so it is bounded in
+  steps and time, and it lets go of every button it pressed however it ends.
+- An element is targeted where the app reports it when the action runs, never from a stale snapshot. An app that
+  exposes no accessibility tree is an error, never a guessed tree.
 - Tests never touch the real compositor, `/dev/uinput`, `grim` or `cua-driver`. Pass fakes into `Desk` and
   `Hyprland`, as `tests/test_core.py` does.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change

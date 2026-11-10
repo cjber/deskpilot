@@ -139,6 +139,16 @@ class Plugin:
     def scroll(self, address: str, gx: int, gy: int, dy: int) -> dict:
         return self._call("scroll", address, str(gx), str(gy), str(dy))
 
+    def path(self, address: str, steps: list[str]) -> dict:
+        """Run a pointer path in a window as one action: `mX,Y` moves to a global point (the first step enters the
+        window there), `pCODE` and `rCODE` press and release a button, `dMS` waits, and `n` answers here with the
+        action's ticket while it goes on, until it ends or `end` ends it."""
+        return self._call("path", address, *steps)
+
+    def end(self, ticket: int) -> None:
+        """End the path with this ticket now, letting go of what it holds. One that has ended already is fine."""
+        self._send("end", str(ticket))
+
     def keys(
         self, address: str, words: list[str], hold: float = 0.0, gap: float = 0.0, paste: str | None = None
     ) -> dict:

@@ -1,7 +1,8 @@
 """deskpilot: drive Hyprland desktop windows from an agent.
 
-Coordinates for move, click and scroll are pixels in the window's last `deskpilot shot`, so read the screenshot,
-pick a point, click it. Pass --scale 1 to give window pixels instead.
+Coordinates for move, click, scroll, hover and drag are pixels in the window's last `deskpilot shot`, so read the
+screenshot, pick a point, click it. Pass --scale 1 to give window pixels instead, or --element with an id from
+`deskpilot elements` to act on that element of the app's accessibility tree.
 
 Clicks, scrolls, keys and text run inside the compositor through the deskpilot Hyprland plugin (`deskpilot plugin
 load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on the user's
@@ -31,19 +32,39 @@ def _print(data, as_json: bool) -> None:
 SHOW_HELP = "bring a window that is not on screen into view by focusing it, instead of refusing"
 
 
-def _point_parser(sub, name: str, helptext: str) -> argparse.ArgumentParser:
-    """A command that acts at a point of a window's screenshot."""
+def _point_parser(sub, name: str, helptext: str, take_pointer: bool = True) -> argparse.ArgumentParser:
+    """A command that acts at a point of a window's screenshot, or at an element of its accessibility tree."""
     s = sub.add_parser(name, help=helptext)
     s.add_argument("window")
-    s.add_argument("x", type=float)
-    s.add_argument("y", type=float)
+    s.add_argument("x", type=float, nargs="?")
+    s.add_argument("y", type=float, nargs="?")
+    s.add_argument("--element", help="an element id from `deskpilot elements`, instead of x and y")
+    _shot_args(s)
+    if take_pointer:
+        s.add_argument(
+            "--take-pointer",
+            action="store_true",
+            help="move the user's own pointer there instead of leaving it in place",
+        )
+    return s
+
+
+def _shot_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--scale", type=float, help="the scale the point is in; 1 for window pixels")
     s.add_argument("--shot", help="the shot id the point is in (default: the window's latest shot)")
     s.add_argument("--show", action="store_true", help=SHOW_HELP)
-    s.add_argument(
-        "--take-pointer", action="store_true", help="move the user's own pointer there instead of leaving it in place"
+
+
+def _tree(element: dict, depth: int = 0) -> list[str]:
+    """An accessibility tree as indented lines: id, role, name, bounds in window pixels, states and text."""
+    name = f" {element['name']!r}" if element.get("name") else ""
+    text = f" text={element['text']!r}" if element.get("text") else ""
+    states = f" [{', '.join(element['states'])}]" if element.get("states") else ""
+    line = (
+        f"{'  ' * depth}{element['id']} {element['role']}{name} "
+        f"{element['x']},{element['y']} {element['width']}x{element['height']}{states}{text}"
     )
-    return s
+    return [line] + [row for child in element.get("children", []) for row in _tree(child, depth + 1)]
 
 
 def _text(arg: str) -> str:
@@ -56,6 +77,40 @@ def _size(text: str) -> tuple[int, int]:
         return int(w), int(h)
     except ValueError:
         raise argparse.ArgumentTypeError(f"size must be WIDTHxHEIGHT, not {text!r}") from None
+
+
+def _path_commands(sub) -> None:
+    """hover, drag and elements: pointer paths and the accessibility tree that names their targets."""
+    s = _point_parser(
+        sub,
+        "hover",
+        "rest the pointer on a point for a tooltip or a hover menu and print a screenshot taken meanwhile",
+        take_pointer=False,
+    )
+    s.add_argument("--wait", type=float, default=1.0, help="seconds to rest there before the screenshot (up to 5)")
+    s.add_argument(
+        "--click",
+        type=float,
+        nargs=2,
+        metavar=("X", "Y"),
+        help="click this point next, as in a menu that opened on hover",
+    )
+    s.add_argument("--button", choices=["left", "right", "middle"], default="left")
+    s.add_argument("--max-width", type=int, default=1400, help="scale down wider windows to this width")
+
+    s = sub.add_parser("drag", help="press at one point, move to another and release, for a slider or a selection")
+    s.add_argument("window")
+    s.add_argument("x1", type=float)
+    s.add_argument("y1", type=float)
+    s.add_argument("x2", type=float)
+    s.add_argument("y2", type=float)
+    s.add_argument("--button", choices=["left", "right", "middle"], default="left")
+    s.add_argument("--duration", type=float, default=0.3, help="seconds the move takes (up to 5)")
+    _shot_args(s)
+
+    s = sub.add_parser("elements", help="print a window's accessibility tree, with ids that --element takes")
+    s.add_argument("window")
+    s.add_argument("--show", action="store_true", help=SHOW_HELP)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,6 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = _point_parser(sub, "scroll", "scroll at a point; positive is up")
     s.add_argument("dy", type=int)
 
+    _path_commands(sub)
+
     s = sub.add_parser("plugin", help="build, load or check the deskpilot Hyprland plugin")
     s.add_argument("action", choices=["build", "load", "status"])
 
@@ -96,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("combo")
     s.add_argument("--window", help="press it in this window; without it the keys go to the focused window")
     s.add_argument("--take-focus", action="store_true", help=focus_help)
+    s.add_argument("--hold", type=float, default=0.0, help="seconds to hold each key down (up to 10)")
 
     s = sub.add_parser("type", help="type text as written, on the user's keymap")
     s.add_argument("text")
@@ -147,7 +205,14 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             return desk.shot(args.window, args.out, args.max_width, args.show).to_dict()
         case "move":
             gx, gy = desk.move(
-                args.window, args.x, args.y, args.scale, args.take_pointer, shot=args.shot, show=args.show
+                args.window,
+                args.x,
+                args.y,
+                args.scale,
+                args.take_pointer,
+                shot=args.shot,
+                show=args.show,
+                element=args.element,
             )
             return {"x": gx, "y": gy}
         case "click":
@@ -163,15 +228,56 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 shot=args.shot,
                 show=args.show,
                 take_focus=args.take_focus,
+                element=args.element,
             )
             return {"x": gx, "y": gy}
         case "scroll":
             gx, gy = desk.scroll(
-                args.window, args.x, args.y, args.dy, args.scale, args.take_pointer, shot=args.shot, show=args.show
+                args.window,
+                args.x,
+                args.y,
+                args.dy,
+                args.scale,
+                args.take_pointer,
+                shot=args.shot,
+                show=args.show,
+                element=args.element,
             )
             return {"x": gx, "y": gy}
+        case "hover":
+            result = desk.hover(
+                args.window,
+                args.x,
+                args.y,
+                args.wait,
+                args.scale,
+                shot=args.shot,
+                show=args.show,
+                element=args.element,
+                then_click=tuple(args.click) if args.click else None,
+                button=args.button,
+                max_width=args.max_width,
+            )
+            if isinstance(result, tuple):
+                return {"x": result[0], "y": result[1]}
+            return result.to_dict()
+        case "drag":
+            gx, gy = desk.drag(
+                args.window,
+                (args.x1, args.y1),
+                (args.x2, args.y2),
+                args.button,
+                args.duration,
+                args.scale,
+                shot=args.shot,
+                show=args.show,
+            )
+            return {"x": gx, "y": gy}
+        case "elements":
+            tree = desk.elements(args.window, args.show).to_dict()
+            return tree if args.json else _tree(tree)
         case "key":
-            desk.key(args.combo, args.window, args.take_focus)
+            desk.key(args.combo, args.window, args.take_focus, args.hold)
             return "ok"
         case "type":
             desk.type(args.text, args.window, args.delay, args.take_focus)

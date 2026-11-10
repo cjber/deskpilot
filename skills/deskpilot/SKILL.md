@@ -6,8 +6,8 @@ description: Click, scroll and type in desktop app windows on Hyprland with the 
 # deskpilot
 
 Run `deskpilot --help` for the command list, and put `--json` before the command for JSON output. Over MCP the same
-actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `key`, `type_text`, `paste_text`,
-`clipboard`, `copy_text`, `wait_for` and `wait_changed`.
+actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `hover`, `drag`, `elements`, `key`,
+`type_text`, `paste_text`, `clipboard`, `copy_text`, `wait_for` and `wait_changed`.
 
 If `deskpilot` is not on `PATH`, ask the user before installing it with
 `uv tool install deskpilot`.
@@ -24,9 +24,14 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    `--double`), `deskpilot scroll WINDOW X Y DY --shot ID` (positive is up), or `deskpilot move WINDOW X Y --shot ID`
    to show the agent cursor there. Points are pixels in that shot, so never rescale them yourself; `--scale 1` means
    window pixels. A point outside the window, one another window covers, or a window resized since the shot is
-   refused.
+   refused. `deskpilot drag WINDOW X1 Y1 X2 Y2 --shot ID` presses, moves and releases (sliders, selections, drag and
+   drop within the window). `deskpilot hover WINDOW X Y --shot ID` rests the pointer there and prints a shot taken
+   meanwhile, for tooltips; `--click X2 Y2` clicks next, for a menu that opens on hover.
+   For a GTK or Qt app, `deskpilot elements WINDOW` lists its accessibility tree with ids, and
+   `--element ID` replaces X Y on `click`, `move`, `scroll` and `hover`. Prefer it where the app has a tree: the
+   app reports where the element is. An app without one says so; use a shot instead.
 5. Type with `deskpilot type "TEXT" --window WINDOW` and press keys with `deskpilot key ctrl+a --window WINDOW`. Games
-   read keys once per frame, so add `--delay 0.1` or more for them: each key is held that long, with the same gap
+   read keys once per frame, so add `--delay 0.1` or more for them, and `key --hold SECONDS` to keep a key down: each key is held that long, with the same gap
    before the next. Text arrives as written on the user's keymap; a character no key on it types is an error, so
    send such text, or a long one, with `deskpilot paste "TEXT" --window WINDOW` (`--keys ctrl+shift+v` in a
    terminal). A paste uses a clipboard only that window sees; XWayland windows refuse it. `deskpilot clipboard`
@@ -47,8 +52,7 @@ By default the user's pointer and keyboard focus stay where they are, so the use
 them instead:
 
 - `--take-pointer` on `click`, `move` or `scroll` moves the user's own pointer there, through a virtual mouse that
-  needs write access to `/dev/uinput`. Use it only when the app must see a hover, such as a tooltip or a menu that
-  opens on mouse-over.
+  needs write access to `/dev/uinput`. Use it only when a plain click or `hover` did not work.
 - `--take-focus` on `key` or `type` focuses the window and leaves it focused. Use it only for an app that ignores
   keys while unfocused, after a plain `--window` attempt did nothing.
 - `--take-focus` on `click` does the same before clicking. Use it when a menu or dropdown you clicked open is gone

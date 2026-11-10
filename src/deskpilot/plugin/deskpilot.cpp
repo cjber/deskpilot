@@ -20,6 +20,14 @@
 //      anything moved it, the cursor's visibility is restored, and the held input is replayed in the order it came
 //      through Hyprland's own handlers, so the user's motion keeps its acceleration and reaches pointer-locked games.
 //
+// `hyprctl deskpilot path <window> <step>...` runs a bounded pointer sequence the same way: mX,Y moves to global X,Y
+// (the first step enters there), pBUTTON and rBUTTON press and release, dMS waits, and n answers the caller at once
+// while the rest goes on. While a button is down the surface it pressed keeps the pointer focus, as for the user's own
+// held buttons, so a drag follows wherever it goes; a drag and drop the client starts is moved and dropped the way
+// Hyprland's own listeners do it, without emitting input events other listeners would act on. A path must release
+// every button it presses. `hyprctl deskpilot end <ticket>` ends a running path early: its buttons are released and
+// the user's pointer and focus restored as usual. Drag, hover and hover-then-click are paths.
+//
 // `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
 // without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
 // key that gives character U+HEX unmodified (a chord's ctrl+a), or `tHEX` to type U+HEX. Characters are resolved on the
@@ -168,19 +176,32 @@ namespace {
     // Key transactions being staged at once; a client that died mid-stage leaves one behind, and the oldest goes first.
     constexpr size_t MAX_STAGED = 32;
 
+    // How long a path waits after moving the pointer: about a frame, so a client that reads input once a frame still
+    // sees the pointer go through each point.
+    constexpr auto MOVE_GAP = ms(8);
+    // A path's bounds, since the user's own pointer input is held while it runs.
+    constexpr int  MAX_MOVES   = 500;
+    constexpr int  MAX_PRESSES = 20;
+    constexpr auto MAX_DWELL   = ms(10000);
+
+    // One step of a pointer action and how long to wait after it before the next.
+    struct SStep {
+        std::function<void()> run;
+        ms                    wait{0};
+    };
+
     struct SOp {
         uintptr_t                          window = 0;
-        Vector2D                           target;
-        uint32_t                           button = 0;
-        int                                count  = 0;
-        int                                scroll = 0; // wheel notches, positive up; 0 for a click
+        Vector2D                           target; // where the pointer is: the click's point, or a path's latest point
         Vector2D                           saved;
         bool                               hadFocus = false;
         PHLWINDOWREF                       focusWindow;
         WP<CWLSurfaceResource>             focusSurface;
         std::vector<std::function<void()>> heldInput;
-        std::vector<std::function<void()>> steps;
+        std::vector<SStep>                 steps;
         size_t                             next = 0;
+        std::vector<uint32_t>              down; // buttons this action holds down, released when it ends however it ends
+        bool                               answered = false; // a path's `n` step has answered its caller already
         SP<CEventLoopTimer>                timer;
         uint64_t                           ticket = 0;
         std::string                        error;
@@ -504,6 +525,34 @@ namespace {
         return false;
     }
 
+    // `pos` in the coordinates of `surface`, as mouseMoveUnified computes them: from the surface's global box, in buffer
+    // pixels for an XWayland window.
+    std::optional<Vector2D> localOn(const SP<CWLSurfaceResource>& surface, const Vector2D& pos) {
+        if (!surface)
+            return std::nullopt;
+        const auto HLSURFACE = Desktop::View::CWLSurface::fromResource(surface);
+        if (!HLSURFACE)
+            return std::nullopt;
+        const auto BOX = HLSURFACE->getSurfaceBoxGlobal();
+        if (!BOX)
+            return std::nullopt;
+        auto       local  = pos - BOX->pos();
+        const auto WINDOW = Desktop::View::CWindow::fromView(HLSURFACE->view());
+        if (WINDOW && WINDOW->backend().isX11())
+            local = WINDOW->backend().surfaceLocalToBuffer(local);
+        return local;
+    }
+
+    // A motion event at the pointer's position to the surface with pointer focus. Real input moves the pointer to a
+    // point before pressing there, and some clients track the pointer from motion alone, not from the enter.
+    void sendMotion() {
+        const auto LOCAL = localOn(g_pSeatManager->m_state.pointerFocus.lock(), g_pInputManager->getMouseCoordsInternal());
+        if (!LOCAL)
+            return;
+        g_pSeatManager->sendPointerMotion(now(), *LOCAL);
+        g_pSeatManager->sendPointerFrame();
+    }
+
     // Pointer focus to the surface under the pointer, with an enter at the pointer's position, and nothing else:
     // simulateMouseMovement would also run focus-follows-mouse and move keyboard focus. Leaving first makes the enter
     // carry the new position even when the pointer was already on that surface, since setPointerFocus skips a
@@ -515,10 +564,87 @@ namespace {
         g_pSeatManager->sendPointerFrame();
     }
 
+    // Defined with the data device's private members below.
+    void dndMotion(const Vector2D& pos);
+    void dndDrop();
+
+    // The pointer to the first point of an action: entered there, and moved there only once that is the target, so a
+    // window covering the point never sees the motion of an action refused at it.
+    void enterAt(const Vector2D& pos) {
+        g_op->target = pos;
+        Pointer::mgr()->warpTo(pos);
+        enterUnderPointer();
+        if (targetUnderPointer())
+            sendMotion();
+    }
+
+    // The pointer on to a later point. With a button down the surface it pressed keeps the pointer focus, as Hyprland
+    // keeps it for the user's own held buttons, so a drag reaches the surface it started on wherever it goes. With none
+    // down the pointer enters what is under it, which must be the target. A drag and drop the window started goes
+    // the way Hyprland takes one.
+    void moveTo(const Vector2D& pos) {
+        g_op->target = pos;
+        Pointer::mgr()->warpTo(pos);
+        if (PROTO::data->dndActive()) {
+            dndMotion(pos);
+            return;
+        }
+        if (g_op->down.empty()) {
+            g_pInputManager->refocusPointer();
+            if (!targetUnderPointer())
+                return;
+        }
+        sendMotion();
+    }
+
+    // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
+    void press(uint32_t button) {
+        if (!targetUnderPointer())
+            return;
+        g_pSeatManager->sendPointerButton(now(), button, WL_POINTER_BUTTON_STATE_PRESSED);
+        g_pSeatManager->sendPointerFrame();
+        g_op->down.push_back(button);
+    }
+
+    // A release that ends a drag and drop drops it where the pointer is.
+    void release(uint32_t button) {
+        const auto IT = std::ranges::find(g_op->down, button);
+        if (IT == g_op->down.end())
+            return;
+        g_op->down.erase(IT);
+        if (PROTO::data->dndActive()) {
+            dndDrop();
+            return;
+        }
+        g_pSeatManager->sendPointerButton(now(), button, WL_POINTER_BUTTON_STATE_RELEASED);
+        g_pSeatManager->sendPointerFrame();
+    }
+
+    std::string pointAt(const Vector2D& pos) {
+        return std::format(R"("x":{},"y":{})", pos.x, pos.y);
+    }
+
+    // A path's `n` step: the caller is answered now, while the action goes on.
+    void answerEarly() {
+        if (!g_op->error.empty())
+            return;
+        complete(g_op->ticket, std::format(R"({{"ok":true,"ticket":{},{}}})", g_op->ticket, pointAt(g_op->target)));
+        g_op->answered = true;
+    }
+
     void finish() {
         auto op = std::move(*g_op);
         g_op.reset();
         dropTimer(op.timer);
+
+        // An action that ends early (an error, `end`, an unload) still lets go of every button it holds. A drag and
+        // drop it started is cancelled rather than dropped wherever the pointer happened to be.
+        if (!op.down.empty())
+            PROTO::data->abortDndIfPresent();
+        for (const auto BUTTON : op.down) {
+            g_pSeatManager->sendPointerButton(now(), BUTTON, WL_POINTER_BUTTON_STATE_RELEASED);
+            g_pSeatManager->sendPointerFrame();
+        }
 
         Pointer::mgr()->warpTo(op.saved);
         enterUnderPointer();
@@ -537,8 +663,8 @@ namespace {
         for (auto& replay : op.heldInput)
             replay();
 
-        complete(op.ticket,
-                 op.error.empty() ? std::format(R"({{"ok":true,"x":{},"y":{}}})", op.target.x, op.target.y) : errorReply(op.error));
+        if (!op.answered)
+            complete(op.ticket, op.error.empty() ? std::format(R"({{"ok":true,{}}})", pointAt(op.target)) : errorReply(op.error));
         startNext();
     }
 
@@ -549,54 +675,23 @@ namespace {
             finish();
             return;
         }
-        g_op->steps[g_op->next++]();
+        const auto& STEP = g_op->steps[g_op->next++];
+        const auto  WAIT = STEP.wait;
+        STEP.run();
         if (g_op)
-            g_op->timer->updateTimeout(g_op->next >= g_op->steps.size() ? SETTLE : (g_op->scroll ? BETWEEN / 2 : HOLD));
+            g_op->timer->updateTimeout(g_op->next >= g_op->steps.size() ? std::max(WAIT, ms(SETTLE)) : std::max(WAIT, ms(1)));
     }
 
-    // Each step runs on its own timer tick; a step that fails sets the error and the next tick restores the user.
-    void buildSteps(SOp& op) {
-        op.steps.push_back([] {
-            Pointer::mgr()->warpTo(g_op->target);
-            enterUnderPointer();
-            targetUnderPointer();
-        });
-        if (op.scroll) {
-            for (int i = 0; i < std::abs(op.scroll); ++i) {
-                op.steps.push_back([] {
-                    if (!targetUnderPointer())
-                        return;
-                    // One wheel notch as onMouseWheel sends it with a scroll factor of 1: delta 15, one discrete step,
-                    // value120 of 120. Negative is up in Wayland.
-                    const int SIGN = g_op->scroll > 0 ? -1 : 1;
-                    g_pSeatManager->sendPointerAxis(now(), WL_POINTER_AXIS_VERTICAL_SCROLL, 15.0 * SIGN, SIGN, 120 * SIGN, WL_POINTER_AXIS_SOURCE_WHEEL,
-                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-                    g_pSeatManager->sendPointerFrame();
-                });
-            }
-            return;
-        }
-        for (int i = 0; i < op.count; ++i) {
-            for (auto state : {WL_POINTER_BUTTON_STATE_PRESSED, WL_POINTER_BUTTON_STATE_RELEASED}) {
-                op.steps.push_back([state] {
-                    if (state == WL_POINTER_BUTTON_STATE_PRESSED && !targetUnderPointer())
-                        return;
-                    // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
-                    g_pSeatManager->sendPointerButton(now(), g_op->button, state);
-                    g_pSeatManager->sendPointerFrame();
-                });
-            }
-        }
-    }
-
-    // Starts a click or scroll; the user's pointer and focus are saved now, when it runs, not when it was queued.
+    // Starts a pointer action; the user's pointer and focus are saved now, when it runs, not when it was queued.
     std::optional<std::string> startPointer(SOp op, uint64_t ticket) {
+        // The user's drag and drop follows the pointer, so an action's pointer would carry it off and drop it.
+        if (PROTO::data->dndActive())
+            return "a drag and drop is in progress: try again when it ends";
         op.ticket       = ticket;
         op.saved        = g_pInputManager->getMouseCoordsInternal();
         op.focusWindow  = Desktop::focusState()->window();
         op.focusSurface = Desktop::focusState()->surface();
         op.hadFocus     = op.focusWindow || op.focusSurface;
-        buildSteps(op);
         g_op.emplace(std::move(op));
 
         g_pHyprRenderer->setCursorHidden(true);
@@ -713,6 +808,31 @@ namespace {
         friend constexpr auto member(SSendSelection);
     };
     template struct SAccess<&CWLDataDeviceProtocol::sendSelectionToDevice, SSendSelection>;
+    struct SDropDrag {
+        friend constexpr auto member(SDropDrag);
+    };
+    template struct SAccess<&CWLDataDeviceProtocol::dropDrag, SDropDrag>;
+    struct SDnd {
+        friend constexpr auto member(SDnd);
+    };
+    template struct SAccess<&CWLDataDeviceProtocol::m_dnd, SDnd>;
+
+    // A drag and drop started from an action's press follows the action's pointer as it would the user's. Hyprland
+    // moves and drops one from its input event bus, which an action's own events never go through, so this does what
+    // its listeners do: the surface under the pointer becomes the drop target and gets the motion.
+    void dndMotion(const Vector2D& pos) {
+        g_pInputManager->refocusPointer();
+        const auto DEVICE = ((*PROTO::data).*member(SDnd{})).focusedDevice.lock();
+        const auto TARGET = g_pSeatManager->m_state.dndPointerFocus.lock();
+        const auto HLSURFACE = TARGET ? Desktop::View::CWLSurface::fromResource(TARGET) : nullptr;
+        const auto BOX = HLSURFACE ? HLSURFACE->getSurfaceBoxGlobal() : std::nullopt;
+        if (DEVICE && BOX)
+            DEVICE->sendMotion(now(), pos - BOX->pos());
+    }
+
+    void dndDrop() {
+        ((*PROTO::data).*member(SDropDrag{}))();
+    }
 
     class CPasteSource;
     struct SPaste {
@@ -1321,19 +1441,116 @@ namespace {
             return refuse("bad arguments: " + command);
 
         SOp op;
-        op.window = *WINDOW;
-        op.target = {*X, *Y};
+        op.window         = *WINDOW;
+        op.target         = {*X, *Y};
+        const auto POINT  = op.target;
         if (CLICK) {
             const auto COUNT = number(args[6]);
             if (*A < 272 || *A > 274 || !COUNT || *COUNT < 1 || *COUNT > 3)
                 return refuse("button must be 272-274 and count 1-3");
-            op.button = static_cast<uint32_t>(*A);
-            op.count  = static_cast<int>(*COUNT);
+            const auto BUTTON = static_cast<uint32_t>(*A);
+            op.steps.push_back({[POINT] { enterAt(POINT); }, HOLD});
+            for (int i = 0; i < static_cast<int>(*COUNT); ++i) {
+                op.steps.push_back({[BUTTON] { press(BUTTON); }, HOLD});
+                op.steps.push_back({[BUTTON] { release(BUTTON); }, HOLD});
+            }
         } else {
             if (*A == 0 || std::abs(*A) > 50)
                 return refuse("dy must be a non-zero number of notches up to 50");
-            op.scroll = static_cast<int>(*A);
+            // One wheel notch as onMouseWheel sends it with a scroll factor of 1: delta 15, one discrete step, value120
+            // of 120. Negative is up in Wayland.
+            const int SIGN = *A > 0 ? -1 : 1;
+            op.steps.push_back({[POINT] { enterAt(POINT); }, BETWEEN / 2});
+            for (int i = 0; i < std::abs(static_cast<int>(*A)); ++i) {
+                op.steps.push_back({[SIGN] {
+                                        if (!targetUnderPointer())
+                                            return;
+                                        g_pSeatManager->sendPointerAxis(now(), WL_POINTER_AXIS_VERTICAL_SCROLL, 15.0 * SIGN, SIGN, 120 * SIGN, WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                                        WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                                        g_pSeatManager->sendPointerFrame();
+                                    },
+                                    BETWEEN / 2});
+            }
         }
+        return enqueue([op = std::move(op)](uint64_t ticket) mutable { return startPointer(std::move(op), ticket); });
+    }
+
+    // `path <window> <step>...`. A step is mX,Y to move the pointer to global X,Y (the first step, where it enters the
+    // window), pB or rB to press or release button B (272-274), dMS to wait MS milliseconds, or n to answer the request
+    // there while the action goes on, with its ticket for `end`.
+    IPC::Socket1::SResponse pathCommand(const std::vector<std::string>& args) {
+        constexpr auto USAGE = "usage: deskpilot path <window> <step>...; a step is mX,Y, pBUTTON, rBUTTON, dMS or n";
+        if (args.size() < 4)
+            return refuse(USAGE);
+        const auto WINDOW = address(args[2]);
+        if (!WINDOW)
+            return refuse("bad window " + args[2]);
+        SOp                   op;
+        op.window = *WINDOW;
+        std::vector<uint32_t> down;
+        int                   moves = 0, presses = 0;
+        ms                    dwell{0};
+        bool                  answers = false;
+        for (size_t i = 3; i < args.size(); ++i) {
+            const std::string& WORD = args[i];
+            const auto         BAD  = "bad path step '" + WORD + "'";
+            const std::string  REST = WORD.substr(1);
+            if (WORD[0] == 'm') {
+                const auto COMMA = REST.find(',');
+                const auto X     = COMMA == std::string::npos ? std::nullopt : number(REST.substr(0, COMMA));
+                const auto Y     = COMMA == std::string::npos ? std::nullopt : number(REST.substr(COMMA + 1));
+                if (!X || !Y)
+                    return refuse(BAD);
+                const Vector2D POINT{*X, *Y};
+                if (moves++ == 0) {
+                    op.target = POINT;
+                    op.steps.push_back({[POINT] { enterAt(POINT); }, MOVE_GAP});
+                } else
+                    op.steps.push_back({[POINT] { moveTo(POINT); }, MOVE_GAP});
+                continue;
+            }
+            if (moves == 0)
+                return refuse("a path starts with a move, mX,Y");
+            if (WORD[0] == 'p' || WORD[0] == 'r') {
+                const auto CODE = number(REST);
+                if (!CODE || *CODE < 272 || *CODE > 274)
+                    return refuse(BAD + ": the button must be 272-274");
+                const auto BUTTON = static_cast<uint32_t>(*CODE);
+                const auto IT     = std::ranges::find(down, BUTTON);
+                if (WORD[0] == 'p') {
+                    if (IT != down.end())
+                        return refuse(BAD + ": that button is down already");
+                    down.push_back(BUTTON);
+                    ++presses;
+                    op.steps.push_back({[BUTTON] { press(BUTTON); }, HOLD});
+                } else {
+                    if (IT == down.end())
+                        return refuse(BAD + ": that button is not down");
+                    down.erase(IT);
+                    op.steps.push_back({[BUTTON] { release(BUTTON); }, HOLD});
+                }
+                continue;
+            }
+            if (WORD[0] == 'd') {
+                const auto MS = number(REST);
+                if (!MS || *MS < 0 || *MS > MAX_DWELL.count())
+                    return refuse(BAD);
+                dwell += ms(static_cast<int>(*MS));
+                op.steps.push_back({[] {}, ms(static_cast<int>(*MS))});
+                continue;
+            }
+            if (WORD == "n" && !answers) {
+                answers = true;
+                op.steps.push_back({[] { answerEarly(); }, ms(1)});
+                continue;
+            }
+            return refuse(WORD == "n" ? "a path answers once" : BAD);
+        }
+        if (!down.empty())
+            return refuse("the path leaves a button down: release every button it presses");
+        if (moves > MAX_MOVES || presses > MAX_PRESSES || dwell > MAX_DWELL)
+            return refuse(std::format("a path may have at most {} moves, {} presses and {}ms of waits, since the user's pointer waits for it", MAX_MOVES, MAX_PRESSES,
+                                      MAX_DWELL.count()));
         return enqueue([op = std::move(op)](uint64_t ticket) mutable { return startPointer(std::move(op), ticket); });
     }
 
@@ -1355,13 +1572,26 @@ namespace {
         }
         if (VERB == "stage")
             return stageCommand(args);
+        if (VERB == "path")
+            return pathCommand(args);
+        // Ends the path with this ticket now, letting go of what it holds; a path that has ended already is fine.
+        if (VERB == "end") {
+            const auto TICKET = args.size() == 3 ? number(args[2]) : std::nullopt;
+            if (!TICKET || *TICKET < 1)
+                return refuse("usage: deskpilot end <ticket>");
+            if (g_op && g_op->ticket == static_cast<uint64_t>(*TICKET)) {
+                g_op->next = g_op->steps.size();
+                g_op->timer->updateTimeout(ms(1));
+            }
+            return IPC::Socket1::SResponse(okReply());
+        }
         if (VERB == "keys" || VERB == "paste")
             return keysCommand(args);
         if ((VERB == "click" && args.size() == 7) || (VERB == "scroll" && args.size() == 6))
             return pointerCommand(args, req.command);
         return refuse("usage: deskpilot click <window> <x> <y> <button> <count> | scroll <window> <x> <y> <dy> | keys <window> <hold-ms> <gap-ms> <txn|none> "
-                      "<key event>... | paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | wait <ticket> | status; a key "
-                      "event is +code, -code, pHEX, rHEX or tHEX");
+                      "<key event>... | paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | path <window> <step>... | end <ticket> | wait <ticket> | status; a key "
+                      "event is +code, -code, pHEX, rHEX or tHEX, and a path step mX,Y, pBUTTON, rBUTTON, dMS or n");
     }
 }
 

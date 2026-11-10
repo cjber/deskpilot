@@ -228,6 +228,13 @@ class FakePlugin:
     def keys(self, *args, **timing):
         self.calls.append(("keys", *args, timing))
 
+    def path(self, *args):
+        self.calls.append(("path", *args))
+        return {"ok": True, "ticket": 9}
+
+    def end(self, ticket):
+        self.calls.append(("end", ticket))
+
 
 def make_desk(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
@@ -277,7 +284,7 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
     desk.key("ctrl+a", "battle")
     desk.type("Hi", "battle", delay=0.05)
     assert plugin.calls == [
-        ("keys", "0xabc", ["+29", "p61", "r61", "-29"], {}),
+        ("keys", "0xabc", ["+29", "p61", "r61", "-29"], {"hold": 0.0}),
         # The whole text is one action, timed inside the plugin, so no other caller's keys land between characters.
         ("keys", "0xabc", ["t48", "t69"], {"hold": 0.05, "gap": 0.05}),
     ]
@@ -297,7 +304,7 @@ def test_click_with_take_focus_focuses_the_window_before_the_plugin_clicks(tmp_p
 def test_keys_without_a_window_go_to_the_focused_one_and_take_focus_focuses_first(tmp_path, monkeypatch):
     desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
     desk.key("Return")
-    assert plugin.calls[-1] == ("keys", "0xabc", ["+28", "-28"], {})
+    assert plugin.calls[-1] == ("keys", "0xabc", ["+28", "-28"], {"hold": 0.0})
     desk.type("x", "battle", take_focus=True)
     assert ["dispatch", 'hl.dsp.focus({window="address:0xabc"})'] in fake.calls
     assert plugin.calls[-1][:3] == ("keys", "0xabc", ["t78"])
@@ -538,3 +545,51 @@ def test_wait_changed_returns_a_shot_of_the_change_and_where_it_is(tmp_path, mon
         desk.wait_changed("battle", base.id, 5, (1200, 0, 100, 10))
     with pytest.raises(TimeoutError, match="did not change from shot"):
         desk.wait_changed("battle", shot.id, 0)
+
+
+def test_drag_is_one_plugin_path_that_presses_moves_and_releases(tmp_path, monkeypatch):
+    desk, _, inp, plugin, cursor = make_desk(tmp_path, monkeypatch)
+    assert desk.drag("battle", (100, 50), (300, 50), duration=0.1) == (2527 + 600, 1066)
+    ((name, address, steps),) = plugin.calls
+    assert (name, address) == ("path", "0xabc")
+    assert steps[:4] == ["m2727,1066", "d60", "p272", "d60"] and steps[-2:] == ["d60", "r272"]
+    moves = [s for s in steps if s.startswith("m")]
+    assert moves[-1] == "m3127,1066" and len(moves) == 1 + 6
+    assert cursor.glides == [(2727, 1066), (3127, 1066)] and inp.events == []
+    with pytest.raises(ValueError):
+        desk.drag("battle", (100, 50), (300, 50), duration=6)
+
+
+def test_hover_answers_once_in_place_shoots_then_ends_the_path(tmp_path, monkeypatch):
+    desk, _, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda _: None)
+    taken = []
+    monkeypatch.setattr(screen, "capture", lambda win, max_width: taken.append(plugin.calls[:]) or "shot")
+    assert desk.hover("battle", 100, 50, wait=0.5) == "shot"
+    assert plugin.calls == [("path", "0xabc", ["m2727,1066", "n", "d5500"]), ("end", 9)]
+    # The screenshot is taken while the pointer rests there, before the path ends.
+    assert taken == [[("path", "0xabc", ["m2727,1066", "n", "d5500"])]]
+
+
+def test_hover_then_click_clicks_before_the_pointer_leaves(tmp_path, monkeypatch):
+    desk, _, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    assert desk.hover("battle", 100, 50, wait=0.2, then_click=(100, 80)) == (2727, 1126)
+    assert plugin.calls == [("path", "0xabc", ["m2727,1066", "d200", "m2727,1126", "p272", "r272"])]
+
+
+def test_an_element_is_targeted_at_its_live_centre(tmp_path, monkeypatch):
+    desk, *_ = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: (10, 20, 30, 40))
+    assert desk.click("battle", None, None, element="e3") == (2527 + 25, 966 + 40)
+    with pytest.raises(ValueError, match="not both"):
+        desk.click("battle", 1, 2, element="e3")
+    with pytest.raises(ValueError, match="neither"):
+        desk.click("battle", None, None)
+
+
+def test_key_hold_is_bounded(tmp_path, monkeypatch):
+    desk, _, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk.key("Right", "battle", hold=2)
+    assert plugin.calls[-1] == ("keys", "0xabc", ["+106", "-106"], {"hold": 2})
+    with pytest.raises(ValueError):
+        desk.key("Right", "battle", hold=11)
