@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Typing no longer flickers a window's title bar.** Keys went to a window with a keyboard enter and leave around
+  each keystroke, so an app that draws its own title bar, such as Chrome, redrew it focused and unfocused for every
+  character. The window is now entered once for the whole sequence.
+- **Typing is much faster.** `type` (MCP `type_text`) no longer holds each key 30 ms and waits 30 ms between keys
+  by default: 9.4 KB reaches Chrome in about 12 seconds rather than 9 minutes. Pass `--delay 0.1` for games, as before.
 - **Paste works in Chrome.** Chrome reads a pasted text as soon as it is offered, and the window's clipboard was
   taken back after that first read, so Chrome pasted nothing. The text now stays the window's clipboard for 10
   seconds, or until the next paste.
