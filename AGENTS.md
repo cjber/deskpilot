@@ -26,15 +26,17 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 - `src/deskpilot/plugin.py`: builds, loads and talks to the compositor plugin
 - `src/deskpilot/plugin/deskpilot.cpp`: the Hyprland plugin that runs each click, scroll and keystroke inside the
   compositor and puts the user's pointer and focus back
-- `src/deskpilot/screen.py`: grim screenshots and the mapping from screenshot pixels back to the screen
+- `src/deskpilot/screen.py`: grim toplevel screenshots, shot ids, and the mapping from shot pixels back to the screen
 - `src/deskpilot/overlay.py`: the agent cursor, drawn by `cua-driver`
 - `src/deskpilot/uinput.py`: the virtual mouse and keyboard behind `--take-pointer` and `--take-focus`
 - `src/deskpilot/keys.py`: key names, chords and US-layout text to Linux key codes
 
 ## Rules
 
-- The user's pointer and focus are theirs. Only `--take-pointer` and `--take-focus` may move them; every other
-  action goes through the plugin, which must restore both and replay input the user made meanwhile.
+- The user's pointer and focus are theirs. Only `--take-pointer`, `--take-focus` and `--show` may move them; every
+  other action goes through the plugin, which must restore both and replay input the user made meanwhile. A window
+  that is not on screen is an error, never a reason to focus it.
+- A point is resolved against a recorded shot. A shot is of one window at one size; any other use is refused.
 - A plugin build loads only into the Hyprland it was built against. Builds are named after the Hyprland commit and
   the plugin source hash, so a changed source or an upgrade rebuilds rather than reusing a stale build.
 - Each dispatcher tries Hyprland 0.57's Lua form first and falls back to the string form. Keep both working.

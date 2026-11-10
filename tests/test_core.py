@@ -1,9 +1,12 @@
 import json
+import subprocess
+from dataclasses import asdict, replace
 
 import pytest
+from PIL import Image
 
 from deskpilot import keys, screen
-from deskpilot.desk import Desk
+from deskpilot.desk import Desk, NotVisible
 from deskpilot.hypr import (
     AmbiguousWindow,
     HyprctlError,
@@ -14,7 +17,7 @@ from deskpilot.hypr import (
     pick_instance,
     run_hyprctl,
 )
-from deskpilot.plugin import Plugin, PluginError, parse_reply
+from deskpilot.plugin import REQUEST_BYTES, Plugin, PluginError, parse_reply, request_size
 
 
 def win(address="0x1", cls="wow.exe", title="World of Warcraft", x=1440, y=560, w=3440, h=1440):
@@ -25,7 +28,7 @@ class FakeHyprctl:
     """Answers hyprctl like Hyprland 0.57: Lua dispatchers only, string ones are a Lua syntax error."""
 
     def __init__(self, clients, lua=True):
-        self.clients, self.lua, self.calls, self.showing = clients, lua, [], "1"
+        self.clients, self.lua, self.calls, self.showing, self.special = clients, lua, [], "1", ""
 
     def __call__(self, args):
         self.calls.append(args)
@@ -33,12 +36,24 @@ class FakeHyprctl:
             return json.dumps(self.clients)
         if args[:2] == ["-j", "monitors"]:
             return json.dumps(
-                [{"name": "DP-1", "x": 0, "y": 0, "width": 10, "height": 10, "activeWorkspace": {"name": self.showing}}]
+                [
+                    {
+                        "name": "DP-1",
+                        "x": 1440,
+                        "y": 560,
+                        "width": 3440,
+                        "height": 1440,
+                        "activeWorkspace": {"name": self.showing},
+                        "specialWorkspace": {"name": self.special},
+                    }
+                ]
             )
         if args[:2] == ["-j", "activewindow"]:
             return json.dumps(self.clients[0] if self.clients else {})
         if args[0] == "dispatch":
             is_lua = args[1].startswith("hl.")
+            if "focus" in args[1]:
+                self.showing = "1"
             return "ok" if is_lua == self.lua else "error: bad dispatcher"
         return ""
 
@@ -87,15 +102,63 @@ def test_point_outside_window_is_refused():
         screen.to_global(win(w=100, h=100), 150, 10, 1.0)
 
 
-def test_scale_only_shrinks_wide_windows():
-    assert screen.scale_for(1266, 1400) == 1.0
-    assert screen.scale_for(3440, 1376) == 0.4
+def fake_grim(monkeypatch, size):
+    """grim writing a PNG of `size`, as a toplevel capture of a window's buffer does."""
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        Image.new("RGB", size).save(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(screen.subprocess, "run", run)
+    return calls
 
 
-def test_last_scale_round_trips(tmp_path):
-    screen.remember_scale("0xabc", 0.4, tmp_path)
-    assert screen.last_scale("0xabc", tmp_path) == 0.4
-    assert screen.last_scale("0xother", tmp_path) == 1.0
+def test_shot_reads_its_scale_from_the_image_and_shrinks_wide_ones(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    window = win(w=1720, h=720)
+    # A scale 2 output: the buffer is twice the window's logical size.
+    calls = fake_grim(monkeypatch, (3440, 1440))
+    shot = screen.capture(replace(window, stable_id="18000377"), max_width=1376)
+    assert calls[0][:3] == ["grim", "-T", "18000377"]
+    assert (shot.width, shot.height, shot.scale) == (1376, 576, 0.8)
+    assert Image.open(shot.path).size == (1376, 576)
+    assert screen.latest("0x1") == shot == screen.load(shot.id)
+
+
+def test_shot_without_a_toplevel_id_captures_the_area_at_an_explicit_scale(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    calls = fake_grim(monkeypatch, (100, 50))
+    shot = screen.capture(win(w=100, h=50))
+    assert calls[0][:5] == ["grim", "-s", "1", "-g", "1440,560 100x50"]
+    assert shot.scale == 1.0
+
+
+def test_a_shot_is_refused_for_another_window_or_a_resized_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake_grim(monkeypatch, (100, 50))
+    shot = screen.capture(win(w=100, h=50))
+    shot.check(win(w=100, h=50))
+    with pytest.raises(screen.StaleShot, match="100x60 now, 100x50 in shot"):
+        shot.check(win(w=100, h=60))
+    with pytest.raises(screen.StaleShot, match="not 0x2"):
+        shot.check(win(address="0x2", w=100, h=50))
+    with pytest.raises(screen.StaleShot, match="no shot nope"):
+        screen.load("nope")
+
+
+def test_old_shots_are_pruned(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake_grim(monkeypatch, (10, 10))
+    ids = []
+    for t in range(screen.KEEP + 2):
+        monkeypatch.setattr(screen.time, "time_ns", lambda t=t: (1_000_000 + t) * 1_000_000)
+        ids.append(screen.capture(win(w=10, h=10)).id)
+    with pytest.raises(screen.StaleShot):
+        screen.load(ids[0])
+    assert screen.load(ids[-1]).id == ids[-1]
+    assert len(list(screen.shots_dir().glob("*.png"))) == screen.KEEP
 
 
 def test_chords_and_text():
@@ -156,16 +219,25 @@ class FakePlugin:
     def scroll(self, *args):
         self.calls.append(("scroll", *args))
 
-    def keys(self, *args):
-        self.calls.append(("keys", *args))
+    def keys(self, *args, **timing):
+        self.calls.append(("keys", *args, timing))
 
 
 def make_desk(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     fake, inp, plugin, cursor = FakeHyprctl([CLIENT]), FakeInput(), FakePlugin(), FakeCursor()
     desk = Desk(Hyprland(fake), lambda: inp, plugin=plugin, cursor=cursor)
-    screen.remember_scale("0xabc", 0.5)
+    remember_shot(CLIENT, 0.5)
     return desk, fake, inp, plugin, cursor
+
+
+def remember_shot(client, scale):
+    """A shot of `client` at `scale`, as `deskpilot shot` would have left it."""
+    folder = screen.shots_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    w, h = client["size"]
+    shot = screen.Shot("abc-1", "", client["address"], round(w * scale), round(h * scale), scale, w, h)
+    (folder / "abc-1.json").write_text(json.dumps(asdict(shot)))
 
 
 def test_click_goes_through_the_plugin_and_leaves_the_pointer_alone(tmp_path, monkeypatch):
@@ -196,14 +268,18 @@ def test_move_only_glides_the_agent_cursor(tmp_path, monkeypatch):
 
 def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
     desk, fake, inp, plugin, _ = make_desk(tmp_path, monkeypatch)
-    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda s: None)
     desk.key("ctrl+a", "battle")
-    desk.type("Hi", "battle")
+    desk.type("Hi", "battle", delay=0.05)
     a, h, i = keys.key_code("a"), keys.key_code("h"), keys.key_code("i")
     assert plugin.calls == [
-        ("keys", "0xabc", [(keys.CTRL, True), (a, True), (a, False), (keys.CTRL, False)]),
-        ("keys", "0xabc", [(keys.SHIFT, True), (h, True), (h, False), (keys.SHIFT, False)]),
-        ("keys", "0xabc", [(i, True), (i, False)]),
+        ("keys", "0xabc", [(keys.CTRL, True), (a, True), (a, False), (keys.CTRL, False)], {}),
+        # The whole text is one action, timed inside the plugin, so no other caller's keys land between characters.
+        (
+            "keys",
+            "0xabc",
+            [(keys.SHIFT, True), (h, True), (h, False), (keys.SHIFT, False), (i, True), (i, False)],
+            {"hold": 0.05, "gap": 0.05},
+        ),
     ]
     assert not any(c[0] == "dispatch" and "focus" in c[1] for c in fake.calls)
     assert inp.events == []
@@ -211,8 +287,33 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
 
 def test_plugin_formats_key_events():
     calls = []
-    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", [(29, True), (30, True), (30, False)])
-    assert calls[-1] == ["deskpilot", "keys", "0xabc", "+29", "+30", "-30"]
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", [(29, True), (30, True)], hold=0.03, gap=0.1)
+    assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "+30"]]
+
+
+def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
+    calls = []
+    events = [(30, down) for _ in range(5000) for down in (True, False)]
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", events)
+    *stages, last = calls
+    assert stages and all(c[:2] == ["deskpilot", "stage"] for c in stages)
+    txn = stages[0][2]
+    assert all(c[2] == txn for c in stages) and last[:6] == ["deskpilot", "keys", "0xabc", "0", "0", txn]
+    sent = [w for c in stages for w in c[3:]] + last[6:]
+    assert sent == [f"{'+' if down else '-'}{code}" for code, down in events]
+    assert all(request_size(c[1:]) <= REQUEST_BYTES for c in calls)
+    # The fewest requests: every one but the first staged is full, and the keys request takes all that fit after it.
+    assert len(calls) == -(-request_size(["keys", "0xabc", "0", "0", txn, *sent]) // REQUEST_BYTES)
+
+
+def test_plugin_waits_on_a_queued_action_until_it_finishes():
+    replies = iter(['{"ok":true,"pending":7}', '{"ok":true,"pending":7}', '{"ok":true,"x":1,"y":2}'])
+    calls = []
+    reply = Plugin(lambda args: calls.append(args) or next(replies)).click("0xabc", 1, 2)
+    assert reply == {"ok": True, "x": 1, "y": 2}
+    assert calls[1:] == [["deskpilot", "wait", "7"], ["deskpilot", "wait", "7"]]
+    with pytest.raises(PluginError, match="queue is full"):
+        Plugin(lambda args: '{"ok":false,"error":"the deskpilot queue is full"}').scroll("0xabc", 1, 2, 3)
 
 
 def test_plugin_sends_button_codes_and_reads_replies():
@@ -272,10 +373,75 @@ def test_run_hyprctl_reports_hyprctls_own_error(monkeypatch):
         run_hyprctl(["-j", "clients"])
 
 
-def test_visible_compares_the_window_workspace_with_the_monitors():
+def test_a_window_is_visible_only_on_a_monitor_showing_its_workspace():
     fake = FakeHyprctl([CLIENT])
     hypr = Hyprland(fake)
-    (w,) = hypr.windows()
-    assert hypr.visible(w)
+    assert hypr.windows()[0].visible
     fake.showing = "2"
-    assert not hypr.visible(w)
+    assert not hypr.windows()[0].visible
+    fake.showing, fake.special = "1", "special:term"
+    assert not hypr.windows()[0].visible, "an open special workspace covers the normal one"
+
+
+def test_a_column_scrolled_off_every_monitor_is_not_visible():
+    fake = FakeHyprctl([{**CLIENT, "at": [-766, 572]}, {**CLIENT, "address": "0xdef", "at": [1000, 572]}])
+    off, partly = Hyprland(fake).windows()
+    assert not off.visible
+    assert partly.visible, "1000 + 1266 reaches past the monitor's left edge at 1440"
+
+
+def test_a_rotated_or_scaled_monitor_covers_its_logical_area():
+    from deskpilot.hypr import Monitor
+
+    rotated = Monitor.from_json(
+        {"x": 0, "y": 0, "width": 2560, "height": 1440, "transform": 1, "activeWorkspace": {"name": "4"}}
+    )
+    assert (rotated.width, rotated.height) == (1440, 2560)
+    scaled = Monitor.from_json(
+        {"x": 0, "y": 0, "width": 3840, "height": 2160, "scale": 2, "activeWorkspace": {"name": "1"}}
+    )
+    assert (scaled.width, scaled.height) == (1920, 1080)
+
+
+def test_a_hidden_window_is_refused_unless_shown(tmp_path, monkeypatch):
+    desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    fake.showing = "2"
+    with pytest.raises(NotVisible, match="workspace 1 is not showing"):
+        desk.click("battle", 100, 50)
+    assert plugin.calls == []
+    assert not any(c[0] == "dispatch" for c in fake.calls), "refusing must not focus anything"
+    desk.click("battle", 100, 50, show=True)
+    assert ["dispatch", 'hl.dsp.focus({window="address:0xabc"})'] in fake.calls
+    assert plugin.calls == [("click", "0xabc", 2727, 1066, "left", 1)]
+
+
+def test_a_click_against_a_resized_window_is_refused(tmp_path, monkeypatch):
+    desk, fake, _, _, _ = make_desk(tmp_path, monkeypatch)
+    fake.clients[0] = {**CLIENT, "size": [1000, 684]}
+    with pytest.raises(screen.StaleShot, match="take a new shot"):
+        desk.click("battle", 100, 50)
+    assert desk.click("battle", 100, 50, scale=1) == (2627, 1016)
+
+
+def test_a_missing_plugin_is_loaded_and_the_command_sent_again(monkeypatch):
+    replies = iter(["unknown request", '{"ok":true,"x":1,"y":2}'])
+    plugin = Plugin(run=lambda args: next(replies))
+    loads = []
+    monkeypatch.setattr(Plugin, "load", lambda self: loads.append(1))
+    assert plugin.click("0xabc", 1, 2) == {"ok": True, "x": 1, "y": 2}
+    assert loads == [1]
+
+
+def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
+    """The SDK hides any exception other than ToolError behind `Error executing tool <name>`."""
+    import asyncio
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from deskpilot import mcp_server
+
+    desk, fake, _, _, _ = make_desk(tmp_path, monkeypatch)
+    fake.showing = "2"
+    monkeypatch.setattr(mcp_server, "desk", desk)
+    with pytest.raises(ToolError, match="is not on screen"):
+        asyncio.run(mcp_server.mcp.call_tool("click", {"window": "battle", "x": 1, "y": 1}))

@@ -1,4 +1,4 @@
-// deskpilot Hyprland plugin: clicks and scrolls that leave the user's pointer where it is.
+// deskpilot Hyprland plugin: clicks, scrolls and keys that leave the user's pointer and focus where they are.
 //
 // `hyprctl deskpilot click <window> <x> <y> <button> <count>` and `hyprctl deskpilot scroll <window> <x> <y> <dy>`
 // run one input sequence on the user's own seat, so every client receives them, XWayland and Wine included:
@@ -10,30 +10,47 @@
 //      anything else on top refuses before any press is sent. Only the seat's pointer focus moves: Hyprland's
 //      focus-follows-mouse and click-to-focus never run, so keyboard focus stays on the user's window and the
 //      target is not raised.
-//   3. Presses and releases are spaced by event-loop timers, so the client sees them as separate events. Before each
-//      press or wheel notch the target must still be under the pointer, so a window that closes mid-sequence never
-//      passes its click on to the one behind it. Releases always go, so no button is left down.
+//   3. Presses, releases and wheel notches go straight to the seat, as the end of Hyprland's own handlers does, so
+//      compositor mouse binds and scroll factors never see them. They are spaced by event-loop timers, so the client
+//      sees them as separate events. Before each press or wheel notch Hyprland's hit tester must still find <window>
+//      at the point and the seat's pointer focus must still be on it, so a window, layer surface or popup that
+//      appears mid-sequence never has the click passed on to it. Releases always go, so no button is left down.
 //   4. The pointer goes back to where the user left it plus the motion they made meanwhile, keyboard focus goes
 //      back to the surface that had it if anything moved it, the cursor's visibility is restored and the held input
 //      is replayed.
 //
-// `hyprctl deskpilot keys <window> <+code|-code>...` presses and releases evdev key codes in <window> without focusing
-// it. Only the seat's keyboard focus moves to the window for the keystroke and comes straight back; Hyprland's own
-// window focus never changes. Modifiers come from an xkb state on the keyboard's own keymap, fed with these keys.
+// `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <+code|-code>...` presses and releases evdev key codes
+// in <window> without focusing it. The events run as strokes: a stroke ends when a release leaves no key down. Each
+// stroke goes straight to the window client's own wl_keyboard resources: enter with no keys pressed, modifiers, the
+// keys and leave. The seat's keyboard focus never moves, so the user's focused client sees no leave, enter or
+// modifiers, and Hyprland's window focus never changes. Each press is held <hold-ms> before the next event, and
+// strokes are <gap-ms> apart. Modifiers come from an xkb state on the keyboard's own keymap, fed with these keys.
 //
-//   - A Wayland window gets enter, the keys and leave in one event-loop turn: one client socket keeps them in order,
-//     and nothing the user types can land in between.
+//   - Each stroke waits until the window's client has read everything sent before it, so a fast sequence cannot fill
+//     the client's buffer, which would make Hyprland disconnect it.
 //   - An XWayland window also needs the X input focus, which the window manager sets over its own X connection while
 //     the keys travel over Wayland, and the X server does not order the two. So each step waits on what the X server
 //     reports through deskpilot's own X connection: the focus is the window before the first key, each key is down
-//     or up before the next, and the focus is back before the user's keyboard is let go. The user's keys are held
-//     meanwhile and replayed. A step that does not happen in time ends the sequence with an error.
+//     or up before the next, and the focus is back before the user's input is let go. If the user's focus is another
+//     X window, Xwayland's keyboard leaves it for the stroke and enters it again after, as one wl_keyboard has one
+//     focused surface.
+//   - The user's keys and mouse are held during a stroke and replayed after it, and a keyboard focus change Hyprland
+//     makes meanwhile waits for the stroke to end. A step that does not happen in time ends the sequence with an
+//     error.
 //
-// The reply is JSON, sent when the sequence has finished. `hyprctl deskpilot status` reports the plugin's version.
+// A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
+// <+code|-code>...`, and the `keys` request naming <txn> queues all of it as one action.
+//
+// Actions run one at a time in the order they arrive; up to MAX_QUEUED wait behind the running one and any more are
+// refused. Each request is answered when its own action has finished, or after REPLY_WAIT with
+// {"ok":true,"pending":<ticket>}, collected with `hyprctl deskpilot wait <ticket>`, since hyprctl stops reading a
+// reply after five seconds. Replies are JSON. `hyprctl deskpilot status` reports the plugin's version and queue.
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/state/ViewHitTester.hpp>
+#include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/desktop/state/ViewQuery.hpp>
 #include <hyprland/src/desktop/state/ViewState.hpp>
@@ -44,23 +61,35 @@
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/ipc/s1/S1.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/protocols/LayerShell.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
+#include <hyprland/src/protocols/core/Seat.hpp>
+#include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/managers/XWaylandManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
 
 #include <xcb/xcb.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <dlfcn.h>
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
 #include <format>
 #include <functional>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -81,66 +110,130 @@ namespace {
     using WheelFn    = void (*)(CInputManager*, IPointer::SAxisEvent, SP<IPointer>);
     using KeyFn      = void (*)(CInputManager*, const IKeyboard::SKeyEvent&, SP<IKeyboard>);
     using ModFn      = void (*)(CInputManager*, SP<IKeyboard>);
+    using FocusFn    = void (*)(CSeatManager*, SP<CWLSurfaceResource>);
+    using ms         = std::chrono::milliseconds;
+    using KeyEvents  = std::vector<std::pair<uint32_t, bool>>;
 
     // How long an XWayland key step may take to show in the X server before the sequence gives up.
-    constexpr auto X_WAIT = std::chrono::milliseconds(500);
+    constexpr auto X_WAIT = ms(500);
+    // How often a step that waits on the X server or a client checks it.
+    constexpr auto X_POLL = ms(1);
+    // How long the window's client may leave earlier input unread before the next keystroke gives up on it.
+    constexpr auto CLIENT_WAIT = std::chrono::seconds(5);
 
-    // Gaps between the steps of a sequence. A client that reads input once per frame (a game) still sees each step.
-    constexpr auto SETTLE  = std::chrono::milliseconds(40);
-    constexpr auto HOLD    = std::chrono::milliseconds(60);
-    constexpr auto BETWEEN = std::chrono::milliseconds(80);
+    // Gaps between the steps of a pointer sequence. A client that reads input once per frame (a game) still sees each.
+    constexpr auto SETTLE  = ms(40);
+    constexpr auto HOLD    = ms(60);
+    constexpr auto BETWEEN = ms(80);
+
+    // Actions that may wait behind the running one. A caller beyond this is refused rather than left waiting.
+    constexpr size_t MAX_QUEUED = 32;
+    // How long a request waits for its action before answering with its ticket: under hyprctl's five second read
+    // timeout (SO_RCVTIMEO in hyprctl's request()), after which hyprctl gives up on the reply.
+    constexpr auto REPLY_WAIT = std::chrono::seconds(4);
+    // Results kept for callers that never collect them (a client killed while it waited); the oldest go first.
+    constexpr size_t MAX_UNCOLLECTED = 64;
+    // Key transactions being staged at once; a client that died mid-stage leaves one behind, and the oldest goes first.
+    constexpr size_t MAX_STAGED = 32;
 
     struct SOp {
-        uintptr_t                            window = 0;
-        Vector2D                             target;
-        uint32_t                             button = 0;
-        int                                  count  = 0;
-        int                                  scroll = 0; // wheel notches, positive up; 0 for a click
-        Vector2D                             saved;
-        Vector2D                             heldMotion;
-        bool                                 hadFocus = false;
-        PHLWINDOWREF                         focusWindow;
-        WP<CWLSurfaceResource>               focusSurface;
-        std::vector<std::function<void()>>   heldInput;
-        std::vector<std::function<void()>>   steps;
-        size_t                               next = 0;
-        SP<CEventLoopTimer>                  timer;
-        SP<CPromiseResolver<std::string>>    reply;
-        std::string                          error;
+        uintptr_t                          window = 0;
+        Vector2D                           target;
+        uint32_t                           button = 0;
+        int                                count  = 0;
+        int                                scroll = 0; // wheel notches, positive up; 0 for a click
+        Vector2D                           saved;
+        Vector2D                           heldMotion;
+        bool                               hadFocus = false;
+        PHLWINDOWREF                       focusWindow;
+        WP<CWLSurfaceResource>             focusSurface;
+        std::vector<std::function<void()>> heldInput;
+        std::vector<std::function<void()>> steps;
+        size_t                             next = 0;
+        SP<CEventLoopTimer>                timer;
+        uint64_t                           ticket = 0;
+        std::string                        error;
     };
 
-    CFunctionHook*       g_moveHook     = nullptr;
-    CFunctionHook*       g_buttonHook   = nullptr;
-    CFunctionHook*       g_wheelHook    = nullptr;
-    CFunctionHook*       g_keyHook      = nullptr;
-    CFunctionHook*       g_modHook      = nullptr;
-    CFunctionHook*       g_activateHook = nullptr;
-    std::optional<SOp>   g_op;
-    bool                 g_injecting = false;
+    CFunctionHook*     g_moveHook     = nullptr;
+    CFunctionHook*     g_buttonHook   = nullptr;
+    CFunctionHook*     g_wheelHook    = nullptr;
+    CFunctionHook*     g_keyHook      = nullptr;
+    CFunctionHook*     g_modHook      = nullptr;
+    CFunctionHook*     g_activateHook = nullptr;
+    CFunctionHook*     g_focusHook    = nullptr;
+    std::optional<SOp> g_op;
 
     struct SKeyOp {
-        enum ePhase { AWAIT_FOCUS, KEY, AWAIT_KEY, AWAIT_RESTORE } phase = AWAIT_FOCUS;
-        PHLWINDOWREF                             window;
-        WP<CWLSurfaceResource>                   surface;
-        uint32_t                                 xid = 0;
-        WP<CWLSurfaceResource>                   lastSurface;
-        PHLWINDOWREF                             lastWindow;
-        uint32_t                                 lastXFocus = 0;
-        std::vector<std::pair<uint32_t, bool>>   events;
-        size_t                                   next = 0;
-        std::vector<uint32_t>                    down; // keys this sequence holds down in the window
-        xkb_state*                               xkb = nullptr;
-        std::chrono::steady_clock::time_point    deadline;
-        std::vector<std::function<void()>>       heldInput;
-        SP<CEventLoopTimer>                      timer;
-        SP<CPromiseResolver<std::string>>        reply;
-        std::string                              error;
+        enum ePhase { ENTER, AWAIT_FOCUS, KEY, AWAIT_KEY, RESTORE, AWAIT_RESTORE, DONE } phase = ENTER;
+        PHLWINDOWREF                       window;
+        WP<CWLSurfaceResource>             surface;
+        bool                               x11 = false;
+        uint32_t                           xid = 0;
+        KeyEvents                          events;
+        size_t                             next = 0;
+        ms                                 hold{0};
+        ms                                 gap{0};
+        // The stroke in progress: the window client's wl_keyboard resources it goes to, whether they were entered for
+        // it, and the surface of the same client that had keyboard focus and is entered again after it.
+        std::vector<WP<CWLKeyboardResource>> keyboards;
+        bool                               entered = false;
+        WP<CWLSurfaceResource>             sibling;
+        bool                               holding = false; // the user's input is held until the stroke ends
+        // A keyboard focus change Hyprland asked for mid-stroke, applied when the stroke ends.
+        std::optional<WP<CWLSurfaceResource>> deferredFocus;
+        std::optional<std::chrono::steady_clock::time_point> clientDeadline;
+        uint32_t                           restoreXid = 0; // the X window the X focus goes back to, or 0 for none
+        std::vector<uint32_t>              down; // keys this sequence holds down in the window
+        xkb_state*                         xkb = nullptr;
+        std::chrono::steady_clock::time_point deadline;
+        std::vector<std::function<void()>> heldInput;
+        SP<CEventLoopTimer>                timer;
+        uint64_t                           ticket = 0;
+        std::string                        error;
     };
     std::optional<SKeyOp> g_keyOp;
     xcb_connection_t*     g_x = nullptr;
 
+    // ---- the queue ----
+
+    struct SWaiter {
+        SP<CPromiseResolver<std::string>> resolver;
+        SP<CEventLoopTimer>               timer;
+    };
+    struct STicket {
+        std::optional<std::string> result;
+        std::optional<SWaiter>     waiter;
+    };
+    // Starts a queued action. It returns an error when the action cannot start, and otherwise runs it to completion,
+    // which ends in complete() with its ticket.
+    using Start = std::function<std::optional<std::string>(uint64_t ticket)>;
+    struct SQueued {
+        uint64_t ticket = 0;
+        Start    start;
+    };
+    std::map<uint64_t, STicket> g_tickets;
+    std::deque<SQueued>         g_queue;
+    uint64_t                    g_nextTicket = 1;
+
+    struct SStaged {
+        uint64_t  order = 0;
+        KeyEvents events;
+    };
+    std::map<std::string, SStaged> g_staged;
+    uint64_t                       g_stageOrder = 0;
+
     uint32_t now() {
         return Time::millis(Time::steadyNow());
+    }
+
+    // During a keystroke the user's mouse is held with their keys: with focus-follows-mouse, motion into another window
+    // would move the seat's keyboard focus away from the window being typed into. Replayed when the stroke ends.
+    bool holdForStroke(std::function<void()> replay) {
+        if (!g_keyOp || !g_keyOp->holding)
+            return false;
+        g_keyOp->heldInput.emplace_back(std::move(replay));
+        return true;
     }
 
     void hkOnMouseMoved(CInputManager* self, IPointer::SMotionEvent e) {
@@ -148,15 +241,19 @@ namespace {
             g_op->heldMotion += e.delta;
             return;
         }
+        if (holdForStroke([self, e] { reinterpret_cast<MoveFn>(g_moveHook->m_original)(self, e); }))
+            return;
         reinterpret_cast<MoveFn>(g_moveHook->m_original)(self, e);
     }
 
     void hkOnMouseButton(CInputManager* self, IPointer::SButtonEvent e, SP<IPointer> mouse) {
-        if (g_op && !g_injecting) {
-            g_op->heldInput.emplace_back([self, e, mouse] { reinterpret_cast<ButtonFn>(g_buttonHook->m_original)(self, e, mouse); });
+        auto replay = [self, e, mouse] { reinterpret_cast<ButtonFn>(g_buttonHook->m_original)(self, e, mouse); };
+        if (g_op) {
+            g_op->heldInput.emplace_back(replay);
             return;
         }
-        reinterpret_cast<ButtonFn>(g_buttonHook->m_original)(self, e, mouse);
+        if (!holdForStroke(replay))
+            replay();
     }
 
     // A client clicked or typed into while unfocused asks to be activated (an X client sends _NET_ACTIVE_WINDOW), and
@@ -171,27 +268,36 @@ namespace {
     }
 
     void hkOnMouseWheel(CInputManager* self, IPointer::SAxisEvent e, SP<IPointer> pointer) {
-        if (g_op && !g_injecting) {
-            g_op->heldInput.emplace_back([self, e, pointer] { reinterpret_cast<WheelFn>(g_wheelHook->m_original)(self, e, pointer); });
+        auto replay = [self, e, pointer] { reinterpret_cast<WheelFn>(g_wheelHook->m_original)(self, e, pointer); };
+        if (g_op) {
+            g_op->heldInput.emplace_back(replay);
             return;
         }
-        reinterpret_cast<WheelFn>(g_wheelHook->m_original)(self, e, pointer);
+        if (!holdForStroke(replay))
+            replay();
     }
 
     void hkOnKeyboardKey(CInputManager* self, const IKeyboard::SKeyEvent& e, SP<IKeyboard> keyboard) {
-        if (g_keyOp) {
-            g_keyOp->heldInput.emplace_back([self, e, keyboard] { reinterpret_cast<KeyFn>(g_keyHook->m_original)(self, e, keyboard); });
-            return;
-        }
-        reinterpret_cast<KeyFn>(g_keyHook->m_original)(self, e, keyboard);
+        auto replay = [self, e, keyboard] { reinterpret_cast<KeyFn>(g_keyHook->m_original)(self, e, keyboard); };
+        if (!holdForStroke(replay))
+            replay();
     }
 
     void hkOnKeyboardMod(CInputManager* self, SP<IKeyboard> keyboard) {
-        if (g_keyOp) {
-            g_keyOp->heldInput.emplace_back([self, keyboard] { reinterpret_cast<ModFn>(g_modHook->m_original)(self, keyboard); });
+        auto replay = [self, keyboard] { reinterpret_cast<ModFn>(g_modHook->m_original)(self, keyboard); };
+        if (!holdForStroke(replay))
+            replay();
+    }
+
+    // Hyprland refocuses on its own events (a layer surface closing, a window opening) as well as on the user's input,
+    // and a focus change sends every wl_keyboard a leave, the window being typed into included. Mid-stroke the change
+    // waits for the stroke to end, as the user's own input does. Hyprland's record of the focused window updates at once.
+    void hkSetKeyboardFocus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
+        if (g_keyOp && g_keyOp->holding) {
+            g_keyOp->deferredFocus = surface;
             return;
         }
-        reinterpret_cast<ModFn>(g_modHook->m_original)(self, keyboard);
+        reinterpret_cast<FocusFn>(g_focusHook->m_original)(self, surface);
     }
 
     std::string jsonString(const std::string& s) {
@@ -206,12 +312,168 @@ namespace {
         return out + "\"";
     }
 
+    std::string okReply() {
+        return R"({"ok":true})";
+    }
+
+    std::string errorReply(const std::string& why) {
+        return std::format(R"({{"ok":false,"error":{}}})", jsonString(why));
+    }
+
+    IPC::Socket1::SResponse refuse(const std::string& why) {
+        return IPC::Socket1::SResponse(errorReply(why));
+    }
+
+    void dropTimer(const SP<CEventLoopTimer>& timer) {
+        if (!timer)
+            return;
+        timer->cancel();
+        g_pEventLoopManager->removeTimer(timer);
+    }
+
+    void startNext();
+
+    // An action has finished: its caller gets the reply now if it is waiting, or from `wait` later.
+    void complete(uint64_t ticket, const std::string& reply) {
+        auto it = g_tickets.find(ticket);
+        if (it == g_tickets.end())
+            return;
+        if (it->second.waiter) {
+            auto waiter = std::move(*it->second.waiter);
+            g_tickets.erase(it);
+            dropTimer(waiter.timer);
+            waiter.resolver->resolve(reply);
+            return;
+        }
+        it->second.result = reply;
+        size_t uncollected = std::ranges::count_if(g_tickets, [](const auto& entry) { return entry.second.result.has_value(); });
+        for (auto old = g_tickets.begin(); uncollected > MAX_UNCOLLECTED && old != g_tickets.end();) {
+            if (old->second.result) {
+                old = g_tickets.erase(old);
+                --uncollected;
+            } else
+                ++old;
+        }
+    }
+
+    // The reply to a request for the action with this ticket: its result if it has finished, else a promise kept
+    // when it finishes or after REPLY_WAIT with the ticket to wait on again.
+    IPC::Socket1::SResponse awaitTicket(uint64_t ticket) {
+        auto it = g_tickets.find(ticket);
+        if (it == g_tickets.end())
+            return refuse(std::format("no deskpilot action {}: its result was collected already or dropped", ticket));
+        if (it->second.result) {
+            auto reply = std::move(*it->second.result);
+            g_tickets.erase(it);
+            return IPC::Socket1::SResponse(reply);
+        }
+        if (it->second.waiter)
+            return refuse(std::format("another caller is already waiting on deskpilot action {}", ticket));
+
+        SWaiter waiter;
+        auto    promise = CPromise<std::string>::make([&waiter](SP<CPromiseResolver<std::string>> resolver) { waiter.resolver = resolver; });
+        waiter.timer    = makeShared<CEventLoopTimer>(
+            REPLY_WAIT,
+            [ticket](SP<CEventLoopTimer>, void*) {
+                auto found = g_tickets.find(ticket);
+                if (found == g_tickets.end() || !found->second.waiter)
+                    return;
+                auto waiting = std::move(*found->second.waiter);
+                found->second.waiter.reset();
+                dropTimer(waiting.timer);
+                waiting.resolver->resolve(std::format(R"({{"ok":true,"pending":{}}})", ticket));
+            },
+            nullptr);
+        g_pEventLoopManager->addTimer(waiter.timer);
+        it->second.waiter = std::move(waiter);
+        return IPC::Socket1::SResponse(promise);
+    }
+
+    IPC::Socket1::SResponse enqueue(Start start) {
+        if (g_queue.size() >= MAX_QUEUED)
+            return refuse(std::format("the deskpilot queue is full: {} actions are waiting behind the running one, try again when they finish", g_queue.size()));
+        const auto TICKET = g_nextTicket++;
+        g_tickets[TICKET] = {};
+        g_queue.push_back({TICKET, std::move(start)});
+        startNext();
+        return awaitTicket(TICKET);
+    }
+
+    void startNext() {
+        while (!g_op && !g_keyOp && !g_queue.empty()) {
+            auto queued = std::move(g_queue.front());
+            g_queue.pop_front();
+            if (const auto ERROR = queued.start(queued.ticket))
+                complete(queued.ticket, errorReply(*ERROR));
+        }
+    }
+
+    // ---- pointer ----
+
+    std::string describe(const PHLWINDOW& window) {
+        return std::format("window 0x{:x} ({})", reinterpret_cast<uintptr_t>(window.get()), window->metadata().title());
+    }
+
     PHLWINDOW windowUnderPointer() {
         const auto SURFACE = g_pSeatManager->m_state.pointerFocus.lock();
         if (!SURFACE)
             return nullptr;
         const auto HLSURFACE = Desktop::View::CWLSurface::fromResource(SURFACE);
         return HLSURFACE ? Desktop::View::CWindow::fromView(HLSURFACE->view()) : nullptr;
+    }
+
+    // What a pointer at `pos` lands on, asked of Hyprland's hit tester in the order mouseMoveUnified looks: input
+    // method popups, focus-priority windows, layer popups, overlay and top layers (a top layer only above an exclusive
+    // fullscreen window if it may be), then windows with the extents processMouseDownNormal uses. Nothing when it is
+    // the target, else what is there instead. It only asks, so neither focus moves.
+    std::optional<std::string> blockerAt(const Vector2D& pos, uintptr_t target) {
+        using namespace Desktop::View;
+        const auto AT = std::format("at {},{}", pos.x, pos.y);
+        if (g_pSessionLockManager->isSessionLocked())
+            return "the session is locked";
+        if (g_pInputManager->m_relay.popupFromCoords(pos))
+            return "an input method popup is on top " + AT;
+        if (const auto W = Desktop::viewState()->hitTest().windowAt(pos, FOCUS_PRIORITY); W && reinterpret_cast<uintptr_t>(W.get()) != target)
+            return describe(W) + " is on top " + AT;
+
+        const auto MONITOR = State::monitorState()->query().vec(pos).run();
+        if (!MONITOR)
+            return "no monitor " + AT;
+        Vector2D local;
+        PHLLS    layer;
+        if (Desktop::viewState()->hitTest().layerPopupSurfaceAt(pos, MONITOR, &local, &layer))
+            return std::format("a popup of layer surface '{}' is on top {}", layer ? layer->m_namespace : "", AT);
+        const auto WORKSPACE = MONITOR->m_activeSpecialWorkspace ? MONITOR->m_activeSpecialWorkspace : MONITOR->m_activeWorkspace;
+        const bool EXCLUSIVE_FULLSCREEN =
+            (WORKSPACE && Fullscreen::controller()->hasFullscreen(WORKSPACE) && Fullscreen::controller()->getFullscreenModes(WORKSPACE).internal == Fullscreen::FSMODE_FULLSCREEN) ||
+            (Fullscreen::controller()->hasFullscreen(MONITOR) && Fullscreen::controller()->getFullscreenModes(MONITOR).internal == Fullscreen::FSMODE_FULLSCREEN);
+        for (const auto LEVEL : {ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, ZWLR_LAYER_SHELL_V1_LAYER_TOP}) {
+            layer = nullptr;
+            if (!Desktop::viewState()->hitTest().layerSurfaceAt(pos, &MONITOR->m_layerSurfaceLayers[LEVEL], &local, &layer))
+                continue;
+            if (LEVEL == ZWLR_LAYER_SHELL_V1_LAYER_TOP && EXCLUSIVE_FULLSCREEN && layer && !(layer->m_flags & LAYER_FLAG_ABOVE_FULLSCREEN))
+                continue;
+            return std::format("layer surface '{}' is on top {}", layer ? layer->m_namespace : "", AT);
+        }
+
+        const auto WINDOW = Desktop::viewState()->hitTest().windowAt(pos, ALLOW_FLOATING | RESERVED_EXTENTS | INPUT_EXTENTS);
+        if (WINDOW && reinterpret_cast<uintptr_t>(WINDOW.get()) == target)
+            return std::nullopt;
+        return WINDOW ? describe(WINDOW) + " is on top " + AT : "no window " + AT;
+    }
+
+    // The target must be what is at the point, fresh from the hit tester, and still hold the seat's pointer focus
+    // (where a press goes) before anything is sent to it.
+    bool targetUnderPointer() {
+        if (const auto BLOCKER = blockerAt(g_op->target, g_op->window)) {
+            g_op->error = *BLOCKER;
+            return false;
+        }
+        const auto UNDER = windowUnderPointer();
+        if (UNDER && reinterpret_cast<uintptr_t>(UNDER.get()) == g_op->window)
+            return true;
+        g_op->error = std::format("the pointer focus is on {}, not the target, at {},{}", UNDER ? describe(UNDER) : "no window", g_op->target.x, g_op->target.y);
+        return false;
     }
 
     // Pointer focus to the surface under the pointer, with an enter at the pointer's position, and nothing else:
@@ -225,19 +487,10 @@ namespace {
         g_pSeatManager->sendPointerFrame();
     }
 
-    void inject(const std::function<void()>& fn) {
-        g_injecting = true;
-        fn();
-        g_injecting = false;
-    }
-
     void finish() {
         auto op = std::move(*g_op);
         g_op.reset();
-        if (op.timer) {
-            op.timer->cancel();
-            g_pEventLoopManager->removeTimer(op.timer);
-        }
+        dropTimer(op.timer);
 
         Pointer::mgr()->warpTo(op.saved + op.heldMotion);
         enterUnderPointer();
@@ -256,11 +509,9 @@ namespace {
         for (auto& replay : op.heldInput)
             replay();
 
-        const auto POS = op.target;
-        if (op.error.empty())
-            op.reply->resolve(std::format(R"({{"ok":true,"x":{},"y":{}}})", POS.x, POS.y));
-        else
-            op.reply->resolve(std::format(R"({{"ok":false,"error":{}}})", jsonString(op.error)));
+        complete(op.ticket,
+                 op.error.empty() ? std::format(R"({{"ok":true,"x":{},"y":{}}})", op.target.x, op.target.y) : errorReply(op.error));
+        startNext();
     }
 
     void runNext(SP<CEventLoopTimer>, void*) {
@@ -275,37 +526,24 @@ namespace {
             g_op->timer->updateTimeout(g_op->next >= g_op->steps.size() ? SETTLE : (g_op->scroll ? BETWEEN / 2 : HOLD));
     }
 
-    // The target must be the window under the pointer before anything is sent to it.
-    bool targetUnderPointer() {
-        const auto UNDER = windowUnderPointer();
-        if (UNDER && reinterpret_cast<uintptr_t>(UNDER.get()) == g_op->window)
-            return true;
-        g_op->error = UNDER ? std::format("window 0x{:x} ({}) is on top at {},{}", reinterpret_cast<uintptr_t>(UNDER.get()), UNDER->metadata().title(),
-                                          g_op->target.x, g_op->target.y) :
-                              std::format("no window under {},{}", g_op->target.x, g_op->target.y);
-        return false;
-    }
-
     // Each step runs on its own timer tick; a step that fails sets the error and the next tick restores the user.
     void buildSteps(SOp& op) {
         op.steps.push_back([] {
-            inject([] {
-                Pointer::mgr()->warpTo(g_op->target);
-                enterUnderPointer();
-            });
+            Pointer::mgr()->warpTo(g_op->target);
+            enterUnderPointer();
             targetUnderPointer();
         });
         if (op.scroll) {
             for (int i = 0; i < std::abs(op.scroll); ++i) {
                 op.steps.push_back([] {
-                    // A wheel notch is delta 15 with discrete 120 (value120); negative is up in Wayland.
-                    const int SIGN = g_op->scroll > 0 ? -1 : 1;
                     if (!targetUnderPointer())
                         return;
-                    inject([SIGN] {
-                        g_pInputManager->onMouseWheel(IPointer::SAxisEvent{.timeMs = now(), .delta = 15.0 * SIGN, .deltaDiscrete = 120 * SIGN});
-                        g_pSeatManager->sendPointerFrame();
-                    });
+                    // One wheel notch as onMouseWheel sends it with a scroll factor of 1: delta 15, one discrete step,
+                    // value120 of 120. Negative is up in Wayland.
+                    const int SIGN = g_op->scroll > 0 ? -1 : 1;
+                    g_pSeatManager->sendPointerAxis(now(), WL_POINTER_AXIS_VERTICAL_SCROLL, 15.0 * SIGN, SIGN, 120 * SIGN, WL_POINTER_AXIS_SOURCE_WHEEL,
+                                                    WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+                    g_pSeatManager->sendPointerFrame();
                 });
             }
             return;
@@ -315,14 +553,28 @@ namespace {
                 op.steps.push_back([state] {
                     if (state == WL_POINTER_BUTTON_STATE_PRESSED && !targetUnderPointer())
                         return;
-                    inject([state] {
-                        // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
-                        g_pSeatManager->sendPointerButton(now(), g_op->button, state);
-                        g_pSeatManager->sendPointerFrame();
-                    });
+                    // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
+                    g_pSeatManager->sendPointerButton(now(), g_op->button, state);
+                    g_pSeatManager->sendPointerFrame();
                 });
             }
         }
+    }
+
+    // Starts a click or scroll; the user's pointer and focus are saved now, when it runs, not when it was queued.
+    std::optional<std::string> startPointer(SOp op, uint64_t ticket) {
+        op.ticket       = ticket;
+        op.saved        = g_pInputManager->getMouseCoordsInternal();
+        op.focusWindow  = Desktop::focusState()->window();
+        op.focusSurface = Desktop::focusState()->surface();
+        op.hadFocus     = op.focusWindow || op.focusSurface;
+        buildSteps(op);
+        g_op.emplace(std::move(op));
+
+        g_pHyprRenderer->setCursorHidden(true);
+        g_op->timer = makeShared<CEventLoopTimer>(ms(1), runNext, nullptr);
+        g_pEventLoopManager->addTimer(g_op->timer);
+        return std::nullopt;
     }
 
     std::optional<double> number(const std::string& s) {
@@ -347,10 +599,6 @@ namespace {
     std::string ownPath() {
         Dl_info info;
         return dladdr(reinterpret_cast<void*>(&ownPath), &info) && info.dli_fname ? info.dli_fname : "";
-    }
-
-    IPC::Socket1::SResponse refuse(const std::string& why) {
-        return IPC::Socket1::SResponse(std::format(R"({{"ok":false,"error":{}}})", jsonString(why)));
     }
 
     // ---- keys ----
@@ -410,217 +658,353 @@ namespace {
         return xkb;
     }
 
-    void sendMods(xkb_state* xkb) {
-        g_pSeatManager->sendKeyboardMods(xkb_state_serialize_mods(xkb, XKB_STATE_MODS_DEPRESSED), xkb_state_serialize_mods(xkb, XKB_STATE_MODS_LATCHED),
-                                         xkb_state_serialize_mods(xkb, XKB_STATE_MODS_LOCKED), xkb_state_serialize_layout(xkb, XKB_STATE_LAYOUT_EFFECTIVE));
-    }
+    // The seat's wl_keyboard resources owned by one client. CWLSeatProtocol keeps them private (see SX11Surface).
+    struct SSeatKeyboards {
+        friend constexpr auto member(SSeatKeyboards);
+    };
+    template struct SAccess<&CWLSeatProtocol::m_keyboards, SSeatKeyboards>;
 
-    // One key to the surface with keyboard focus, then the modifiers it leads to (wl_keyboard: modifiers follow the
-    // key that changed them).
-    void sendKey(xkb_state* xkb, std::vector<uint32_t>& down, uint32_t code, bool press) {
-        g_pSeatManager->sendKeyboardKey(now(), code, press ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
-        xkb_state_update_key(xkb, code + 8, press ? XKB_KEY_DOWN : XKB_KEY_UP);
-        sendMods(xkb);
-        if (press)
-            down.push_back(code);
-        else
-            std::erase(down, code);
-    }
-
-    void releaseAll(xkb_state* xkb, std::vector<uint32_t>& down) {
-        while (!down.empty())
-            sendKey(xkb, down, down.back(), false);
-    }
-
-    std::string okReply() {
-        return R"({"ok":true})";
-    }
-
-    std::string errorReply(const std::string& why) {
-        return std::format(R"({{"ok":false,"error":{}}})", jsonString(why));
-    }
-
-    // A Wayland window, or one that already has keyboard focus: the whole sequence in this event-loop turn.
-    std::string keysNow(PHLWINDOW window, const std::vector<std::pair<uint32_t, bool>>& events, const SP<IKeyboard>& keyboard) {
-        const auto SURFACE = window->wlSurface()->resource();
-        const auto LAST    = g_pSeatManager->m_state.keyboardFocus.lock();
-        const bool MOVE    = SURFACE != LAST;
-        if (MOVE) {
-            g_pSeatManager->setKeyboardFocus(SURFACE);
-            if (g_pSeatManager->m_state.keyboardFocus.lock() != SURFACE) {
-                g_pSeatManager->setKeyboardFocus(LAST);
-                return errorReply("the window cannot take keyboard focus now (a lock screen or a grab holds it)");
-            }
+    std::vector<WP<CWLKeyboardResource>> keyboardsOf(wl_client* client) {
+        std::vector<WP<CWLKeyboardResource>> out;
+        for (const auto& keyboard : (*PROTO::seat).*member(SSeatKeyboards{})) {
+            if (keyboard && keyboard->m_owner && keyboard->m_owner->client() == client)
+                out.emplace_back(keyboard);
         }
-        auto*                 xkb = scratchState(keyboard);
-        std::vector<uint32_t> down;
-        sendMods(xkb);
-        for (const auto& [code, press] : events)
-            sendKey(xkb, down, code, press);
-        releaseAll(xkb, down);
-        xkb_state_unref(xkb);
-        if (MOVE)
-            g_pSeatManager->setKeyboardFocus(LAST);
+        return out;
+    }
+
+    template <typename FN>
+    void eachKeyboard(SKeyOp& op, FN&& fn) {
+        for (const auto& weak : op.keyboards) {
+            if (const auto KEYBOARD = weak.lock())
+                fn(KEYBOARD);
+        }
+    }
+
+    void sendMods(SKeyOp& op) {
+        const auto DEPRESSED = xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_DEPRESSED), LATCHED = xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_LATCHED),
+                   LOCKED = xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_LOCKED), GROUP = xkb_state_serialize_layout(op.xkb, XKB_STATE_LAYOUT_EFFECTIVE);
+        eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendMods(DEPRESSED, LATCHED, LOCKED, GROUP); });
+    }
+
+    // The modifiers the user's keyboard really has, as the seat would send them.
+    void sendRealMods(SKeyOp& op) {
+        const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
+        if (!KEYBOARD)
+            return;
+        const auto& MODS = KEYBOARD->m_modifiersState;
+        eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendMods(MODS.depressed, MODS.latched, MODS.locked, MODS.group); });
+    }
+
+    // One key to the window's keyboards, then the modifiers it leads to (wl_keyboard: modifiers follow the key that
+    // changed them).
+    void sendKey(SKeyOp& op, uint32_t code, bool press) {
+        const auto TIME = now();
+        eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendKey(TIME, code, press ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED); });
+        xkb_state_update_key(op.xkb, code + 8, press ? XKB_KEY_DOWN : XKB_KEY_UP);
+        sendMods(op);
+        if (press)
+            op.down.push_back(code);
         else
-            g_pSeatManager->sendKeyboardMods(keyboard->m_modifiersState.depressed, keyboard->m_modifiersState.latched, keyboard->m_modifiersState.locked,
-                                             keyboard->m_modifiersState.group);
-        return okReply();
+            std::erase(op.down, code);
+    }
+
+    void releaseAll(SKeyOp& op) {
+        while (!op.down.empty())
+            sendKey(op, op.down.back(), false);
     }
 
     void finishKeys() {
         auto op = std::move(*g_keyOp);
         g_keyOp.reset();
-        if (op.timer) {
-            op.timer->cancel();
-            g_pEventLoopManager->removeTimer(op.timer);
-        }
+        dropTimer(op.timer);
         if (op.xkb)
             xkb_state_unref(op.xkb);
         for (auto& replay : op.heldInput)
             replay();
-        op.reply->resolve(op.error.empty() ? okReply() : errorReply(op.error));
+        complete(op.ticket, op.error.empty() ? okReply() : errorReply(op.error));
+        startNext();
     }
 
-    // Keyboard focus back to the surface that had it, and the X focus back to the X window that had it.
-    void restoreKeys(SKeyOp& op) {
-        if (g_pSeatManager->m_state.keyboardFocus.lock() == op.surface.lock())
-            releaseAll(op.xkb, op.down);
-        g_pSeatManager->setKeyboardFocus(op.lastSurface.lock());
-        const auto LASTWINDOW = op.lastWindow.lock();
-        if (LASTWINDOW && LASTWINDOW->backend().isX11())
-            g_pXWaylandManager->activateSurface(LASTWINDOW->wlSurface()->resource(), true);
-        else if (LASTWINDOW)
+    // The stroke is over: a focus change Hyprland made meanwhile takes effect, the user's held input is replayed, and
+    // the next stroke follows after the gap.
+    std::optional<ms> endStroke(SKeyOp& op) {
+        op.holding = false;
+        if (const auto DEFERRED = std::exchange(op.deferredFocus, std::nullopt))
+            reinterpret_cast<FocusFn>(g_focusHook->m_original)(g_pSeatManager.get(), DEFERRED->lock());
+        auto held = std::move(op.heldInput);
+        op.heldInput.clear();
+        for (auto& replay : held)
+            replay();
+        if (!op.error.empty() || op.next >= op.events.size()) {
+            op.phase = SKeyOp::DONE;
+            return std::nullopt;
+        }
+        op.phase = SKeyOp::ENTER;
+        return op.gap;
+    }
+
+    // Keys this stroke holds are released and its keyboards left, or given back the user's modifiers if the window
+    // had keyboard focus all along; a sibling surface of the same client is entered again, and the X focus goes back
+    // to the X window Hyprland has focused.
+    std::optional<ms> restoreStroke(SKeyOp& op) {
+        releaseAll(op);
+        if (!op.entered) {
+            sendRealMods(op);
+            return endStroke(op);
+        }
+        eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
+        if (const auto SIBLING = op.sibling.lock()) {
+            wl_array keys;
+            wl_array_init(&keys);
+            const auto& PRESSED = g_pInputManager->getKeysFromAllKBs();
+            if (!PRESSED.empty()) {
+                if (auto* data = wl_array_add(&keys, PRESSED.size() * sizeof(uint32_t)))
+                    std::ranges::copy(PRESSED, static_cast<uint32_t*>(data));
+            }
+            eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendEnter(SIBLING, &keys); });
+            wl_array_release(&keys);
+            sendRealMods(op);
+        }
+        if (!op.x11)
+            return endStroke(op);
+        const auto FOCUSED = Desktop::focusState()->window();
+        op.restoreXid      = FOCUSED && FOCUSED->backend().isX11() ? xidOf(FOCUSED) : 0;
+        if (op.restoreXid)
+            g_pXWaylandManager->activateSurface(FOCUSED->wlSurface()->resource(), true);
+        else
             g_pXWaylandManager->activateSurface(op.surface.lock(), false);
         op.phase    = SKeyOp::AWAIT_RESTORE;
         op.deadline = std::chrono::steady_clock::now() + X_WAIT;
+        return X_POLL;
     }
 
-    void keyTick(SP<CEventLoopTimer>, void*) {
-        if (!g_keyOp)
-            return;
-        auto&      op      = *g_keyOp;
+    // After a key: a press is held before the next event; a release that leaves no key down ends the stroke.
+    std::optional<ms> afterKey(SKeyOp& op) {
+        const bool PRESS = op.events[op.next].second;
+        op.next++;
+        const bool LAST = op.next >= op.events.size();
+        if (PRESS) {
+            op.phase = LAST ? SKeyOp::RESTORE : SKeyOp::KEY;
+            return op.hold;
+        }
+        op.phase = op.down.empty() || LAST ? SKeyOp::RESTORE : SKeyOp::KEY;
+        return std::nullopt;
+    }
+
+    // One step of a key sequence: how long to wait before the next, or nothing to go on in this event-loop turn.
+    std::optional<ms> keyStep(SKeyOp& op) {
         const bool EXPIRED = std::chrono::steady_clock::now() > op.deadline;
         switch (op.phase) {
+            case SKeyOp::ENTER: {
+                const auto WINDOW = op.window.lock();
+                if (!WINDOW || !WINDOW->mapped()) {
+                    op.error = "the window closed mid-sequence";
+                    op.phase = SKeyOp::DONE;
+                    return std::nullopt;
+                }
+                const auto SURFACE = WINDOW->wlSurface()->resource();
+                // Backpressure: the next stroke waits until the window's client has read everything sent to it, so a
+                // fast sequence never fills the client's buffer, which would make Hyprland disconnect it.
+                if (auto* client = SURFACE->client()) {
+                    wl_client_flush(client);
+                    int unread = 0;
+                    if (ioctl(wl_client_get_fd(client), SIOCOUTQ, &unread) == 0 && unread > 0) {
+                        const auto NOW = std::chrono::steady_clock::now();
+                        if (!op.clientDeadline)
+                            op.clientDeadline = NOW + CLIENT_WAIT;
+                        if (NOW < *op.clientDeadline)
+                            return X_POLL;
+                        op.error = "the window's client stopped reading its input";
+                        op.phase = SKeyOp::DONE;
+                        return std::nullopt;
+                    }
+                }
+                op.clientDeadline.reset();
+                // The window's own client gets enter, keys and leave on its wl_keyboard resources; the seat's keyboard
+                // focus, and with it the user's client, is never touched. Only a surface of the same client that has
+                // keyboard focus is left and entered again, since one wl_keyboard has one focused surface.
+                const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+                op.surface       = SURFACE;
+                op.keyboards     = keyboardsOf(SURFACE->client());
+                op.entered       = FOCUS != SURFACE;
+                op.sibling       = op.entered && FOCUS && FOCUS->client() == SURFACE->client() ? FOCUS : nullptr;
+                if (op.keyboards.empty()) {
+                    op.error = "the window's client has no keyboard to send keys to";
+                    op.phase = SKeyOp::DONE;
+                    return std::nullopt;
+                }
+                op.holding = true;
+                if (op.entered) {
+                    if (op.x11) {
+                        op.xid = xidOf(WINDOW);
+                        if (!op.xid || !xOpen()) {
+                            op.error = "cannot reach the X server for this XWayland window";
+                            return endStroke(op);
+                        }
+                    }
+                    wl_array keys;
+                    wl_array_init(&keys);
+                    eachKeyboard(op, [&](const auto& keyboard) {
+                        keyboard->sendLeave();
+                        keyboard->sendEnter(SURFACE, &keys);
+                    });
+                    wl_array_release(&keys);
+                    if (op.x11) {
+                        g_pXWaylandManager->activateSurface(SURFACE, true);
+                        op.phase    = SKeyOp::AWAIT_FOCUS;
+                        op.deadline = std::chrono::steady_clock::now() + X_WAIT;
+                        return X_POLL;
+                    }
+                }
+                sendMods(op);
+                op.phase = SKeyOp::KEY;
+                return std::nullopt;
+            }
             case SKeyOp::AWAIT_FOCUS:
                 if (xFocus() == op.xid) {
-                    sendMods(op.xkb);
+                    sendMods(op);
                     op.phase = SKeyOp::KEY;
-                } else if (EXPIRED) {
-                    op.error = "the X window did not take the X input focus";
-                    restoreKeys(op);
-                }
-                break;
-            case SKeyOp::KEY:
-                if (op.next == op.events.size() || !op.window.lock() || g_pSeatManager->m_state.keyboardFocus.lock() != op.surface.lock()) {
-                    if (op.next != op.events.size())
-                        op.error = "the window closed or lost keyboard focus mid-sequence";
-                    restoreKeys(op);
-                    break;
-                }
-                sendKey(op.xkb, op.down, op.events[op.next].first, op.events[op.next].second);
-                op.phase    = SKeyOp::AWAIT_KEY;
-                op.deadline = std::chrono::steady_clock::now() + X_WAIT;
-                break;
-            case SKeyOp::AWAIT_KEY:
-                if (xKeyDown(op.events[op.next].first) == op.events[op.next].second) {
-                    op.next++;
-                    op.phase = SKeyOp::KEY;
-                } else if (EXPIRED) {
-                    op.error = std::format("key {} did not reach the X server", op.events[op.next].first);
-                    restoreKeys(op);
-                }
-                break;
-            case SKeyOp::AWAIT_RESTORE:
-                if (!op.lastWindow.lock() || xFocus() == op.lastXFocus) {
-                    finishKeys();
-                    return;
+                    return std::nullopt;
                 }
                 if (EXPIRED) {
-                    op.error = op.error.empty() ? "the X input focus did not return to the window that had it" : op.error;
-                    finishKeys();
-                    return;
+                    op.error = "the X window did not take the X input focus";
+                    return restoreStroke(op);
                 }
-                break;
+                return X_POLL;
+            case SKeyOp::KEY: {
+                if (!op.window.lock() || !op.surface.lock()) {
+                    op.error = "the window closed mid-sequence";
+                    return restoreStroke(op);
+                }
+                // Xwayland hands keys to the X focus, which Hyprland moves when it focuses another X window.
+                if (op.x11 && op.entered && xFocus() != op.xid) {
+                    op.error = "another X window took the X input focus mid-sequence";
+                    return restoreStroke(op);
+                }
+                const auto [CODE, PRESS] = op.events[op.next];
+                sendKey(op, CODE, PRESS);
+                if (!(op.x11 && op.entered))
+                    return afterKey(op);
+                op.phase    = SKeyOp::AWAIT_KEY;
+                op.deadline = std::chrono::steady_clock::now() + X_WAIT;
+                return X_POLL;
+            }
+            case SKeyOp::AWAIT_KEY:
+                if (xKeyDown(op.events[op.next].first) == op.events[op.next].second)
+                    return afterKey(op);
+                if (EXPIRED) {
+                    op.error = std::format("key {} did not reach the X server", op.events[op.next].first);
+                    return restoreStroke(op);
+                }
+                return X_POLL;
+            case SKeyOp::RESTORE: return restoreStroke(op);
+            case SKeyOp::AWAIT_RESTORE:
+                if (op.restoreXid ? xFocus() == op.restoreXid : xFocus() != op.xid)
+                    return endStroke(op);
+                if (EXPIRED) {
+                    op.error = op.error.empty() ? "the X input focus did not return to the window that had it" : op.error;
+                    return endStroke(op);
+                }
+                return X_POLL;
+            case SKeyOp::DONE: break;
         }
-        if (g_keyOp)
-            g_keyOp->timer->updateTimeout(std::chrono::milliseconds(1));
+        return std::nullopt;
     }
 
-    IPC::Socket1::SResponse keysCommand(const std::vector<std::string>& args, const std::string& command) {
-        if (args.size() < 4)
-            return refuse("usage: deskpilot keys <window> <+code|-code>...");
-        const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
+    // Runs steps until one has to wait: with no hold, a Wayland stroke goes out in one event-loop turn.
+    void keyTick(SP<CEventLoopTimer>, void*) {
+        while (g_keyOp) {
+            if (g_keyOp->phase == SKeyOp::DONE) {
+                finishKeys();
+                return;
+            }
+            const auto WAIT = keyStep(*g_keyOp);
+            if (WAIT && WAIT->count() > 0) {
+                g_keyOp->timer->updateTimeout(*WAIT);
+                return;
+            }
+        }
+    }
+
+    std::optional<std::string> startKeys(SKeyOp op, uint64_t ticket) {
+        const auto WINDOW = op.window.lock();
         if (!WINDOW || !WINDOW->mapped())
-            return refuse("no mapped window " + args[2]);
+            return "the window closed before its keys were sent";
         const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
         if (!KEYBOARD || !KEYBOARD->m_xkbKeymap)
-            return refuse("no keyboard");
-
-        std::vector<std::pair<uint32_t, bool>> events;
-        for (size_t i = 3; i < args.size(); ++i) {
-            const auto CODE = args[i].size() > 1 ? number(args[i].substr(1)) : std::nullopt;
-            if ((args[i][0] != '+' && args[i][0] != '-') || !CODE || *CODE < 1 || *CODE > 247)
-                return refuse("bad key event '" + args[i] + "' in: " + command);
-            events.emplace_back(static_cast<uint32_t>(*CODE), args[i][0] == '+');
-        }
-
-        const auto SURFACE = WINDOW->wlSurface()->resource();
-        if (!WINDOW->backend().isX11() || g_pSeatManager->m_state.keyboardFocus.lock() == SURFACE)
-            return IPC::Socket1::SResponse(keysNow(WINDOW, events, KEYBOARD));
-
-        const auto XID = xidOf(WINDOW);
-        if (!XID || !xOpen())
-            return refuse("cannot reach the X server for this XWayland window");
-
-        SKeyOp op;
-        op.window      = WINDOW;
-        op.surface     = SURFACE;
-        op.xid         = XID;
-        op.lastSurface = g_pSeatManager->m_state.keyboardFocus;
-        op.lastWindow  = Desktop::focusState()->window();
-        op.lastXFocus  = xFocus();
-        op.events      = std::move(events);
-        op.xkb         = scratchState(KEYBOARD);
-        op.deadline    = std::chrono::steady_clock::now() + X_WAIT;
-
-        g_pSeatManager->setKeyboardFocus(SURFACE);
-        if (g_pSeatManager->m_state.keyboardFocus.lock() != SURFACE) {
-            g_pSeatManager->setKeyboardFocus(op.lastSurface.lock());
-            xkb_state_unref(op.xkb);
-            return refuse("the window cannot take keyboard focus now (a lock screen or a grab holds it)");
-        }
-        g_pXWaylandManager->activateSurface(SURFACE, true);
-
-        auto promise = CPromise<std::string>::make([&op](SP<CPromiseResolver<std::string>> resolver) { op.reply = resolver; });
+            return "no keyboard";
+        op.ticket = ticket;
+        op.x11    = WINDOW->backend().isX11();
+        op.xkb    = scratchState(KEYBOARD);
         g_keyOp.emplace(std::move(op));
-        g_keyOp->timer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(1), keyTick, nullptr);
+        g_keyOp->timer = makeShared<CEventLoopTimer>(ms(1), keyTick, nullptr);
         g_pEventLoopManager->addTimer(g_keyOp->timer);
-        return IPC::Socket1::SResponse(promise);
+        return std::nullopt;
     }
 
-    IPC::Socket1::SResponse onCommand(const IPC::Socket1::SRequest& req) {
-        std::istringstream       in(req.command);
-        std::vector<std::string> args;
-        for (std::string word; in >> word;)
-            args.push_back(word);
-        // args[0] is "deskpilot".
-        if (args.size() >= 2 && args[1] == "status")
-            return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"version":{},"path":{},"busy":{}}})", jsonString(VERSION), jsonString(ownPath()),
-                                                       g_op || g_keyOp ? "true" : "false"));
-        if (g_op || g_keyOp)
-            return refuse("busy: another deskpilot action is running");
-        if (args.size() >= 2 && args[1] == "keys")
-            return keysCommand(args, req.command);
+    // `+code` or `-code` words from `first` on, appended to `events`.
+    std::optional<std::string> parseKeys(const std::vector<std::string>& args, size_t first, KeyEvents& events) {
+        for (size_t i = first; i < args.size(); ++i) {
+            const auto CODE = args[i].size() > 1 ? number(args[i].substr(1)) : std::nullopt;
+            if ((args[i][0] != '+' && args[i][0] != '-') || !CODE || *CODE < 1 || *CODE > 247)
+                return "bad key event '" + args[i] + "'";
+            events.emplace_back(static_cast<uint32_t>(*CODE), args[i][0] == '+');
+        }
+        return std::nullopt;
+    }
 
-        const bool CLICK  = args.size() == 7 && args[1] == "click";
-        const bool SCROLL = args.size() == 6 && args[1] == "scroll";
-        if (!CLICK && !SCROLL)
-            return refuse("usage: deskpilot click <window> <x> <y> <button> <count> | scroll <window> <x> <y> <dy> | keys <window> <+code|-code>... | status");
+    IPC::Socket1::SResponse stageCommand(const std::vector<std::string>& args) {
+        if (args.size() < 4)
+            return refuse("usage: deskpilot stage <txn> <+code|-code>...");
+        auto it = g_staged.find(args[2]);
+        if (it == g_staged.end()) {
+            if (g_staged.size() >= MAX_STAGED)
+                g_staged.erase(std::ranges::min_element(g_staged, {}, [](const auto& entry) { return entry.second.order; }));
+            it = g_staged.emplace(args[2], SStaged{.order = g_stageOrder++}).first;
+        }
+        if (const auto ERROR = parseKeys(args, 3, it->second.events)) {
+            g_staged.erase(it);
+            return refuse(*ERROR);
+        }
+        return IPC::Socket1::SResponse(okReply());
+    }
 
+    IPC::Socket1::SResponse keysCommand(const std::vector<std::string>& args) {
+        if (args.size() < 6)
+            return refuse("usage: deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <+code|-code>...");
+        const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
+        const auto HOLD = number(args[3]), GAP = number(args[4]);
+        // The user's keys wait out each hold, so neither may be longer than a key would be held by hand.
+        if (!HOLD || !GAP || *HOLD < 0 || *GAP < 0 || *HOLD > 10000 || *GAP > 10000)
+            return refuse("hold and gap must be 0 to 10000 milliseconds");
+
+        SKeyOp op;
+        if (args[5] != "none") {
+            auto staged = g_staged.find(args[5]);
+            if (staged == g_staged.end())
+                return refuse("no staged key transaction " + args[5]);
+            op.events = std::move(staged->second.events);
+            g_staged.erase(staged);
+        }
+        if (const auto ERROR = parseKeys(args, 6, op.events))
+            return refuse(*ERROR);
+        if (op.events.empty())
+            return refuse("no key events");
+        if (!WINDOW || !WINDOW->mapped())
+            return refuse("no mapped window " + args[2]);
+        op.window = WINDOW;
+        op.hold   = ms(static_cast<int>(*HOLD));
+        op.gap    = ms(static_cast<int>(*GAP));
+        return enqueue([op = std::move(op)](uint64_t ticket) mutable { return startKeys(std::move(op), ticket); });
+    }
+
+    IPC::Socket1::SResponse pointerCommand(const std::vector<std::string>& args, const std::string& command) {
+        const bool CLICK = args[1] == "click";
         const auto WINDOW = address(args[2]);
         const auto X = number(args[3]), Y = number(args[4]), A = number(args[5]);
         if (!WINDOW || !X || !Y || !A)
-            return refuse("bad arguments: " + req.command);
+            return refuse("bad arguments: " + command);
 
         SOp op;
         op.window = *WINDOW;
@@ -636,20 +1020,33 @@ namespace {
                 return refuse("dy must be a non-zero number of notches up to 50");
             op.scroll = static_cast<int>(*A);
         }
-        op.saved         = g_pInputManager->getMouseCoordsInternal();
-        op.focusWindow   = Desktop::focusState()->window();
-        op.focusSurface  = Desktop::focusState()->surface();
-        op.hadFocus      = op.focusWindow || op.focusSurface;
-        buildSteps(op);
+        return enqueue([op = std::move(op)](uint64_t ticket) mutable { return startPointer(std::move(op), ticket); });
+    }
 
-        // make() calls its function at once, so the resolver is ours before the sequence starts.
-        auto promise = CPromise<std::string>::make([&op](SP<CPromiseResolver<std::string>> resolver) { op.reply = resolver; });
-        g_op.emplace(std::move(op));
-
-        g_pHyprRenderer->setCursorHidden(true);
-        g_op->timer = makeShared<CEventLoopTimer>(std::chrono::milliseconds(1), runNext, nullptr);
-        g_pEventLoopManager->addTimer(g_op->timer);
-        return IPC::Socket1::SResponse(promise);
+    IPC::Socket1::SResponse onCommand(const IPC::Socket1::SRequest& req) {
+        std::istringstream       in(req.command);
+        std::vector<std::string> args;
+        for (std::string word; in >> word;)
+            args.push_back(word);
+        // args[0] is "deskpilot".
+        const std::string VERB = args.size() >= 2 ? args[1] : "";
+        if (VERB == "status")
+            return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"version":{},"path":{},"busy":{},"queued":{}}})", jsonString(VERSION), jsonString(ownPath()),
+                                                       g_op || g_keyOp ? "true" : "false", g_queue.size()));
+        if (VERB == "wait") {
+            const auto TICKET = args.size() == 3 ? number(args[2]) : std::nullopt;
+            if (!TICKET || *TICKET < 1)
+                return refuse("usage: deskpilot wait <ticket>");
+            return awaitTicket(static_cast<uint64_t>(*TICKET));
+        }
+        if (VERB == "stage")
+            return stageCommand(args);
+        if (VERB == "keys")
+            return keysCommand(args);
+        if ((VERB == "click" && args.size() == 7) || (VERB == "scroll" && args.size() == 6))
+            return pointerCommand(args, req.command);
+        return refuse("usage: deskpilot click <window> <x> <y> <button> <count> | scroll <window> <x> <y> <dy> | keys <window> <hold-ms> <gap-ms> <txn|none> "
+                      "<+code|-code>... | stage <txn> <+code|-code>... | wait <ticket> | status");
     }
 }
 
@@ -684,18 +1081,35 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_keyHook      = hook(handle, "CInputManager", "onKeyboardKey", reinterpret_cast<void*>(&hkOnKeyboardKey));
     g_modHook      = hook(handle, "CInputManager", "onKeyboardMod", reinterpret_cast<void*>(&hkOnKeyboardMod));
     g_activateHook = hook(handle, "CWindow", "activate", reinterpret_cast<void*>(&hkActivate));
+    g_focusHook    = hook(handle, "CSeatManager", "setKeyboardFocus", reinterpret_cast<void*>(&hkSetKeyboardFocus));
 
     HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{.name = "deskpilot", .match = IPC::Socket1::COMMAND_MATCH_PREFIX, .handler = onCommand});
     return {"deskpilot", "Clicks, scrolls and keys for agents that leave the user's pointer and focus in place", "cjber", VERSION};
 }
 
+// The running action is ended and the user's pointer and focus put back; everything queued or waiting is answered.
 APICALL EXPORT void PLUGIN_EXIT() {
-    if (g_op)
+    const auto UNLOADED = errorReply("the deskpilot plugin was unloaded");
+    for (auto& queued : g_queue)
+        complete(queued.ticket, UNLOADED);
+    g_queue.clear();
+    if (g_op) {
+        g_op->error = "the deskpilot plugin was unloaded";
         finish();
+    }
     if (g_keyOp) {
-        restoreKeys(*g_keyOp);
+        if (g_keyOp->holding)
+            restoreStroke(*g_keyOp);
+        g_keyOp->error = "the deskpilot plugin was unloaded";
         finishKeys();
     }
+    for (auto& [ticket, entry] : g_tickets) {
+        if (!entry.waiter)
+            continue;
+        dropTimer(entry.waiter->timer);
+        entry.waiter->resolver->resolve(UNLOADED);
+    }
+    g_tickets.clear();
     if (g_x)
         xcb_disconnect(g_x);
 }

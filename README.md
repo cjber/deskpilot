@@ -50,10 +50,9 @@ The agent skill, which teaches an agent the steps below, installs in Claude Code
 ## Use
 
 ```sh
-deskpilot plugin load                     # build for the running Hyprland and load; again after each upgrade
-deskpilot windows                         # every window, with its address, class, title and geometry
-deskpilot shot battle.net.exe             # screenshot; prints the image path and its scale
-deskpilot click battle.net.exe 920 367    # a point in that screenshot
+deskpilot windows                         # every window: address, class, title, geometry, whether on screen
+deskpilot shot battle.net.exe             # screenshot; prints its id, image path and scale
+deskpilot click battle.net.exe 920 367 --shot ID    # a point in that screenshot
 deskpilot type "/reload" --window wow.exe --delay 0.12
 deskpilot key ctrl+a --window kitty
 deskpilot wait-for wow.exe --timeout 120
@@ -62,8 +61,16 @@ deskpilot wait-for wow.exe --timeout 120
 A window is named by its address, its class, or a substring of its class or title. A name that matches more
 than one window is an error listing them, so a click never lands on a guessed window.
 
-`move`, `click` and `scroll` take pixels in the window's last `shot`, whatever scale it was taken at. Pass
-`--scale 1` to give window pixels instead. A point outside the window is refused.
+`shot` captures the window itself, so a window on top does not show in it, and saves it under an id. `move`,
+`click` and `scroll` take pixels in the shot named by `--shot`, or the window's latest one, whatever scale it was
+taken at. A window resized since that shot is refused, as is a point outside the window. Pass `--scale 1` to give
+window pixels instead.
+
+A window on a hidden workspace or scrolled off its monitor is reported as `"visible": false`, and `shot`, `move`,
+`click` and `scroll` refuse it rather than move the user's view. `--show` focuses it to bring it on screen first.
+
+The first action that needs the plugin builds and loads it for the running Hyprland, so it comes back by itself
+after Hyprland restarts or upgrades. `deskpilot plugin load` does the same ahead of time.
 
 `move` only shows the agent cursor. Pass `--take-pointer` to `move`, `click` or `scroll` to move the user's own
 pointer there and press through the input device instead, for a hover the app must see.
@@ -74,13 +81,17 @@ the one instance whose socket answers, and with several live instances it stops 
 `key` and `type` without `--window` press keys into whatever has focus. `--take-focus` focuses the window and
 leaves it focused, for an app that ignores keys while unfocused.
 
-Games read keys once per frame, so type into them with `--delay 0.1` or more.
+Games read keys once per frame, so type into them with `--delay 0.1` or more: each key is held that long, with the
+same gap before the next.
+
+Clicks, scrolls and keys from several agents at once run one after another in the order they arrive, so one `type`
+is never interleaved with another's keys. Up to 32 wait behind the running one; past that an action is refused.
 
 ## MCP
 
-`deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image), `click`,
-`move`, `scroll`, `key`, `type_text` and `wait_for`. `click`, `move` and `scroll` take `take_pointer`; `key` and
-`type_text` take `take_focus`. It keeps one input
+`deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
+id), `click`, `move`, `scroll`, `key`, `type_text` and `wait_for`. `click`, `move` and `scroll` take `shot`, `show`
+and `take_pointer`; `key` and `type_text` take `take_focus`. It keeps one input
 device and one agent cursor open for the session.
 
 ```sh

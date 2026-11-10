@@ -81,6 +81,11 @@ class Window:
     xwayland: bool
     pid: int
     focused: bool = False
+    # The ext-foreign-toplevel identifier, which `grim -T` captures by. Empty on a Hyprland too old to report it.
+    stable_id: str = ""
+    # Some of the window lies on a monitor showing its workspace. False for a hidden workspace and for a column a
+    # scrolling layout has moved off every monitor.
+    visible: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -94,9 +99,36 @@ class Window:
             "monitor": self.monitor,
             "workspace": self.workspace,
             "xwayland": self.xwayland,
+            "visible": self.visible,
             "pid": self.pid,
             "focused": self.focused,
         }
+
+
+@dataclass(frozen=True)
+class Monitor:
+    """A monitor's area in global logical pixels, and the workspaces it shows."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+    showing: frozenset[str]
+
+    @classmethod
+    def from_json(cls, m: dict) -> Monitor:
+        scale = m.get("scale") or 1
+        width, height = round(m["width"] / scale), round(m["height"] / scale)
+        if m.get("transform", 0) % 2:  # rotated a quarter turn, flipped or not
+            width, height = height, width
+        # A special workspace covers the monitor's normal one while it is open.
+        special = str((m.get("specialWorkspace") or {}).get("name") or "")
+        shown = special or str((m.get("activeWorkspace") or {}).get("name", ""))
+        return cls(m["x"], m["y"], width, height, frozenset({shown}))
+
+    def shows(self, workspace: str, x: int, y: int, width: int, height: int) -> bool:
+        overlaps = x < self.x + self.width and self.x < x + width and y < self.y + self.height and self.y < y + height
+        return workspace in self.showing and overlaps
 
 
 class WindowNotFound(LookupError):
@@ -117,12 +149,14 @@ class Hyprland:
 
     def windows(self) -> list[Window]:
         active = self._json("activewindow") or {}
+        monitors = [Monitor.from_json(m) for m in self._json("monitors") or [] if not m.get("disabled")]
         found = []
         for c in self._json("clients") or []:
             if not c.get("mapped", True) or c.get("hidden"):
                 continue
             x, y = c["at"]
             w, h = c["size"]
+            workspace = str((c.get("workspace") or {}).get("name", ""))
             found.append(
                 Window(
                     address=c["address"],
@@ -133,18 +167,15 @@ class Hyprland:
                     width=w,
                     height=h,
                     monitor=c.get("monitor", -1),
-                    workspace=str((c.get("workspace") or {}).get("name", "")),
+                    workspace=workspace,
                     xwayland=bool(c.get("xwayland")),
                     pid=c.get("pid", 0),
                     focused=c["address"] == active.get("address"),
+                    stable_id=str(c.get("stableId") or ""),
+                    visible=any(m.shows(workspace, x, y, w, h) for m in monitors),
                 )
             )
         return found
-
-    def visible(self, window: Window) -> bool:
-        """Whether the window's workspace is the one showing on its monitor, so a screenshot of its area shows it."""
-        showing = {str((m.get("activeWorkspace") or {}).get("name", "")) for m in self._json("monitors") or []}
-        return window.workspace in showing
 
     def find(self, query: str) -> Window:
         return find_window(self.windows(), query)

@@ -15,9 +15,7 @@ import json
 import sys
 from pathlib import Path
 
-from .desk import Desk
-from .hypr import AmbiguousWindow, HyprctlError, WindowNotFound
-from .plugin import PluginError
+from .desk import EXPECTED, Desk
 
 
 def _print(data, as_json: bool) -> None:
@@ -28,6 +26,24 @@ def _print(data, as_json: bool) -> None:
             print(row if isinstance(row, str) else json.dumps(row))
     else:
         print(data if isinstance(data, str) else json.dumps(data))
+
+
+SHOW_HELP = "bring a window that is not on screen into view by focusing it, instead of refusing"
+
+
+def _point_parser(sub, name: str, helptext: str) -> argparse.ArgumentParser:
+    """A command that acts at a point of a window's screenshot."""
+    s = sub.add_parser(name, help=helptext)
+    s.add_argument("window")
+    s.add_argument("x", type=float)
+    s.add_argument("y", type=float)
+    s.add_argument("--scale", type=float, help="the scale the point is in; 1 for window pixels")
+    s.add_argument("--shot", help="the shot id the point is in (default: the window's latest shot)")
+    s.add_argument("--show", action="store_true", help=SHOW_HELP)
+    s.add_argument(
+        "--take-pointer", action="store_true", help="move the user's own pointer there instead of leaving it in place"
+    )
+    return s
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,26 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("window")
     s.add_argument("-o", "--out", type=Path)
     s.add_argument("--max-width", type=int, default=1400, help="scale down wider windows to this width")
+    s.add_argument("--show", action="store_true", help=SHOW_HELP)
 
-    take_help = "move the user's own pointer there instead of leaving it in place"
-    for name, helptext in (("move", "show the agent cursor at a point"), ("click", "click a point")):
-        s = sub.add_parser(name, help=helptext)
-        s.add_argument("window")
-        s.add_argument("x", type=float)
-        s.add_argument("y", type=float)
-        s.add_argument("--scale", type=float, help="the screenshot scale the point is in (default: the last shot)")
-        s.add_argument("--take-pointer", action="store_true", help=take_help)
-        if name == "click":
-            s.add_argument("--button", choices=["left", "right", "middle"], default="left")
-            s.add_argument("--double", action="store_true")
-
-    s = sub.add_parser("scroll", help="scroll at a point; positive is up")
-    s.add_argument("window")
-    s.add_argument("x", type=float)
-    s.add_argument("y", type=float)
+    _point_parser(sub, "move", "show the agent cursor at a point")
+    s = _point_parser(sub, "click", "click a point")
+    s.add_argument("--button", choices=["left", "right", "middle"], default="left")
+    s.add_argument("--double", action="store_true")
+    s = _point_parser(sub, "scroll", "scroll at a point; positive is up")
     s.add_argument("dy", type=int)
-    s.add_argument("--scale", type=float)
-    s.add_argument("--take-pointer", action="store_true", help=take_help)
 
     s = sub.add_parser("plugin", help="build, load or check the deskpilot Hyprland plugin")
     s.add_argument("action", choices=["build", "load", "status"])
@@ -80,7 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text")
     s.add_argument("--window", help="type into this window; without it the keys go to the focused window")
     s.add_argument("--take-focus", action="store_true", help=focus_help)
-    s.add_argument("--delay", type=float, default=0.03, help="seconds between keys; games want 0.1 or more")
+    s.add_argument(
+        "--delay", type=float, default=0.03, help="seconds each key is held and between keys; games want 0.1 or more"
+    )
 
     s = sub.add_parser("wait-for", help="wait for a window to appear (or --gone to close)")
     s.add_argument("window")
@@ -99,16 +105,30 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
         case "focus":
             return desk.focus(args.window).to_dict()
         case "shot":
-            return desk.shot(args.window, args.out, args.max_width).to_dict()
+            return desk.shot(args.window, args.out, args.max_width, args.show).to_dict()
         case "move":
-            gx, gy = desk.move(args.window, args.x, args.y, args.scale, args.take_pointer)
+            gx, gy = desk.move(
+                args.window, args.x, args.y, args.scale, args.take_pointer, shot=args.shot, show=args.show
+            )
             return {"x": gx, "y": gy}
         case "click":
             count = 2 if args.double else 1
-            gx, gy = desk.click(args.window, args.x, args.y, args.button, count, args.scale, args.take_pointer)
+            gx, gy = desk.click(
+                args.window,
+                args.x,
+                args.y,
+                args.button,
+                count,
+                args.scale,
+                args.take_pointer,
+                shot=args.shot,
+                show=args.show,
+            )
             return {"x": gx, "y": gy}
         case "scroll":
-            gx, gy = desk.scroll(args.window, args.x, args.y, args.dy, args.scale, args.take_pointer)
+            gx, gy = desk.scroll(
+                args.window, args.x, args.y, args.dy, args.scale, args.take_pointer, shot=args.shot, show=args.show
+            )
             return {"x": gx, "y": gy}
         case "key":
             desk.key(args.combo, args.window, args.take_focus)
@@ -141,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     desk = Desk()
     try:
         _print(run(args, desk), args.json)
-    except (WindowNotFound, AmbiguousWindow, HyprctlError, PluginError, ValueError, TimeoutError) as error:
+    except EXPECTED as error:
         print(f"deskpilot: {error}", file=sys.stderr)
         return 2
     finally:
