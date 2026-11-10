@@ -24,31 +24,41 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 - `src/deskpilot/desk.py`: the actions an agent takes, shared by the CLI and the MCP server
 - `src/deskpilot/hypr.py`: hyprctl: windows, monitors, focus, the cursor, and picking the live instance
 - `src/deskpilot/plugin.py`: builds, loads and talks to the compositor plugin
-- `src/deskpilot/plugin/deskpilot.cpp`: the Hyprland plugin that runs each click, scroll and keystroke inside the
-  compositor and puts the user's pointer and focus back
+- `src/deskpilot/plugin/deskpilot.cpp`: the Hyprland plugin that runs each pointer path and keystroke inside the
+  compositor, puts the user's pointer and focus back, drives a hidden window's own pointer, and draws the agent
+  cursor
 - `src/deskpilot/screen.py`: grim toplevel screenshots, shot ids, and the mapping from shot pixels back to the screen
-- `src/deskpilot/overlay.py`: the agent cursor, drawn by `cua-driver`
 - `src/deskpilot/uinput.py`: the virtual mouse behind `--take-pointer`
 - `src/deskpilot/keys.py`: key names, chords and text as the plugin's key events
 - `src/deskpilot/clipboard.py`: the user's clipboard through wl-clipboard
+- `src/deskpilot/a11y.py`: the target app's AT-SPI accessibility tree over D-Bus, and element ids for actions
 
 ## Rules
 
 - The user's pointer and focus are theirs. Only `--take-pointer`, `--take-focus` and `--show` may move them; every
-  other action goes through the plugin, which must restore both and replay input the user made meanwhile. A window
-  that is not on screen is an error, never a reason to focus it.
+  other action goes through the plugin, which sends input to the target app's own pointer and keyboard and never
+  holds the user's input, except where the target can only be reached through the seat (an XWayland window, or the
+  app the user's pointer or keyboard focus is in): there it must restore both and replay input the user made
+  meanwhile. A window that is not on screen is an error unless the action is hidden, never a reason to focus it.
 - A point is resolved against a recorded shot. A shot is of one window at one size; any other use is refused.
 - A plugin build loads only into the Hyprland it was built against. Builds are named after the Hyprland commit and
   the plugin source hash, so a changed source or an upgrade rebuilds rather than reusing a stale build.
 - Each dispatcher tries Hyprland 0.57's Lua form first and falls back to the string form. Keep both working.
 - A window name that matches several windows is an error listing them, and a point outside the window or under
   another window is refused. Never guess a target.
-- The agent cursor is feedback, never input: any overlay failure turns it off and the action goes ahead.
+- The agent cursor is feedback, never input: it never changes what an action does, and window captures never
+  include it.
+- A hidden action never moves the user's pointer, focus or view. Where it cannot reach a window without doing so
+  (XWayland, the app under the user's pointer, a drag and drop), it is refused, never quietly run on screen.
 - Text is typed as written on the user's active keymap, resolved in the plugin, never through a fixed layout table.
   A character no key on that keymap gives is an error, never skipped.
 - A paste offers its text to the target window's client alone and never sets the seat's selection, so the user's
   clipboard is untouched. A client that can only read the shared clipboard (XWayland) is refused.
-- Tests never touch the real compositor, `/dev/uinput`, `grim` or `cua-driver`. Pass fakes into `Desk` and
+- A pointer action (click, scroll, drag, hover) is bounded in steps and time, and it lets go of every button it
+  pressed however it ends.
+- An element is targeted where the app reports it when the action runs, never from a stale snapshot. An app that
+  exposes no accessibility tree is an error, never a guessed tree.
+- Tests never touch the real compositor, `/dev/uinput`, or `grim`. Pass fakes into `Desk` and
   `Hyprland`, as `tests/test_core.py` does.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change
   updates `README.md` and `skills/deskpilot/SKILL.md` too.

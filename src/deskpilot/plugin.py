@@ -133,11 +133,21 @@ class Plugin:
     def status(self) -> dict:
         return self._send("status")
 
-    def click(self, address: str, gx: int, gy: int, button: str = "left", count: int = 1) -> dict:
-        return self._call("click", address, str(gx), str(gy), str(BUTTON_CODES[button]), str(count))
+    def path(self, address: str, mode: str, steps: list[str]) -> dict:
+        """Run a pointer path in a window as one action. `mode` is "shown" (on screen, with the agent cursor gliding
+        there first), "plain" (on screen, no cursor) or "hidden" (the window's own pointer, wherever the window is).
+        `mX,Y` moves to a global point (the first step enters the window there), `pCODE` and `rCODE` press and
+        release a button, `wN` turns the wheel N notches (positive up), `dMS` waits, and `n` answers here with the
+        action's ticket while it goes on, until it ends or `end` ends it."""
+        return self._call("path", address, mode, *steps)
 
-    def scroll(self, address: str, gx: int, gy: int, dy: int) -> dict:
-        return self._call("scroll", address, str(gx), str(gy), str(dy))
+    def cursor(self, gx: int, gy: int) -> dict:
+        """Glide the agent cursor to a global point, in turn with the actions, and return once it lands."""
+        return self._call("cursor", str(gx), str(gy))
+
+    def end(self, ticket: int) -> None:
+        """End the path with this ticket now, letting go of what it holds. One that has ended already is fine."""
+        self._send("end", str(ticket))
 
     def keys(
         self, address: str, words: list[str], hold: float = 0.0, gap: float = 0.0, paste: str | None = None

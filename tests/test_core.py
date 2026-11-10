@@ -204,37 +204,31 @@ class FakeInput:
         pass
 
 
-class FakeCursor:
-    def __init__(self):
-        self.glides = []
-
-    def glide(self, x, y):
-        self.glides.append((x, y))
-
-    def close(self):
-        pass
-
-
 class FakePlugin:
     def __init__(self):
         self.calls = []
 
-    def click(self, *args):
-        self.calls.append(("click", *args))
-
-    def scroll(self, *args):
-        self.calls.append(("scroll", *args))
-
     def keys(self, *args, **timing):
         self.calls.append(("keys", *args, timing))
+
+    def path(self, *args):
+        self.calls.append(("path", *args))
+        return {"ok": True, "ticket": 9}
+
+    def cursor(self, *args):
+        self.calls.append(("cursor", *args))
+
+    def end(self, ticket):
+        self.calls.append(("end", ticket))
 
 
 def make_desk(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    fake, inp, plugin, cursor = FakeHyprctl([CLIENT]), FakeInput(), FakePlugin(), FakeCursor()
-    desk = Desk(Hyprland(fake), lambda: inp, plugin=plugin, cursor=cursor)
+    monkeypatch.delenv("DESKPILOT_CURSOR", raising=False)
+    fake, inp, plugin = FakeHyprctl([CLIENT]), FakeInput(), FakePlugin()
+    desk = Desk(Hyprland(fake), lambda: inp, plugin=plugin)
     remember_shot(CLIENT, 0.5)
-    return desk, fake, inp, plugin, cursor
+    return desk, fake, inp, plugin
 
 
 def remember_shot(client, scale):
@@ -247,18 +241,40 @@ def remember_shot(client, scale):
 
 
 def test_click_goes_through_the_plugin_and_leaves_the_pointer_alone(tmp_path, monkeypatch):
-    desk, fake, inp, plugin, cursor = make_desk(tmp_path, monkeypatch)
+    desk, fake, inp, plugin = make_desk(tmp_path, monkeypatch)
     assert desk.click("battle", 100, 50, "right", 2) == (2527 + 200, 966 + 100)
-    assert plugin.calls == [("click", "0xabc", 2727, 1066, "right", 2)]
-    assert cursor.glides == [(2727, 1066)]
+    assert plugin.calls == [("path", "0xabc", "shown", ["m2727,1066", "d52", "p273", "r273", "p273", "r273"])]
     assert inp.events == []
     assert not any(c[0] == "dispatch" and "cursor.move" in c[1] for c in fake.calls)
     desk.scroll("battle", 100, 50, -3)
-    assert plugin.calls[-1] == ("scroll", "0xabc", 2727, 1066, -3)
+    assert plugin.calls[-1] == ("path", "0xabc", "shown", ["m2727,1066", "d52", "w-3"])
+    with pytest.raises(ValueError):
+        desk.scroll("battle", 100, 50, 51)
+
+
+def test_hidden_actions_drive_the_window_s_own_pointer_wherever_it_is(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.showing = "2"
+    desk.click("battle", 100, 50, hidden=True)
+    assert plugin.calls == [("path", "0xabc", "hidden", ["m2727,1066", "d52", "p272", "r272"])]
+    assert not any(c[0] == "dispatch" for c in fake.calls), "hidden input must not focus or show anything"
+    with pytest.raises(ValueError):
+        desk.click("battle", 100, 50, hidden=True, show=True)
+    with pytest.raises(ValueError):
+        desk.click("battle", 100, 50, hidden=True, take_pointer=True)
+    with pytest.raises(ValueError):
+        desk.click("battle", 100, 50, hidden=True, take_focus=True)
+
+
+def test_cursor_off_sends_plain_paths(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setenv("DESKPILOT_CURSOR", "off")
+    desk.click("battle", 100, 50)
+    assert plugin.calls[-1][2] == "plain"
 
 
 def test_take_pointer_moves_the_user_pointer_then_clicks(tmp_path, monkeypatch):
-    desk, fake, inp, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk, fake, inp, plugin = make_desk(tmp_path, monkeypatch)
     desk.click("battle", 100, 50, take_pointer=True)
     assert ["dispatch", "hl.dsp.cursor.move({x=2727,y=1066})"] in fake.calls
     assert inp.events == ["nudge", ("click", "left", 1)]
@@ -266,18 +282,18 @@ def test_take_pointer_moves_the_user_pointer_then_clicks(tmp_path, monkeypatch):
 
 
 def test_move_only_glides_the_agent_cursor(tmp_path, monkeypatch):
-    desk, fake, _, _, cursor = make_desk(tmp_path, monkeypatch)
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
     desk.move("battle", 100, 50)
-    assert cursor.glides == [(2727, 1066)]
+    assert plugin.calls == [("cursor", 2727, 1066)]
     assert not any(c[0] == "dispatch" and "cursor.move" in c[1] for c in fake.calls)
 
 
 def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
-    desk, fake, inp, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk, fake, inp, plugin = make_desk(tmp_path, monkeypatch)
     desk.key("ctrl+a", "battle")
     desk.type("Hi", "battle", delay=0.05)
     assert plugin.calls == [
-        ("keys", "0xabc", ["+29", "p61", "r61", "-29"], {}),
+        ("keys", "0xabc", ["+29", "p61", "r61", "-29"], {"hold": 0.0}),
         # The whole text is one action, timed inside the plugin, so no other caller's keys land between characters.
         ("keys", "0xabc", ["t48", "t69"], {"hold": 0.05, "gap": 0.05}),
     ]
@@ -286,18 +302,18 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
 
 
 def test_click_with_take_focus_focuses_the_window_before_the_plugin_clicks(tmp_path, monkeypatch):
-    desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
     desk.click("battle", 10, 10, take_focus=True)
     focus = ["dispatch", 'hl.dsp.focus({window="address:0xabc"})']
-    assert focus in fake.calls and plugin.calls[-1][0] == "click"
+    assert focus in fake.calls and plugin.calls[-1][0] == "path"
     desk.click("battle", 10, 10)
     assert fake.calls.count(focus) == 1
 
 
 def test_keys_without_a_window_go_to_the_focused_one_and_take_focus_focuses_first(tmp_path, monkeypatch):
-    desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
     desk.key("Return")
-    assert plugin.calls[-1] == ("keys", "0xabc", ["+28", "-28"], {})
+    assert plugin.calls[-1] == ("keys", "0xabc", ["+28", "-28"], {"hold": 0.0})
     desk.type("x", "battle", take_focus=True)
     assert ["dispatch", 'hl.dsp.focus({window="address:0xabc"})'] in fake.calls
     assert plugin.calls[-1][:3] == ("keys", "0xabc", ["t78"])
@@ -341,11 +357,11 @@ def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
 def test_plugin_waits_on_a_queued_action_until_it_finishes():
     replies = iter(['{"ok":true,"pending":7}', '{"ok":true,"pending":7}', '{"ok":true,"x":1,"y":2}'])
     calls = []
-    reply = Plugin(lambda args: calls.append(args) or next(replies)).click("0xabc", 1, 2)
+    reply = Plugin(lambda args: calls.append(args) or next(replies)).path("0xabc", "shown", ["m1,2"])
     assert reply == {"ok": True, "x": 1, "y": 2}
     assert calls[1:] == [["deskpilot", "wait", "7"], ["deskpilot", "wait", "7"]]
     with pytest.raises(PluginError, match="queue is full"):
-        Plugin(lambda args: '{"ok":false,"error":"the deskpilot queue is full"}').scroll("0xabc", 1, 2, 3)
+        Plugin(lambda args: '{"ok":false,"error":"the deskpilot queue is full"}').cursor(1, 2)
 
 
 def test_a_refusal_from_a_stale_plugin_names_the_build_and_the_fix():
@@ -367,8 +383,10 @@ def test_plugin_sends_button_codes_and_reads_replies():
         calls.append(args)
         return '{"ok":true,"x":1,"y":2}'
 
-    Plugin(run).click("0xabc", 10, 20, "right", 2)
-    assert calls[-1] == ["deskpilot", "click", "0xabc", "10", "20", "273", "2"]
+    Plugin(run).path("0xabc", "hidden", ["m10,20", "p273", "r273"])
+    assert calls[-1] == ["deskpilot", "path", "0xabc", "hidden", "m10,20", "p273", "r273"]
+    Plugin(run).cursor(10, 20)
+    assert calls[-1] == ["deskpilot", "cursor", "10", "20"]
     with pytest.raises(PluginError, match="not loaded"):
         parse_reply("unknown request")
     with pytest.raises(PluginError, match="is on top"):
@@ -448,7 +466,7 @@ def test_a_rotated_or_scaled_monitor_covers_its_logical_area():
 
 
 def test_a_hidden_window_is_refused_unless_shown(tmp_path, monkeypatch):
-    desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
     fake.showing = "2"
     with pytest.raises(NotVisible, match="workspace 1 is not showing"):
         desk.click("battle", 100, 50)
@@ -456,11 +474,11 @@ def test_a_hidden_window_is_refused_unless_shown(tmp_path, monkeypatch):
     assert not any(c[0] == "dispatch" for c in fake.calls), "refusing must not focus anything"
     desk.click("battle", 100, 50, show=True)
     assert ["dispatch", 'hl.dsp.focus({window="address:0xabc"})'] in fake.calls
-    assert plugin.calls == [("click", "0xabc", 2727, 1066, "left", 1)]
+    assert plugin.calls == [("path", "0xabc", "shown", ["m2727,1066", "d52", "p272", "r272"])]
 
 
 def test_a_click_against_a_resized_window_is_refused(tmp_path, monkeypatch):
-    desk, fake, _, _, _ = make_desk(tmp_path, monkeypatch)
+    desk, fake, _, _ = make_desk(tmp_path, monkeypatch)
     fake.clients[0] = {**CLIENT, "size": [1000, 684]}
     with pytest.raises(screen.StaleShot, match="take a new shot"):
         desk.click("battle", 100, 50)
@@ -472,7 +490,7 @@ def test_a_missing_plugin_is_loaded_and_the_command_sent_again(monkeypatch):
     plugin = Plugin(run=lambda args: next(replies))
     loads = []
     monkeypatch.setattr(Plugin, "load", lambda self: loads.append(1))
-    assert plugin.click("0xabc", 1, 2) == {"ok": True, "x": 1, "y": 2}
+    assert plugin.cursor(1, 2) == {"ok": True, "x": 1, "y": 2}
     assert loads == [1]
 
 
@@ -484,7 +502,7 @@ def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
 
     from deskpilot import mcp_server
 
-    desk, fake, _, _, _ = make_desk(tmp_path, monkeypatch)
+    desk, fake, _, _ = make_desk(tmp_path, monkeypatch)
     fake.showing = "2"
     monkeypatch.setattr(mcp_server, "desk", desk)
     with pytest.raises(ToolError, match="is not on screen"):
@@ -538,3 +556,51 @@ def test_wait_changed_returns_a_shot_of_the_change_and_where_it_is(tmp_path, mon
         desk.wait_changed("battle", base.id, 5, (1200, 0, 100, 10))
     with pytest.raises(TimeoutError, match="did not change from shot"):
         desk.wait_changed("battle", shot.id, 0)
+
+
+def test_drag_is_one_plugin_path_that_presses_moves_and_releases(tmp_path, monkeypatch):
+    desk, _, inp, plugin = make_desk(tmp_path, monkeypatch)
+    assert desk.drag("battle", (100, 50), (300, 50), duration=0.1) == (2527 + 600, 1066)
+    ((name, address, mode, steps),) = plugin.calls
+    assert (name, address, mode) == ("path", "0xabc", "shown")
+    assert steps[:4] == ["m2727,1066", "d60", "p272", "d60"] and steps[-2:] == ["d60", "r272"]
+    moves = [s for s in steps if s.startswith("m")]
+    assert moves[-1] == "m3127,1066" and len(moves) == 1 + 6
+    assert inp.events == []
+    with pytest.raises(ValueError):
+        desk.drag("battle", (100, 50), (300, 50), duration=6)
+
+
+def test_hover_answers_once_in_place_shoots_then_ends_the_path(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda _: None)
+    taken = []
+    monkeypatch.setattr(screen, "capture", lambda win, max_width: taken.append(plugin.calls[:]) or "shot")
+    assert desk.hover("battle", 100, 50, wait=0.5) == "shot"
+    assert plugin.calls == [("path", "0xabc", "shown", ["m2727,1066", "n", "d5500"]), ("end", 9)]
+    # The screenshot is taken while the pointer rests there, before the path ends.
+    assert taken == [[("path", "0xabc", "shown", ["m2727,1066", "n", "d5500"])]]
+
+
+def test_hover_then_click_clicks_before_the_pointer_leaves(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    assert desk.hover("battle", 100, 50, wait=0.2, then_click=(100, 80)) == (2727, 1126)
+    assert plugin.calls == [("path", "0xabc", "shown", ["m2727,1066", "d200", "m2727,1126", "p272", "r272"])]
+
+
+def test_an_element_is_targeted_at_its_live_centre(tmp_path, monkeypatch):
+    desk, *_ = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: (10, 20, 30, 40))
+    assert desk.click("battle", None, None, element="e3") == (2527 + 25, 966 + 40)
+    with pytest.raises(ValueError, match="not both"):
+        desk.click("battle", 1, 2, element="e3")
+    with pytest.raises(ValueError, match="neither"):
+        desk.click("battle", None, None)
+
+
+def test_key_hold_is_bounded(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    desk.key("Right", "battle", hold=2)
+    assert plugin.calls[-1] == ("keys", "0xabc", ["+106", "-106"], {"hold": 2})
+    with pytest.raises(ValueError):
+        desk.key("Right", "battle", hold=11)

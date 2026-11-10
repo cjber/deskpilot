@@ -7,6 +7,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Act on windows out of view with `--hidden`.** `shot`, `click`, `scroll`, `drag`, `hover`, `elements` and
+  `wait-for --changed` take `--hidden` (MCP `hidden`) to act on a window wherever it is, a hidden or special workspace
+  included, without switching workspace, showing a cursor, or touching your pointer, focus or screen. Tooltips and
+  menus the window opens show in its screenshots and take clicks, and your own pointer moving meanwhile does not close
+  them. Native Wayland
+  windows only: XWayland windows, and windows of the app your pointer is on, are refused.
+- **Deskpilot no longer blocks you.** Clicks, scrolls, drags, hovers and keys go straight to the target app, so your
+  pointer, cursor, focus and input keep working while an agent acts. XWayland apps and the app your pointer or
+  keyboard is in still take a brief hold, as before.
+- **The agent cursor is drawn by the plugin.** It no longer needs `cua-driver`. It glides along an arc to each point
+  before the action starts, shrinks with a ring at each press, follows drags as they move, and fades when idle.
+- **Scroll is bounded.** `scroll` takes 1 to 50 notches either way.
+- **Drag, hover and hold keys without taking your pointer.** `deskpilot drag` presses, moves and releases for
+  sliders, text selection and drag and drop within a window. `deskpilot hover` rests the pointer on a point and
+  returns a screenshot taken meanwhile, so tooltips show, and `--click` clicks next for a menu that opens on hover.
+  `key --hold` keeps a key down. Each holds your pointer input only while it runs and always lets go of its button
+  (MCP `drag`, `hover`, and `hold` on `key`).
+- **Target elements of the accessibility tree.** `deskpilot elements` prints an app's AT-SPI tree with roles, names,
+  states, text and bounds, and `--element ID` on `click`, `move`, `scroll` and `hover` acts where the app says the
+  element is now (MCP `elements` and `element`). An app that exposes no tree says so.
+- **Clicks move the pointer before pressing.** Each click and scroll now sends a motion event at its point before
+  the press, as a real pointer does, for clients that track the pointer from motion.
+
 ## [0.3.0] - 2026-11-10
 
 - **Text arrives as written on any keyboard layout.** `type` and `key` used US key positions, so another layout or
