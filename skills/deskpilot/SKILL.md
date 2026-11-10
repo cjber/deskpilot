@@ -16,8 +16,11 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    a minute once per Hyprland version. `deskpilot plugin status` reports the loaded build.
 2. Run `deskpilot windows` and pick the target by address, class, or part of its class or title. A name that matches
    several windows is an error that lists them: pick one by address rather than guessing. `visible` is false for a
-   window on a hidden workspace or scrolled off screen; acting on it is refused unless you pass `--show`, which
-   focuses it and moves the user's view, so ask the user first.
+   window on a hidden workspace or scrolled off screen; acting on it is refused unless you pass `--hidden`, which
+   acts on it where it is without the user seeing anything, or `--show`, which focuses it and moves the user's
+   view, so ask the user before `--show`. `--hidden` works on `shot`, `click`, `scroll`, `drag`, `hover`,
+   `elements` and `wait-for --changed`, for native Wayland windows; an XWayland window, or one of the app the
+   user's pointer is on, is refused.
 3. Run `deskpilot shot WINDOW`, read the image at the `path` it prints, and choose a point in that image. Note its
    `shot` id.
 4. Act with that point as given, passing the id: `deskpilot click WINDOW X Y --shot ID` (`--button right`,
@@ -63,7 +66,8 @@ press into the focused window, which may be the user's own: always pass `--windo
 
 ## Errors
 
-- "is not on screen": the window is on a hidden workspace or scrolled off. Ask the user before passing `--show`.
+- "is not on screen": the window is on a hidden workspace or scrolled off. Pass `--hidden`, or ask the user before
+  passing `--show`.
 - "take a new shot": the window changed size since the shot. Shoot again and pick the point anew.
 - A plugin build failure names the missing headers or compiler.
 - A stale `HYPRLAND_INSTANCE_SIGNATURE` is handled: deskpilot finds the live Hyprland, and stops with a list when

@@ -4,9 +4,10 @@ Coordinates for move, click, scroll, hover and drag are pixels in the window's l
 screenshot, pick a point, click it. Pass --scale 1 to give window pixels instead, or --element with an id from
 `deskpilot elements` to act on that element of the app's accessibility tree.
 
-Clicks, scrolls, keys and text run inside the compositor through the deskpilot Hyprland plugin (`deskpilot plugin
-load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on the user's
-keymap. --take-pointer and --take-focus move the user's own pointer or focus instead.
+Clicks, scrolls, drags, hovers, keys and text run inside the compositor through the deskpilot Hyprland plugin
+(`deskpilot plugin load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on
+the user's keymap; an arrow the plugin draws shows where the agent acts. --hidden acts on a window wherever it is, on
+screen or not, with nothing shown. --take-pointer and --take-focus move the user's own pointer or focus instead.
 """
 
 from __future__ import annotations
@@ -29,7 +30,20 @@ def _print(data, as_json: bool) -> None:
         print(data if isinstance(data, str) else json.dumps(data))
 
 
-SHOW_HELP = "bring a window that is not on screen into view by focusing it, instead of refusing"
+def _view_args(s: argparse.ArgumentParser) -> None:
+    """How the command reaches a window that may be off screen."""
+    group = s.add_mutually_exclusive_group()
+    group.add_argument(
+        "--show",
+        action="store_true",
+        help="bring a window that is not on screen into view by focusing it, instead of refusing",
+    )
+    group.add_argument(
+        "--hidden",
+        action="store_true",
+        help="act on the window wherever it is, on screen or not, with no agent cursor and the user's pointer, focus "
+        "and view untouched (not for XWayland windows' pointer input)",
+    )
 
 
 def _point_parser(sub, name: str, helptext: str, take_pointer: bool = True) -> argparse.ArgumentParser:
@@ -52,7 +66,7 @@ def _point_parser(sub, name: str, helptext: str, take_pointer: bool = True) -> a
 def _shot_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--scale", type=float, help="the scale the point is in; 1 for window pixels")
     s.add_argument("--shot", help="the shot id the point is in (default: the window's latest shot)")
-    s.add_argument("--show", action="store_true", help=SHOW_HELP)
+    _view_args(s)
 
 
 def _tree(element: dict, depth: int = 0) -> list[str]:
@@ -110,7 +124,28 @@ def _path_commands(sub) -> None:
 
     s = sub.add_parser("elements", help="print a window's accessibility tree, with ids that --element takes")
     s.add_argument("window")
-    s.add_argument("--show", action="store_true", help=SHOW_HELP)
+    _view_args(s)
+
+
+def _wait_command(sub) -> None:
+    s = sub.add_parser(
+        "wait-for", help="wait for a window to appear, close, take focus, change title or size, or look different"
+    )
+    s.add_argument("window")
+    s.add_argument("--timeout", type=float, default=60)
+    s.add_argument("--gone", action="store_true", help="wait for it to close")
+    s.add_argument("--focused", action="store_true", help="wait until it has keyboard focus")
+    s.add_argument("--title", help="wait until its title contains this")
+    s.add_argument("--size", type=_size, metavar="WxH", help="wait until it is this size in window pixels")
+    s.add_argument(
+        "--changed", metavar="SHOT", help="wait until it looks different from this shot; prints a shot of the change"
+    )
+    s.add_argument(
+        "--region", type=int, nargs=4, metavar=("X", "Y", "W", "H"), help="with --changed, only this part of the shot"
+    )
+    s.add_argument(
+        "--hidden", action="store_true", help="with --changed, watch the window wherever it is, on screen or not"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("window")
     s.add_argument("-o", "--out", type=Path)
     s.add_argument("--max-width", type=int, default=1400, help="scale down wider windows to this width")
-    s.add_argument("--show", action="store_true", help=SHOW_HELP)
+    _view_args(s)
 
     _point_parser(sub, "move", "show the agent cursor at a point")
     s = _point_parser(sub, "click", "click a point")
@@ -174,21 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("clipboard", help="print the user's clipboard text, or replace it with --set")
     s.add_argument("--set", metavar="TEXT", help="the text to copy, or - to read it from stdin")
 
-    s = sub.add_parser(
-        "wait-for", help="wait for a window to appear, close, take focus, change title or size, or look different"
-    )
-    s.add_argument("window")
-    s.add_argument("--timeout", type=float, default=60)
-    s.add_argument("--gone", action="store_true", help="wait for it to close")
-    s.add_argument("--focused", action="store_true", help="wait until it has keyboard focus")
-    s.add_argument("--title", help="wait until its title contains this")
-    s.add_argument("--size", type=_size, metavar="WxH", help="wait until it is this size in window pixels")
-    s.add_argument(
-        "--changed", metavar="SHOT", help="wait until it looks different from this shot; prints a shot of the change"
-    )
-    s.add_argument(
-        "--region", type=int, nargs=4, metavar=("X", "Y", "W", "H"), help="with --changed, only this part of the shot"
-    )
+    _wait_command(sub)
 
     sub.add_parser("cursor", help="print the cursor's global position")
     sub.add_parser("mcp", help="run the MCP server on stdio")
@@ -202,8 +223,10 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
         case "focus":
             return desk.focus(args.window).to_dict()
         case "shot":
-            return desk.shot(args.window, args.out, args.max_width, args.show).to_dict()
+            return desk.shot(args.window, args.out, args.max_width, args.show, args.hidden).to_dict()
         case "move":
+            if args.hidden:
+                raise ValueError("move only shows the agent cursor, which a hidden action never shows")
             gx, gy = desk.move(
                 args.window,
                 args.x,
@@ -229,6 +252,7 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 show=args.show,
                 take_focus=args.take_focus,
                 element=args.element,
+                hidden=args.hidden,
             )
             return {"x": gx, "y": gy}
         case "scroll":
@@ -242,6 +266,7 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 shot=args.shot,
                 show=args.show,
                 element=args.element,
+                hidden=args.hidden,
             )
             return {"x": gx, "y": gy}
         case "hover":
@@ -257,6 +282,7 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 then_click=tuple(args.click) if args.click else None,
                 button=args.button,
                 max_width=args.max_width,
+                hidden=args.hidden,
             )
             if isinstance(result, tuple):
                 return {"x": result[0], "y": result[1]}
@@ -271,10 +297,11 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 args.scale,
                 shot=args.shot,
                 show=args.show,
+                hidden=args.hidden,
             )
             return {"x": gx, "y": gy}
         case "elements":
-            tree = desk.elements(args.window, args.show).to_dict()
+            tree = desk.elements(args.window, args.show, args.hidden).to_dict()
             return tree if args.json else _tree(tree)
         case "key":
             desk.key(args.combo, args.window, args.take_focus, args.hold)
@@ -294,10 +321,10 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             if args.changed:
                 if args.gone or args.focused or args.title is not None or args.size:
                     raise ValueError("--changed waits on pixels alone: drop --gone, --focused, --title and --size")
-                shot, box = desk.wait_changed(args.window, args.changed, args.timeout, args.region)
+                shot, box = desk.wait_changed(args.window, args.changed, args.timeout, args.region, args.hidden)
                 return {**shot.to_dict(), "changed": list(box)}
-            if args.region:
-                raise ValueError("--region needs --changed")
+            if args.region or args.hidden:
+                raise ValueError("--region and --hidden need --changed")
             win = desk.wait_for(args.window, args.timeout, args.gone, args.focused, args.title, args.size)
             return win.to_dict() if win else "gone"
         case "plugin":

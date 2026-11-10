@@ -10,9 +10,17 @@ meanwhile. Only pointer focus moves, so keyboard focus stays on the user's windo
 with `focus_on_activate` set. Wayland, XWayland and Wine clients all receive the press as a real click. The plugin refuses
 a click when another window covers the point.
 
-An agent cursor shows where deskpilot acts: [cua-driver](https://github.com/trycua/cua)'s overlay arrow glides to
-each point, drawn above every window and separate from the user's pointer. Without `cua-driver` on `PATH`, or with
-`DESKPILOT_CURSOR=off`, actions run without it.
+An agent cursor shows where deskpilot acts. The plugin draws it above every window, separate from the user's
+pointer: it glides along an arc to each point before the action starts, shrinks and sends out a ring at each press,
+follows a drag as it moves, and fades after a few idle seconds. Window screenshots never include it.
+`DESKPILOT_CURSOR=off` turns it off.
+
+`--hidden` acts on a window wherever it is, on a hidden or special workspace included, fully out of the user's
+view: no workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
+sends pointer input straight to that window's own client, and lets it draw while off screen so a screenshot after the
+action shows the result. It works for native Wayland windows. An XWayland window (X11 and Wine apps) is refused,
+since X clients read the one X pointer only the user's pointer moves; so is a window of the app the user's pointer is
+on, and a drag and drop the press starts is cancelled.
 
 Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
 the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
@@ -31,8 +39,7 @@ Battle.net drops `xdotool` clicks.
 
 - Hyprland, with `hyprctl` on `PATH`. Version 0.57's Lua dispatchers and the older string ones both work.
 - The plugin build tools: a C++26 compiler, `make`, Hyprland's headers (`pkg-config hyprland`, shipped with
-  Arch's `hyprland` package), `libxcb` and `libxkbcommon`.
-- Optional: `cua-driver` for the agent cursor.
+  Arch's `hyprland` package), `libxcb`, `libxkbcommon` and `cairo`.
 - `grim` for screenshots.
 - `wl-clipboard` for `clipboard`.
 - For `--take-pointer`: write access to `/dev/uinput`, usually through the `input` group or a udev ACL. Check with
@@ -79,7 +86,8 @@ taken at. A window resized since that shot is refused, as is a point outside the
 window pixels instead.
 
 A window on a hidden workspace or scrolled off its monitor is reported as `"visible": false`, and `shot`, `move`,
-`click` and `scroll` refuse it rather than move the user's view. `--show` focuses it to bring it on screen first.
+`click`, `scroll`, `drag`, `hover` and `elements` refuse it rather than move the user's view. `--hidden` acts on it
+where it is, out of view; `--show` focuses it to bring it on screen first.
 
 The first action that needs the plugin builds and loads it for the running Hyprland, so it comes back by itself
 after Hyprland restarts or upgrades. `deskpilot plugin load` does the same ahead of time.
@@ -134,8 +142,9 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
 id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`, `key`, `type_text`, `paste_text`,
 `clipboard`, `copy_text`, `wait_for` and `wait_changed`. `click`, `move` and `scroll` take `shot`, `show` and
-`take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `click`, `key`, `type_text` and `paste_text`
-take `take_focus`; `key` takes `hold`. It keeps one input device and one agent cursor open for the session.
+`take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements` and
+`wait_changed` take `hidden`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
+keeps one input device open for the session.
 
 ```sh
 claude mcp add deskpilot -- deskpilot mcp

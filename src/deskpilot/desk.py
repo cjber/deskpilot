@@ -1,12 +1,14 @@
 """The actions an agent takes, shared by the CLI and the MCP server.
 
-Clicks, scrolls and keys go through the deskpilot Hyprland plugin, which leaves the user's pointer and keyboard focus
-where they were; the agent cursor overlay shows where clicks land. `take_pointer` instead moves the user's own pointer
-and clicks through the uinput device, and `take_focus` focuses the window before its keys.
+Clicks, scrolls, drags, hovers and keys go through the deskpilot Hyprland plugin, which leaves the user's pointer and
+keyboard focus where they were; the agent cursor the plugin draws shows where they land. `hidden` acts on a window
+wherever it is, on screen or not, with nothing shown and the user's pointer untouched. `take_pointer` instead moves the
+user's own pointer and clicks through the uinput device, and `take_focus` focuses the window before its keys.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -14,7 +16,6 @@ from PIL import Image, ImageChops
 
 from . import a11y, clipboard, keys, screen
 from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound
-from .overlay import AgentCursor
 from .plugin import BUTTON_CODES, Plugin, PluginError
 
 
@@ -42,16 +43,18 @@ SHOW_TIMEOUT = 3.0
 # release, as a hand makes, so a slider or a drag threshold sees the press before the motion.
 DRAG_STEP = 1 / 60
 DRAG_PAUSE_MS = 60
+# How long the pointer rests on a point before pressing there, on top of the plugin's 8 ms after each move: the
+# 60 ms a hand takes, which a client that reads input once a frame still sees as separate events.
+HOLD_MS = 52
 # How long beyond its own wait a hover holds the pointer for its screenshot. The plugin ends the hover when the shot is
 # taken; this bounds it if deskpilot dies first.
 HOVER_SHOT_MS = 5000
 
 
 class Desk:
-    def __init__(self, hypr: Hyprland | None = None, input_factory=None, plugin=None, cursor=None):
+    def __init__(self, hypr: Hyprland | None = None, input_factory=None, plugin=None):
         self.hypr = hypr or Hyprland()
         self.plugin = plugin or Plugin()
-        self.cursor = cursor or AgentCursor()
         self._input_factory = input_factory
         self._input = None
 
@@ -66,7 +69,6 @@ class Desk:
         return self._input
 
     def close(self) -> None:
-        self.cursor.close()
         if self._input is not None:
             self._input.close()
             self._input = None
@@ -82,15 +84,19 @@ class Desk:
         self.hypr.focus(win)
         return win
 
-    def _on_screen(self, win: Window, show: bool) -> Window:
-        """The window, on screen: a screenshot or a click reaches only what is showing. A hidden window is an error
-        unless `show`, which focuses it, since that switches the user's workspace or scrolls their layout."""
-        if win.visible:
+    def _on_screen(self, win: Window, show: bool, hidden: bool = False) -> Window:
+        """The window to act on. A visible action reaches only what is showing, so a window off screen is an error
+        unless `show`, which focuses it, since that switches the user's workspace or scrolls their layout. A hidden
+        action takes the window wherever it is."""
+        if show and hidden:
+            raise ValueError("show brings a window into view and hidden acts out of view: pass one")
+        if win.visible or hidden:
             return win
         if not show:
             raise NotVisible(
                 f"{win.cls} ({win.address}) is not on screen: its workspace {win.workspace} is not showing or it is "
-                "scrolled off its monitor. Pass --show (show over MCP) to bring it into view, which focuses it"
+                "scrolled off its monitor. Pass --hidden (hidden over MCP) to act on it where it is, out of view, or "
+                "--show (show) to bring it into view, which focuses it"
             )
         self.hypr.focus(win)
         deadline = time.monotonic() + SHOW_TIMEOUT
@@ -102,9 +108,14 @@ class Desk:
         raise NotVisible(f"{win.cls} ({win.address}) did not come on screen within {SHOW_TIMEOUT}s of focusing it")
 
     def shot(
-        self, query: str, out: Path | None = None, max_width: int = screen.DEFAULT_MAX_WIDTH, show: bool = False
+        self,
+        query: str,
+        out: Path | None = None,
+        max_width: int = screen.DEFAULT_MAX_WIDTH,
+        show: bool = False,
+        hidden: bool = False,
     ) -> screen.Shot:
-        return screen.capture(self._on_screen(self.window(query), show), out, max_width)
+        return screen.capture(self._on_screen(self.window(query), show, hidden), out, max_width)
 
     def point(
         self,
@@ -115,13 +126,14 @@ class Desk:
         shot: str | None = None,
         show: bool = False,
         element: str | None = None,
+        hidden: bool = False,
     ) -> tuple[Window, int, int]:
         """Resolve a point to a global position. The point is in pixels of `shot`, or of the window's latest shot,
         or at `scale` (1 for window pixels); with no shot at all it is in window pixels. With `element` it is the
         centre of that element of the window's accessibility tree, where the app says it is now."""
         if (element is None) == (x is None or y is None):
             raise ValueError("give a point (x and y) or an element, not both or neither")
-        win = self._on_screen(self.window(query), show)
+        win = self._on_screen(self.window(query), show, hidden)
         if element is not None:
             ex, ey, ew, eh = a11y.locate(win, element)
             return win, *screen.to_global(win, ex + ew / 2, ey + eh / 2, 1.0)
@@ -133,6 +145,16 @@ class Desk:
             scale = taken.scale if taken else 1.0
         gx, gy = screen.to_global(win, x, y, scale)
         return win, gx, gy
+
+    @staticmethod
+    def _mode(hidden: bool) -> str:
+        """How the plugin reaches the window: hidden, or on screen with the agent cursor unless DESKPILOT_CURSOR=off."""
+        if hidden:
+            return "hidden"
+        return "plain" if os.environ.get("DESKPILOT_CURSOR") == "off" else "shown"
+
+    def _path(self, win: Window, steps: list[str], hidden: bool) -> dict:
+        return self.plugin.path(win.address, self._mode(hidden), steps)
 
     def _take_pointer(self, win: Window, gx: int, gy: int) -> None:
         self.hypr.focus(win)
@@ -154,7 +176,8 @@ class Desk:
     ) -> tuple[int, int]:
         """Show the agent cursor at a point. take_pointer also moves the user's pointer there."""
         win, gx, gy = self.point(query, x, y, scale, shot, show, element)
-        self.cursor.glide(gx, gy)
+        if self._mode(False) == "shown":
+            self.plugin.cursor(gx, gy)
         if take_pointer:
             self._take_pointer(win, gx, gy)
         return gx, gy
@@ -173,18 +196,23 @@ class Desk:
         show: bool = False,
         take_focus: bool = False,
         element: str | None = None,
+        hidden: bool = False,
     ) -> tuple[int, int]:
         """Click a point. take_focus focuses the window first and leaves it focused, for a menu or dropdown that
         closes when its window is not the focused one."""
+        if hidden and (take_pointer or take_focus):
+            raise ValueError(
+                "a hidden click leaves the user's pointer and focus alone: drop take_pointer and take_focus"
+            )
         if take_focus:
             self.focus(query)
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element)
-        self.cursor.glide(gx, gy)
+        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
         if take_pointer:
             self._take_pointer(win, gx, gy)
             self.input.click(button, count)
         else:
-            self.plugin.click(win.address, gx, gy, button, count)
+            code = BUTTON_CODES[button]
+            self._path(win, [f"m{gx},{gy}", f"d{HOLD_MS}", *[f"p{code}", f"r{code}"] * count], hidden)
         return gx, gy
 
     def scroll(
@@ -199,14 +227,19 @@ class Desk:
         shot: str | None = None,
         show: bool = False,
         element: str | None = None,
+        hidden: bool = False,
     ) -> tuple[int, int]:
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element)
-        self.cursor.glide(gx, gy)
+        """Turn the wheel `dy` notches at a point, up to 50; positive is up."""
+        if hidden and take_pointer:
+            raise ValueError("a hidden scroll leaves the user's pointer alone: drop take_pointer")
+        if dy == 0 or abs(dy) > 50:
+            raise ValueError("scroll 1 to 50 notches, positive up")
+        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
         if take_pointer:
             self._take_pointer(win, gx, gy)
             self.input.scroll(dy=dy)
         else:
-            self.plugin.scroll(win.address, gx, gy, dy)
+            self._path(win, [f"m{gx},{gy}", f"d{HOLD_MS}", f"w{dy}"], hidden)
         return gx, gy
 
     def drag(
@@ -220,11 +253,12 @@ class Desk:
         *,
         shot: str | None = None,
         show: bool = False,
+        hidden: bool = False,
     ) -> tuple[int, int]:
         """Press at `start`, move to `end` over `duration` seconds and release there, for a slider, a selection or a
         drag and drop within the window. Both points are in the same shot's pixels. The user's pointer stays put."""
-        win, x1, y1 = self.point(query, *start, scale, shot, show)
-        _, x2, y2 = self.point(query, *end, scale, shot, show)
+        win, x1, y1 = self.point(query, *start, scale, shot, show, hidden=hidden)
+        _, x2, y2 = self.point(query, *end, scale, shot, show, hidden=hidden)
         if not 0 < duration <= 5:
             raise ValueError("a drag takes more than 0 and at most 5 seconds")
         moves = max(2, round(duration / DRAG_STEP))
@@ -234,9 +268,7 @@ class Desk:
         for i in range(1, moves + 1):
             steps += [f"m{x1 + (x2 - x1) * i / moves:g},{y1 + (y2 - y1) * i / moves:g}", f"d{wait}"]
         steps += [f"d{DRAG_PAUSE_MS}", f"r{code}"]
-        self.cursor.glide(x1, y1)
-        self.plugin.path(win.address, steps)
-        self.cursor.glide(x2, y2)
+        self._path(win, steps, hidden)
         return x2, y2
 
     def hover(
@@ -253,31 +285,30 @@ class Desk:
         then_click: tuple[float, float] | None = None,
         button: str = "left",
         max_width: int = screen.DEFAULT_MAX_WIDTH,
+        hidden: bool = False,
     ) -> screen.Shot | tuple[int, int]:
         """Rest the pointer on a point for `wait` seconds without moving the user's, for a tooltip or a menu that
         opens on hover. Returns a screenshot taken while it rests there. With `then_click`, a point in the same
         pixels, it clicks there next instead, before the pointer leaves, and returns that point."""
         if not 0 <= wait <= 5:
             raise ValueError("a hover waits 0 to 5 seconds")
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element)
-        self.cursor.glide(gx, gy)
+        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
         if then_click is not None:
-            _, cx, cy = self.point(query, *then_click, scale, shot, show)
+            _, cx, cy = self.point(query, *then_click, scale, shot, show, hidden=hidden)
             code = BUTTON_CODES[button]
             steps = [f"m{gx},{gy}", f"d{round(wait * 1000)}", f"m{cx},{cy}", f"p{code}", f"r{code}"]
-            self.plugin.path(win.address, steps)
-            self.cursor.glide(cx, cy)
+            self._path(win, steps, hidden)
             return cx, cy
-        reply = self.plugin.path(win.address, [f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"])
+        reply = self._path(win, [f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"], hidden)
         try:
             time.sleep(wait)
             return screen.capture(win, max_width=max_width)
         finally:
             self.plugin.end(reply["ticket"])
 
-    def elements(self, query: str, show: bool = False) -> a11y.Element:
+    def elements(self, query: str, show: bool = False, hidden: bool = False) -> a11y.Element:
         """The window's accessibility tree, whose element ids click, hover, move and scroll take."""
-        return a11y.snapshot(self._on_screen(self.window(query), show))
+        return a11y.snapshot(self._on_screen(self.window(query), show, hidden))
 
     def key(self, combo: str, query: str | None = None, take_focus: bool = False, hold: float = 0.0) -> None:
         """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
@@ -355,12 +386,17 @@ class Desk:
             time.sleep(0.5)
 
     def wait_changed(
-        self, query: str, shot: str, timeout: float = 60, region: tuple[int, int, int, int] | None = None
+        self,
+        query: str,
+        shot: str,
+        timeout: float = 60,
+        region: tuple[int, int, int, int] | None = None,
+        hidden: bool = False,
     ) -> tuple[screen.Shot, tuple[int, int, int, int]]:
         """Wait until the window looks different from `shot`, in all of it or in `region` (x, y, width, height in
         that shot's pixels). Returns a shot of the change and the box that changed in its pixels. A pixel counts as
         changed when it differs at all; a window resized since the shot has changed everywhere."""
-        win = self._on_screen(self.window(query), False)
+        win = self._on_screen(self.window(query), False, hidden)
         base = screen.load(shot)
         if win.address != base.address:
             raise screen.StaleShot(f"shot {shot} is of window {base.address}, not {win.address}")
@@ -372,7 +408,7 @@ class Desk:
             before = image.convert("RGB").crop(box)
         deadline = time.monotonic() + timeout
         while True:
-            win = self._on_screen(self.window(query), False)
+            win = self._on_screen(self.window(query), False, hidden)
             now = screen.capture(win, max_width=base.width)
             # A resize, or a move to a monitor of another scale, changes the whole image.
             if (now.width, now.height) != (base.width, base.height):
