@@ -23,6 +23,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   (with an optional `--region X Y W H`) waits until the window looks different from that shot, then prints a shot of
   the change and the box that changed (MCP `wait_for` and `wait_changed`).
 
+- **Dropdowns stay open with `click --take-focus`.** Chrome and other apps close a menu or dropdown when their
+  window is not the focused one, so a click that left the user's focus in place closed the list it opened.
+  `click --take-focus` (MCP `take_focus`) focuses the window first and leaves it focused.
+
 ## [0.2.1] - 2026-11-10
 
 - **Reloading the plugin no longer crashes Hyprland.** Loading a plugin build that had already been loaded and

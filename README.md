@@ -79,6 +79,10 @@ A window on a hidden workspace or scrolled off its monitor is reported as `"visi
 The first action that needs the plugin builds and loads it for the running Hyprland, so it comes back by itself
 after Hyprland restarts or upgrades. `deskpilot plugin load` does the same ahead of time.
 
+Some apps close a menu or dropdown as soon as it opens when their window is not the focused one, as Chrome does
+with many web page dropdowns. `click --take-focus` focuses the window first and leaves it focused, so the list stays
+open for the next click.
+
 `move` only shows the agent cursor. Pass `--take-pointer` to `move`, `click` or `scroll` to move the user's own
 pointer there and press through the input device instead, for a hover the app must see.
 
@@ -109,7 +113,7 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
 id), `click`, `move`, `scroll`, `key`, `type_text`, `paste_text`, `clipboard`, `copy_text`, `wait_for` and
-`wait_changed`. `click`, `move` and `scroll` take `shot`, `show` and `take_pointer`; `key`, `type_text` and
+`wait_changed`. `click`, `move` and `scroll` take `shot`, `show` and `take_pointer`; `click`, `key`, `type_text` and
 `paste_text` take `take_focus`. It keeps one input device and one agent cursor open for the session.
 
 ```sh
