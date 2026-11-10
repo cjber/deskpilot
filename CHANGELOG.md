@@ -7,6 +7,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **A combo box's chosen item reads as selected.** GTK reports a combo box's active item only through the
+  combo box's AT-SPI Selection, so `elements` showed no choice at all and a program had to take a screenshot to
+  read it. An item any container reports as chosen now carries the `selected` state.
+
 ## [0.5.0] - 2026-11-10
 
 - **Read a tree without replacing the snapshot.** `elements --peek` (MCP `peek`) reads the accessibility tree and

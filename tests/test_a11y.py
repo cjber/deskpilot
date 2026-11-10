@@ -39,6 +39,8 @@ class FakeBus:
         self.text = {"/button": "Save"}
         self.pid = pid
         self.failure: Exception | None = None
+        # What a container with a Selection interface reports as chosen, by its path.
+        self.selected: dict[str, list[tuple[str, str]]] = {}
 
     def call(self, destination, object_path, interface, method, signature, body):
         self.calls.append((destination, object_path, interface, method, signature, body))
@@ -62,6 +64,10 @@ class FakeBus:
                 return (("s", self.names[object_path]),)
             if name == "CharacterCount":
                 return (("i", len(self.text[object_path])),)
+            if name == "NSelectedChildren":
+                return (("i", len(self.selected[object_path])),)
+        if (interface, method) == (a11y.SELECTION_INTERFACE, "GetSelectedChild"):
+            return (self.selected[object_path][body[0]],)
         if (interface, method) == (a11y.COMPONENT_INTERFACE, "GetExtents"):
             return (self.bounds[object_path],)
         if (interface, method) == (a11y.TEXT_INTERFACE, "GetText"):
@@ -86,6 +92,17 @@ def test_snapshot_matches_pid_and_chooses_one_toplevel_by_exact_title(tmp_path, 
         "role": "push button",
         "name": "Save",
     }
+
+
+def test_a_child_a_selection_reports_as_chosen_is_selected(tmp_path, monkeypatch):
+    # A GTK combo box reports its active item only through its Selection: the item has no selected state itself.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake = FakeBus()
+    fake.interfaces["/frame"].append(a11y.SELECTION_INTERFACE)
+    fake.selected["/frame"] = [("app.bus", "/button")]
+    tree = a11y.snapshot(window(), bus=fake)
+    assert "selected" in tree.children[0].states
+    assert "selected" not in tree.states
 
 
 def test_snapshot_reports_ambiguous_toplevel_names(tmp_path, monkeypatch):
