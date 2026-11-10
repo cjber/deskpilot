@@ -128,10 +128,27 @@ def copy_text(text: str) -> str:
 
 
 @_tool()
-def wait_for(window: str, timeout: float = 60, gone: bool = False) -> dict | str:
-    """Wait for a window to appear, or with gone=True to close."""
-    win = desk.wait_for(window, timeout, gone)
+def wait_for(
+    window: str,
+    timeout: float = 60,
+    gone: bool = False,
+    focused: bool = False,
+    title: str | None = None,
+    size: tuple[int, int] | None = None,
+) -> dict | str:
+    """Wait for a window to appear, or with gone=True to close. focused, title (a substring) and size (window pixels)
+    also wait for it to have keyboard focus, that title or that size. Returns the window as it matched."""
+    win = desk.wait_for(window, timeout, gone, focused, title, size)
     return win.to_dict() if win else "gone"
+
+
+@_tool()
+def wait_changed(window: str, shot: str, timeout: float = 60, region: tuple[int, int, int, int] | None = None) -> list:
+    """Wait until a window looks different from one of its shots, in all of it or in region (x, y, width, height in
+    that shot's pixels). Any pixel difference counts. Returns a shot of the change, its id and the box that
+    changed."""
+    taken, box = desk.wait_changed(window, shot, timeout, region)
+    return [Image(path=taken.path), {**taken.to_dict(), "changed": list(box)}]
 
 
 def serve() -> None:

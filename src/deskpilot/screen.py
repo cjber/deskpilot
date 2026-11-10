@@ -113,6 +113,12 @@ def _prune(folder: Path, address: str) -> None:
         record.unlink(missing_ok=True)
 
 
+def discard(shot: Shot) -> None:
+    """Remove a shot nobody will use, such as a poll that saw nothing new."""
+    Path(shot.path).unlink(missing_ok=True)
+    (shots_dir() / f"{shot.id}.json").unlink(missing_ok=True)
+
+
 def load(shot_id: str, folder: Path | None = None) -> Shot:
     try:
         return Shot(**json.loads((shots_dir(folder) / f"{shot_id}.json").read_text()))
