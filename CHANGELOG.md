@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-10
+
 - **Read a tree without replacing the snapshot.** `elements --peek` (MCP `peek`) reads the accessibility tree and
   leaves the latest snapshot in place, so the ids taken from it stay good while a program checks what changed.
 
