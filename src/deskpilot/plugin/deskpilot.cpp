@@ -756,23 +756,27 @@ namespace {
     // method popups, focus-priority windows, layer popups, overlay and top layers (a top layer only above an exclusive
     // fullscreen window if it may be), then windows with the extents processMouseDownNormal uses. Nothing when it is
     // the target, else what is there instead. It only asks, so neither focus moves.
-    std::optional<std::string> blockerAt(const Vector2D& pos, uintptr_t target) {
+    struct SBlocker {
+        std::string why;
+        std::string code; // covered when something is over the point, else refused (see SOp::code)
+    };
+    std::optional<SBlocker> blockerAt(const Vector2D& pos, uintptr_t target) {
         using namespace Desktop::View;
         const auto AT = std::format("at {},{}", pos.x, pos.y);
         if (g_pSessionLockManager->isSessionLocked())
-            return "the session is locked";
+            return SBlocker{"the session is locked", "refused"};
         if (g_pInputManager->m_relay.popupFromCoords(pos))
-            return "an input method popup is on top " + AT;
+            return SBlocker{"an input method popup is on top " + AT, "covered"};
         if (const auto W = Desktop::viewState()->hitTest().windowAt(pos, FOCUS_PRIORITY); W && reinterpret_cast<uintptr_t>(W.get()) != target)
-            return describe(W) + " is on top " + AT;
+            return SBlocker{describe(W) + " is on top " + AT, "covered"};
 
         const auto MONITOR = State::monitorState()->query().vec(pos).run();
         if (!MONITOR)
-            return "no monitor " + AT;
+            return SBlocker{"no monitor " + AT, "refused"};
         Vector2D local;
         PHLLS    layer;
         if (Desktop::viewState()->hitTest().layerPopupSurfaceAt(pos, MONITOR, &local, &layer))
-            return std::format("a popup of layer surface '{}' is on top {}", layer ? layer->m_namespace : "", AT);
+            return SBlocker{std::format("a popup of layer surface '{}' is on top {}", layer ? layer->m_namespace : "", AT), "covered"};
         const auto WORKSPACE = MONITOR->m_activeSpecialWorkspace ? MONITOR->m_activeSpecialWorkspace : MONITOR->m_activeWorkspace;
         const bool EXCLUSIVE_FULLSCREEN =
             (WORKSPACE && Fullscreen::controller()->hasFullscreen(WORKSPACE) && Fullscreen::controller()->getFullscreenModes(WORKSPACE).internal == Fullscreen::FSMODE_FULLSCREEN) ||
@@ -783,21 +787,23 @@ namespace {
                 continue;
             if (LEVEL == ZWLR_LAYER_SHELL_V1_LAYER_TOP && EXCLUSIVE_FULLSCREEN && layer && !(layer->m_flags & LAYER_FLAG_ABOVE_FULLSCREEN))
                 continue;
-            return std::format("layer surface '{}' is on top {}", layer ? layer->m_namespace : "", AT);
+            return SBlocker{std::format("layer surface '{}' is on top {}", layer ? layer->m_namespace : "", AT), "covered"};
         }
 
         const auto WINDOW = Desktop::viewState()->hitTest().windowAt(pos, ALLOW_FLOATING | RESERVED_EXTENTS | INPUT_EXTENTS);
         if (WINDOW && reinterpret_cast<uintptr_t>(WINDOW.get()) == target)
             return std::nullopt;
-        return WINDOW ? describe(WINDOW) + " is on top " + AT : "no window " + AT;
+        if (WINDOW)
+            return SBlocker{describe(WINDOW) + " is on top " + AT, "covered"};
+        return SBlocker{"no window " + AT, "refused"};
     }
 
     // The target must be what is at the point, fresh from the hit tester, and still hold the seat's pointer focus
     // (where a press goes) before anything is sent to it.
     bool targetUnderPointer() {
         if (const auto BLOCKER = blockerAt(g_op->target, g_op->window)) {
-            g_op->error = *BLOCKER;
-            g_op->code  = "covered";
+            g_op->error = BLOCKER->why;
+            g_op->code  = BLOCKER->code;
             return false;
         }
         const auto UNDER = windowUnderPointer();

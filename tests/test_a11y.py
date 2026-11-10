@@ -1,6 +1,9 @@
 import json
+from types import SimpleNamespace
 
 import pytest
+from jeepney.low_level import HeaderFields
+from jeepney.wrappers import DBusErrorResponse
 
 from deskpilot import a11y
 from deskpilot.hypr import Window
@@ -35,9 +38,12 @@ class FakeBus:
         self.interfaces["/button"].append("org.a11y.atspi.Text")
         self.text = {"/button": "Save"}
         self.pid = pid
+        self.failure: Exception | None = None
 
     def call(self, destination, object_path, interface, method, signature, body):
         self.calls.append((destination, object_path, interface, method, signature, body))
+        if self.failure is not None and object_path == "/button":
+            raise self.failure
         if (interface, method) == (a11y.ACCESSIBLE_INTERFACE, "GetChildren"):
             return (self.refs.get(object_path, []),)
         if (interface, method) == (a11y.DBUS_INTERFACE, "GetConnectionUnixProcessID"):
@@ -85,8 +91,9 @@ def test_snapshot_matches_pid_and_chooses_one_toplevel_by_exact_title(tmp_path, 
 def test_snapshot_reports_ambiguous_toplevel_names(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     fake = FakeBus(title="Same", duplicate_title=True)
-    with pytest.raises(a11y.A11yError, match=r"'Same'.*'Same'"):
+    with pytest.raises(a11y.A11yError, match=r"'Same'.*'Same'") as error:
         a11y.snapshot(window(title="Different"), bus=fake)
+    assert error.value.code == "ambiguous"
 
 
 def test_snapshot_reports_an_app_without_accessibility(tmp_path, monkeypatch):
@@ -139,6 +146,36 @@ def test_an_element_whose_name_changed_is_stale_and_one_not_showing_is_offscreen
     with pytest.raises(a11y.A11yError, match="not showing") as error:
         a11y.locate(window(), "e2", bus=fake)
     assert error.value.code == "offscreen"
+
+
+def test_a_vanished_element_is_stale_and_a_failing_bus_is_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake = FakeBus()
+    a11y.snapshot(window(), bus=fake)
+    gone = SimpleNamespace(
+        header=SimpleNamespace(fields={HeaderFields.error_name: "org.freedesktop.DBus.Error.UnknownObject"}), body=()
+    )
+    fake.failure = DBusErrorResponse(gone)
+    with pytest.raises(a11y.A11yError, match="is gone") as error:
+        a11y.locate(window(), "e2", bus=fake)
+    assert error.value.code == "stale"
+
+    fake.failure = TimeoutError("no reply")
+    with pytest.raises(a11y.A11yError) as error:
+        a11y.locate(window(), "e2", bus=fake)
+    assert error.value.code == "unavailable"
+
+
+def test_a_malformed_record_is_stale(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    a11y.snapshot(window(), bus=FakeBus())
+    path = tmp_path / "deskpilot" / "elements" / "0xabc.json"
+    payload = json.loads(path.read_text())
+    del payload["elements"]["e2"]["path"]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(a11y.A11yError, match="unknown") as error:
+        a11y.locate(window(), "e2", bus=FakeBus())
+    assert error.value.code == "stale"
 
 
 def test_snapshot_to_dict_marks_a_walk_cut_by_max_nodes(tmp_path, monkeypatch):

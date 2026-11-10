@@ -11,7 +11,7 @@ from typing import Any, Protocol, cast
 
 from jeepney import DBusAddress, new_method_call
 from jeepney.io.blocking import open_dbus_connection
-from jeepney.wrappers import unwrap_msg
+from jeepney.wrappers import DBusErrorResponse, unwrap_msg
 
 from . import screen
 from .hypr import Window
@@ -29,6 +29,15 @@ DBUS_INTERFACE = "org.freedesktop.DBus"
 DBUS_PATH = "/org/freedesktop/DBus"
 COORDINATE_WINDOW = 1
 CALL_TIMEOUT = 2.0
+# D-Bus errors meaning the element's app or object no longer exists, so an id that named it is stale. Any other
+# failure, such as a timeout, is the bus being unavailable.
+GONE_ERRORS = frozenset(
+    {
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+        "org.freedesktop.DBus.Error.NameHasNoOwner",
+        "org.freedesktop.DBus.Error.UnknownObject",
+    }
+)
 TEXT_LIMIT = 4000
 
 _STATE_NAMES = (
@@ -81,8 +90,9 @@ _STATE_NAMES = (
 
 class A11yError(RuntimeError):
     """An accessibility operation failed with an actionable message. `code` is its kind: no_tree (the app exposes
-    none), stale (the element is gone, changed, or from an older snapshot), offscreen (it is not showing), refused (it
-    has no position) or unavailable (the accessibility bus failed)."""
+    none), ambiguous (several toplevels could be the window), stale (the element is gone, changed, or from an older
+    snapshot), offscreen (it is not showing), refused (it has no position) or unavailable (the accessibility bus
+    failed)."""
 
     def __init__(self, message: str, code: str = "unavailable"):
         super().__init__(message)
@@ -226,7 +236,8 @@ def _call(
     except A11yError:
         raise
     except Exception as exc:
-        raise A11yError(f"Could not call {interface}.{method} on {object_path}: {exc}") from exc
+        code = "stale" if isinstance(exc, DBusErrorResponse) and exc.name in GONE_ERRORS else "unavailable"
+        raise A11yError(f"Could not call {interface}.{method} on {object_path}: {exc}", code) from exc
 
 
 def _property(bus: _Bus, destination: str, object_path: str, interface: str, name: str) -> object:
@@ -383,7 +394,8 @@ def _choose_toplevel(bus: _Bus, app_bus: str, app_path: str, window: Window) -> 
     listed = ", ".join(repr(name) for name in names) or "none"
     raise A11yError(
         f"Could not choose an accessibility toplevel for {window.title!r}: candidates are {listed}. "
-        "The title must match exactly and uniquely."
+        "The title must match exactly and uniquely.",
+        "ambiguous",
     )
 
 
@@ -436,7 +448,7 @@ def snapshot(window: Window, max_depth: int = 30, max_nodes: int = 2000, bus: _B
 
         root = walk(root_bus, root_path, 0)
         # Ids are numbered afresh by each snapshot, so an id is checked against the snapshot it came from.
-        snapshot_id = f"{window.address.removeprefix('0x')}-{time.time_ns() // 1_000_000}"
+        snapshot_id = f"{window.address.removeprefix('0x')}-{time.time_ns()}"
         _write_records(window, snapshot_id, records)
         return replace(root, truncated=truncated, snapshot=snapshot_id)
 
@@ -446,7 +458,7 @@ def _load_record(window: Window, element_id: str, snapshot_id: str | None) -> di
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         record = payload.get("elements", {}).get(element_id)
-        if not isinstance(record, dict):
+        if not isinstance(record, dict) or not {"bus", "path"} <= record.keys():
             raise KeyError(element_id)
         latest = str(payload.get("snapshot", ""))
     except (AttributeError, OSError, ValueError, KeyError, TypeError) as exc:
@@ -479,6 +491,8 @@ def locate(window: Window, element_id: str, bus: _Bus | None = None) -> tuple[in
             role = _role(connection, destination, object_path)
             name = _name(connection, destination, object_path)
         except A11yError as exc:
+            if exc.code != "stale":
+                raise
             raise A11yError(f"Element {element_id} is gone; take a new snapshot: {exc}", "stale") from exc
         # A record written before records kept role and name has nothing to compare.
         if "role" in record and (role, name) != (record["role"], record["name"]):
