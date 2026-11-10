@@ -7,6 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Install from PyPI.** Each release is published to PyPI, so `uv tool install deskpilot` installs it.
 - **Windows off screen are refused, not focused.** `shot`, `click`, `move` and `scroll` on a window on a hidden
   workspace or scrolled off its monitor used to focus it, switching your workspace. They now refuse it, and
   `--show` brings it into view on request. `windows` reports `visible` for each window.
