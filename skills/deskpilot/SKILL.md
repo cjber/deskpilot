@@ -34,7 +34,7 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    `--element ID` replaces X Y on `click`, `move`, `scroll` and `hover`. Prefer it where the app has a tree: the
    app reports where the element is. An app without one says so; use a shot instead.
 5. Type with `deskpilot type "TEXT" --window WINDOW` and press keys with `deskpilot key ctrl+a --window WINDOW`. Games
-   read keys once per frame, so add `--delay 0.1` or more for them, and `key --hold SECONDS` to keep a key down: each key is held that long, with the same gap
+   read keys once per frame, so add `--delay 0.1` or more for them (other apps take keys with no delay; use `paste` for long text), and `key --hold SECONDS` to keep a key down: each key is held that long, with the same gap
    before the next. Text arrives as written on the user's keymap; a character no key on it types is an error, so
    send such text, or a long one, with `deskpilot paste "TEXT" --window WINDOW` (`--keys ctrl+shift+v` in a
    terminal). A paste uses a clipboard only that window sees; XWayland windows refuse it. `deskpilot clipboard`

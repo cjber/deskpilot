@@ -333,7 +333,7 @@ class Desk:
             raise ValueError("a key is held 0 to 10 seconds")
         self.plugin.keys(self._key_target(query, take_focus).address, keys.chord_words(combo), hold=hold)
 
-    def type(self, text: str, query: str | None = None, delay: float = 0.03, take_focus: bool = False) -> None:
+    def type(self, text: str, query: str | None = None, delay: float = 0.0, take_focus: bool = False) -> None:
         """Type text as written, on the user's own keymap. Each key is held `delay` seconds, and the next follows
         `delay` seconds later."""
         target = self._key_target(query, take_focus)

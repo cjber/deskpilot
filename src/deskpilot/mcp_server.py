@@ -204,9 +204,10 @@ def key(combo: str, window: str | None = None, take_focus: bool = False, hold: f
 
 
 @_tool()
-def type_text(text: str, window: str | None = None, delay: float = 0.03, take_focus: bool = False) -> str:
-    """Type text as written, on the user's keymap, into a window without focusing it. Each key is held `delay`
-    seconds and the next follows after the same gap; use 0.1 or more for games."""
+def type_text(text: str, window: str | None = None, delay: float = 0.0, take_focus: bool = False) -> str:
+    """Type text as written, on the user's keymap, into a window without focusing it. Keys go as fast as the
+    app reads them by default. Games read keys once per frame: for them, each key is held `delay` seconds, 0.1 or
+    more, and the next follows after the same gap. For long text, paste_text is faster still."""
     desk.type(text, window, delay, take_focus)
     return "ok"
 

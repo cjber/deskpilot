@@ -57,8 +57,8 @@
 //
 // `hyprctl deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <event>...` sends the same key events (the
 // window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
-// The seat's selection never changes, so the user's clipboard and every other client's stay as they are. Once the
-// client has read the text, or after PASTE_WAIT, it gets the clipboard it would otherwise have: the user's if it has
+// The seat's selection never changes, so the user's clipboard and every other client's stay as they are. After
+// PASTE_WAIT, or at the next paste, the client gets the clipboard it would otherwise have: the user's if it has
 // keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard.
 //
 // A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
@@ -275,6 +275,10 @@ namespace {
         // The user's input is held until the stroke ends: only when their keys could reach the stroke's keyboards,
         // since their keyboard focus is in the window's app, or the window is an XWayland one, which X focus reaches.
         bool                               holding = false;
+        // The window stays entered between strokes when nothing is held, so the next stroke needs no enter. A leave and
+        // enter around each keystroke makes an app such as Chrome redraw itself unfocused and focused every time,
+        // which flickers its title bar. It is left when the sequence ends, or when the user focuses its app.
+        bool                               lingering = false;
         // A keyboard focus change Hyprland asked for mid-stroke, applied when the stroke ends.
         std::optional<WP<CWLSurfaceResource>> deferredFocus;
         std::optional<std::chrono::steady_clock::time_point> clientDeadline;
@@ -386,7 +390,15 @@ namespace {
     // app's keyboard is in use.
     bool g_shieldKeys = false;
 
+    void endLinger(SKeyOp& op);
+
     void hkSetKeyboardFocus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
+        // Hyprland enters the surface it focuses itself, so a window still entered between strokes is left first.
+        if (g_keyOp && g_keyOp->lingering) {
+            const auto TARGET = g_keyOp->surface.lock();
+            if (!TARGET || (surface && surface->client() == TARGET->client()))
+                endLinger(*g_keyOp);
+        }
         if (g_keyOp && g_keyOp->inStroke) {
             const auto TARGET = g_keyOp->surface.lock();
             if (g_keyOp->holding || (surface && TARGET && surface->client() == TARGET->client())) {
@@ -1553,14 +1565,9 @@ namespace {
                     break;
                 write->written += N;
             }
-            // Read once: the window has its text, so it gets the user's clipboard back (or none, when unfocused).
-            // Restored here rather than later, so no callback into this plugin is left queued if it is unloaded.
-            auto* source = write->source;
-            std::erase(source->m_writes, write);
+            std::erase(write->source->m_writes, write);
             wl_event_source_remove(write->event);
             delete write;
-            if (g_paste && g_paste->source.get() == source)
-                restorePaste();
             return 0;
         }
 
@@ -1568,7 +1575,10 @@ namespace {
         std::vector<SWrite*> m_writes;
     };
 
-    // How long a window may take to read a pasted text before its clipboard is given back anyway.
+    // How long a window keeps the pasted text as its clipboard. A client may read the text as soon as it is offered,
+    // as Chrome does to cache it, and paste that copy when the chord arrives; another reads it at the chord. Nothing
+    // tells when a client is done with it, and taking it back after the first read left Chrome with an empty
+    // clipboard by the time its chord arrived, so the offer lasts this long.
     constexpr auto PASTE_WAIT = std::chrono::seconds(10);
 
     // The window's client sees the clipboard it would have without the paste: the user's, if it has keyboard focus,
@@ -1588,7 +1598,7 @@ namespace {
         ((*PROTO::data).*member(SSendSelection{}))(DEVICE, FOCUSED ? g_pSeatManager->m_selection.currentSelection.lock() : nullptr);
     }
 
-    // Offers `text` as the clipboard of `window`'s client alone, until it has read it or PASTE_WAIT passes.
+    // Offers `text` as the clipboard of `window`'s client alone, until PASTE_WAIT passes or the next paste.
     std::optional<std::string> offerPaste(const PHLWINDOW& window, std::string text) {
         if (!window || !window->mapped())
             return "the window closed before its text was offered";
@@ -1652,6 +1662,7 @@ namespace {
     }
 
     void finishKeys() {
+        endLinger(*g_keyOp);
         auto op = std::move(*g_keyOp);
         g_keyOp.reset();
         dropTimer(op.timer);
@@ -1684,6 +1695,13 @@ namespace {
         return op.gap;
     }
 
+    // A window still entered between strokes is left, so its app sees itself unfocused again.
+    void endLinger(SKeyOp& op) {
+        if (!std::exchange(op.lingering, false))
+            return;
+        eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
+    }
+
     // Keys this stroke holds are released and its keyboards left, or given back the user's modifiers if the window
     // had keyboard focus all along; a sibling surface of the same client is entered again, and the X focus goes back
     // to the X window Hyprland has focused.
@@ -1691,6 +1709,11 @@ namespace {
         releaseAll(op);
         if (!op.entered) {
             sendRealMods(op);
+            return endStroke(op);
+        }
+        if (!op.holding && op.error.empty() && op.next < op.events.size()) {
+            sendMods(op);
+            op.lingering = true;
             return endStroke(op);
         }
         eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
@@ -1766,6 +1789,15 @@ namespace {
                 // focus, and with it the user's client, is never touched. Only a surface of the same client that has
                 // keyboard focus is left and entered again, since one wl_keyboard has one focused surface.
                 const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+                if (op.lingering) {
+                    if (op.surface.lock() == SURFACE && !(FOCUS && FOCUS->client() == SURFACE->client())) {
+                        op.inStroke = true;
+                        sendMods(op);
+                        op.phase = SKeyOp::KEY;
+                        return std::nullopt;
+                    }
+                    endLinger(op);
+                }
                 op.surface       = SURFACE;
                 op.keyboards     = keyboardsOf(SURFACE->client());
                 op.entered       = FOCUS != SURFACE;
