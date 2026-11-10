@@ -185,13 +185,14 @@ def drag(
 
 
 @_tool()
-def elements(window: str, show: bool = False, hidden: bool = False) -> dict:
+def elements(window: str, show: bool = False, hidden: bool = False, peek: bool = False) -> dict:
     """The window's accessibility tree: each element's id, role, name, states, text and bounds in window pixels,
     and on the root the snapshot id. click, hover, move and scroll take an id as `element` and act on where the app
     says it is now. Each snapshot numbers its elements afresh: `<snapshot>:<id>` is refused (stale) once a newer
     snapshot replaces that one, and an element whose role or name changed since is stale too. An app that exposes no
-    tree is an error (no_tree)."""
-    return desk.elements(window, show, hidden).to_dict()
+    tree is an error (no_tree). peek reads the tree without replacing the latest snapshot, so its ids stay good, to
+    check what changed before acting; a peek's own ids name nothing and it has no snapshot id."""
+    return desk.elements(window, show, hidden, peek).to_dict()
 
 
 @_tool()

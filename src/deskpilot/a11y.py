@@ -409,8 +409,11 @@ def _write_records(window: Window, snapshot_id: str, records: dict[str, dict[str
         raise A11yError(f"Could not persist accessibility elements for {window.address}: {exc}") from exc
 
 
-def snapshot(window: Window, max_depth: int = 30, max_nodes: int = 2000, bus: _Bus | None = None) -> Element:
-    """Read and persist the accessibility tree for a Hyprland window."""
+def snapshot(
+    window: Window, max_depth: int = 30, max_nodes: int = 2000, bus: _Bus | None = None, peek: bool = False
+) -> Element:
+    """Read and persist the accessibility tree for a Hyprland window. A peek reads it without replacing the latest
+    snapshot, so ids taken from that snapshot stay good; its own ids name nothing and it has no snapshot id."""
     with _bus_context(bus) as connection:
         app_bus, app_path = _app_for_pid(connection, window.pid)
         root_bus, root_path = _choose_toplevel(connection, app_bus, app_path, window)
@@ -448,6 +451,8 @@ def snapshot(window: Window, max_depth: int = 30, max_nodes: int = 2000, bus: _B
 
         root = walk(root_bus, root_path, 0)
         # Ids are numbered afresh by each snapshot, so an id is checked against the snapshot it came from.
+        if peek:
+            return replace(root, truncated=truncated)
         snapshot_id = f"{window.address.removeprefix('0x')}-{time.time_ns()}"
         _write_records(window, snapshot_id, records)
         return replace(root, truncated=truncated, snapshot=snapshot_id)

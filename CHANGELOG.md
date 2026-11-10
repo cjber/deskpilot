@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Read a tree without replacing the snapshot.** `elements --peek` (MCP `peek`) reads the accessibility tree and
+  leaves the latest snapshot in place, so the ids taken from it stay good while a program checks what changed.
+
 ## [0.4.0] - 2026-11-10
 
 - **Typing no longer flickers a window's title bar.** Keys went to a window with a keyboard enter and leave around

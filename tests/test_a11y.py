@@ -132,6 +132,16 @@ def test_an_id_from_a_replaced_snapshot_is_stale_and_its_own_snapshot_is_accepte
     assert error.value.code == "stale"
 
 
+def test_a_peek_leaves_the_latest_snapshot_and_its_ids_in_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake = FakeBus()
+    taken = a11y.snapshot(window(), bus=fake).snapshot
+    peeked = a11y.snapshot(window(), bus=fake, peek=True)
+
+    assert peeked.snapshot == "" and "snapshot" not in peeked.to_dict()
+    assert a11y.locate(window(), f"{taken}:e2", bus=fake) == (10, 20, 80, 20)
+
+
 def test_an_element_whose_name_changed_is_stale_and_one_not_showing_is_offscreen(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     fake = FakeBus()

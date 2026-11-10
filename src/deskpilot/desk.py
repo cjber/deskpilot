@@ -321,9 +321,10 @@ class Desk:
         finally:
             self.plugin.end(reply["ticket"])
 
-    def elements(self, query: str, show: bool = False, hidden: bool = False) -> a11y.Element:
-        """The window's accessibility tree, whose element ids click, hover, move and scroll take."""
-        return a11y.snapshot(self._on_screen(self.window(query), show, hidden))
+    def elements(self, query: str, show: bool = False, hidden: bool = False, peek: bool = False) -> a11y.Element:
+        """The window's accessibility tree, whose element ids click, hover, move and scroll take. A peek leaves the
+        latest snapshot, and the ids taken from it, in place."""
+        return a11y.snapshot(self._on_screen(self.window(query), show, hidden), peek=peek)
 
     def key(self, combo: str, query: str | None = None, take_focus: bool = False, hold: float = 0.0) -> None:
         """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
