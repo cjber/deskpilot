@@ -1,30 +1,13 @@
-"""Key names, chords and US-layout text to Linux input key codes (linux/input-event-codes.h)."""
+"""Key names, chords and text as the deskpilot plugin's key events.
+
+A named key is a Linux input key code (linux/input-event-codes.h). A character is sent as its code point, and the
+plugin finds the key that types it on the user's own keymap, so text arrives as written on any layout and with Caps
+Lock on. A character no key on that keymap types is refused by the plugin, never skipped.
+"""
 
 from __future__ import annotations
 
-SHIFT = 42
-CTRL = 29
-ALT = 56
-SUPER = 125
-
-# Unshifted and shifted characters of a US keyboard, by key code.
-_ROWS = {
-    2: ("1", "!"), 3: ("2", "@"), 4: ("3", "#"), 5: ("4", "$"), 6: ("5", "%"), 7: ("6", "^"), 8: ("7", "&"),
-    9: ("8", "*"), 10: ("9", "("), 11: ("0", ")"), 12: ("-", "_"), 13: ("=", "+"), 26: ("[", "{"), 27: ("]", "}"),
-    39: (";", ":"), 40: ("'", '"'), 41: ("`", "~"), 43: ("\\", "|"), 51: (",", "<"), 52: (".", ">"), 53: ("/", "?"),
-    57: (" ", " "), 28: ("\n", "\n"), 15: ("\t", "\t"),
-}  # fmt: skip
-_LETTERS = dict(zip("qwertyuiop", range(16, 26), strict=True))
-_LETTERS |= dict(zip("asdfghjkl", range(30, 39), strict=True))
-_LETTERS |= dict(zip("zxcvbnm", range(44, 51), strict=True))
-
-CHARS: dict[str, tuple[int, bool]] = {}
-for _code, (_plain, _shifted) in _ROWS.items():
-    CHARS.setdefault(_plain, (_code, False))
-    CHARS.setdefault(_shifted, (_code, _shifted != _plain))
-for _ch, _code in _LETTERS.items():
-    CHARS[_ch] = (_code, False)
-    CHARS[_ch.upper()] = (_code, True)
+CTRL, SHIFT, ALT, SUPER = 29, 42, 56, 125
 
 NAMED = {
     "esc": 1, "escape": 1, "backspace": 14, "tab": 15, "return": 28, "enter": 28, "space": 57,
@@ -36,41 +19,28 @@ NAMED = {
 }  # fmt: skip
 
 
-def all_codes() -> set[int]:
-    return {code for code, _ in CHARS.values()} | set(NAMED.values())
+def press_release(part: str) -> tuple[str, str]:
+    """A chord part's press and release: `+code` and `-code` for a named key, or `p` and `r` with the character for
+    the key that gives it unmodified (ctrl+A is ctrl+a, as on a keyboard)."""
+    if part.lower() in NAMED:
+        code = NAMED[part.lower()]
+        return f"+{code}", f"-{code}"
+    if len(part) == 1:
+        char = f"{ord(part.lower()):x}"
+        return f"p{char}", f"r{char}"
+    raise ValueError(f"unknown key '{part}'; use a character or one of: {', '.join(sorted(NAMED))}")
 
 
-def key_code(name: str) -> int:
-    lowered = name.lower()
-    if lowered in NAMED:
-        return NAMED[lowered]
-    if len(name) == 1 and name.lower() in CHARS:
-        return CHARS[name.lower()][0]
-    raise ValueError(f"unknown key '{name}'; use a character or one of: {', '.join(sorted(NAMED))}")
+def chord_words(combo: str) -> list[str]:
+    """'ctrl+shift+t' -> ctrl, shift and t down, then up in reverse. A lone character, '+' included, is typed as
+    written, so `key A` types a capital A."""
+    parts = [part for part in combo.split("+") if part] if combo != "+" else ["+"]
+    if len(parts) == 1 and len(parts[0]) == 1:
+        return text_words(parts[0])
+    keys = [press_release(part) for part in parts]
+    return [press for press, _ in keys] + [release for _, release in reversed(keys)]
 
 
-def parse_chord(combo: str) -> list[int]:
-    """'ctrl+shift+t' -> [CTRL, SHIFT, T]. A lone '+' is the plus key."""
-    if combo == "+":
-        return [SHIFT, CHARS["+"][0]]
-    return [key_code(part) for part in combo.split("+") if part]
-
-
-def chord_events(combo: str) -> list[tuple[int, bool]]:
-    """'ctrl+a' -> ctrl down, a down, a up, ctrl up, as (key code, pressed)."""
-    codes = parse_chord(combo)
-    return [(code, True) for code in codes] + [(code, False) for code in reversed(codes)]
-
-
-def stroke_events(code: int, shift: bool) -> list[tuple[int, bool]]:
-    """One typed character as (key code, pressed), wrapped in shift when it needs it."""
-    events = [(code, True), (code, False)]
-    return [(SHIFT, True), *events, (SHIFT, False)] if shift else events
-
-
-def text_strokes(text: str) -> list[tuple[int, bool]]:
-    """Each character as (key code, needs shift). Characters a US keyboard cannot type are an error, not skipped."""
-    missing = sorted({ch for ch in text if ch not in CHARS})
-    if missing:
-        raise ValueError(f"cannot type {missing!r} on a US layout")
-    return [CHARS[ch] for ch in text]
+def text_words(text: str) -> list[str]:
+    """Each character typed as one keystroke."""
+    return [f"t{ord(ch):x}" for ch in text]

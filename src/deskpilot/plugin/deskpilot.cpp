@@ -19,8 +19,12 @@
 //      back to the surface that had it if anything moved it, the cursor's visibility is restored and the held input
 //      is replayed.
 //
-// `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <+code|-code>...` presses and releases evdev key codes
-// in <window> without focusing it. The events run as strokes: a stroke ends when a release leaves no key down. Each
+// `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
+// without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
+// key that gives character U+HEX unmodified (a chord's ctrl+a), or `tHEX` to type U+HEX. Characters are resolved on the
+// active keyboard's keymap, the one every client has, when the action starts: a typed character's key is pressed with
+// the modifiers it needs set directly, over the user's locks (Caps Lock) and layout, so text arrives as written on any
+// layout. The events run as strokes: a stroke ends when a release leaves no key down. Each
 // stroke goes straight to the window client's own wl_keyboard resources: enter with no keys pressed, modifiers, the
 // keys and leave. The seat's keyboard focus never moves, so the user's focused client sees no leave, enter or
 // modifiers, and Hyprland's window focus never changes. Each press is held <hold-ms> before the next event, and
@@ -39,7 +43,7 @@
 //     error.
 //
 // A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
-// <+code|-code>...`, and the `keys` request naming <txn> queues all of it as one action.
+// <event>...`, and the `keys` request naming <txn> queues all of it as one action.
 //
 // Actions run one at a time in the order they arrive; up to MAX_QUEUED wait behind the running one and any more are
 // refused. Each request is answered when its own action has finished, or after REPLY_WAIT with
@@ -80,6 +84,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
@@ -112,7 +117,24 @@ namespace {
     using ModFn      = void (*)(CInputManager*, SP<IKeyboard>);
     using FocusFn    = void (*)(CSeatManager*, SP<CWLSurfaceResource>);
     using ms         = std::chrono::milliseconds;
-    using KeyEvents  = std::vector<std::pair<uint32_t, bool>>;
+
+    // The modifiers a typed character's key needs: held ones, and the locks it needs (the user's, or none when a lock
+    // such as Caps Lock would change the character).
+    struct SMods {
+        xkb_mod_mask_t depressed = 0;
+        xkb_mod_mask_t locked    = 0;
+    };
+
+    // One key event. A character is named by its code point until its action starts, when it is resolved to the key
+    // that produces it on the active keymap. A typed character carries the modifiers it needs: they are set for its
+    // press and the user's restored after its release, with no modifier key pressed.
+    struct SKeyEvent {
+        enum eKind { CODE, KEY_OF, TYPED } kind = CODE;
+        uint32_t             code  = 0; // an evdev key code, or the code point until resolved
+        bool                 press = false;
+        std::optional<SMods> mods;
+    };
+    using KeyEvents = std::vector<SKeyEvent>;
 
     // How long an XWayland key step may take to show in the X server before the sequence gives up.
     constexpr auto X_WAIT = ms(500);
@@ -186,6 +208,7 @@ namespace {
         uint32_t                           restoreXid = 0; // the X window the X focus goes back to, or 0 for none
         std::vector<uint32_t>              down; // keys this sequence holds down in the window
         xkb_state*                         xkb = nullptr;
+        xkb_mod_mask_t                     locked = 0; // the user's locks, which a typed character's modifiers return to
         std::chrono::steady_clock::time_point deadline;
         std::vector<std::function<void()>> heldInput;
         SP<CEventLoopTimer>                timer;
@@ -696,6 +719,12 @@ namespace {
         eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendMods(MODS.depressed, MODS.latched, MODS.locked, MODS.group); });
     }
 
+    // The modifiers a typed character needs, in the user's layout, as if their keys were held.
+    void setMods(SKeyOp& op, SMods mods) {
+        xkb_state_update_mask(op.xkb, mods.depressed, 0, mods.locked, 0, 0, xkb_state_serialize_layout(op.xkb, XKB_STATE_LAYOUT_LOCKED));
+        sendMods(op);
+    }
+
     // One key to the window's keyboards, then the modifiers it leads to (wl_keyboard: modifiers follow the key that
     // changed them).
     void sendKey(SKeyOp& op, uint32_t code, bool press) {
@@ -781,7 +810,7 @@ namespace {
 
     // After a key: a press is held before the next event; a release that leaves no key down ends the stroke.
     std::optional<ms> afterKey(SKeyOp& op) {
-        const bool PRESS = op.events[op.next].second;
+        const bool PRESS = op.events[op.next].press;
         op.next++;
         const bool LAST = op.next >= op.events.size();
         if (PRESS) {
@@ -882,8 +911,12 @@ namespace {
                     op.error = "another X window took the X input focus mid-sequence";
                     return restoreStroke(op);
                 }
-                const auto [CODE, PRESS] = op.events[op.next];
-                sendKey(op, CODE, PRESS);
+                const auto EVENT = op.events[op.next];
+                if (EVENT.mods && EVENT.press)
+                    setMods(op, *EVENT.mods);
+                sendKey(op, EVENT.code, EVENT.press);
+                if (EVENT.mods && !EVENT.press)
+                    setMods(op, {.locked = op.locked});
                 if (!(op.x11 && op.entered))
                     return afterKey(op);
                 op.phase    = SKeyOp::AWAIT_KEY;
@@ -891,10 +924,10 @@ namespace {
                 return X_POLL;
             }
             case SKeyOp::AWAIT_KEY:
-                if (xKeyDown(op.events[op.next].first) == op.events[op.next].second)
+                if (xKeyDown(op.events[op.next].code) == op.events[op.next].press)
                     return afterKey(op);
                 if (EXPIRED) {
-                    op.error = std::format("key {} did not reach the X server", op.events[op.next].first);
+                    op.error = std::format("key {} did not reach the X server", op.events[op.next].code);
                     return restoreStroke(op);
                 }
                 return X_POLL;
@@ -927,6 +960,86 @@ namespace {
         }
     }
 
+    xkb_keysym_t keysymOf(uint32_t codePoint) {
+        if (codePoint == '\n')
+            return XKB_KEY_Return;
+        if (codePoint == '\t')
+            return XKB_KEY_Tab;
+        return xkb_utf32_to_keysym(codePoint);
+    }
+
+    // The key that gives `keysym` on `keymap` under locks `locked` and the user's layout, with the fewest modifiers, as
+    // its evdev code and those modifiers. With `bare`, only a key that gives it with no modifiers: the key a chord such
+    // as ctrl+a names. Lock modifiers are never chosen, since holding one is not how a key is typed.
+    std::optional<std::pair<uint32_t, xkb_mod_mask_t>> keyUnder(xkb_keymap* keymap, xkb_keysym_t keysym, xkb_mod_mask_t locked, xkb_layout_index_t group, bool bare) {
+        auto* state = xkb_state_new(keymap);
+        if (!state)
+            return std::nullopt;
+        xkb_mod_mask_t lockMods = 0;
+        for (const char* name : {XKB_MOD_NAME_CAPS, XKB_MOD_NAME_NUM}) {
+            if (const auto INDEX = xkb_keymap_mod_get_index(keymap, name); INDEX != XKB_MOD_INVALID)
+                lockMods |= 1u << INDEX;
+        }
+        std::optional<std::pair<uint32_t, xkb_mod_mask_t>> best;
+        // X keycodes stop at 255, and the first eight are not keys.
+        const auto LAST = std::min<xkb_keycode_t>(xkb_keymap_max_keycode(keymap), 255);
+        for (xkb_keycode_t keycode = std::max<xkb_keycode_t>(xkb_keymap_min_keycode(keymap), 9); keycode <= LAST; ++keycode) {
+            xkb_state_update_mask(state, 0, 0, locked, 0, 0, group);
+            const auto LAYOUT = xkb_state_key_get_layout(state, keycode);
+            if (LAYOUT == XKB_LAYOUT_INVALID)
+                continue;
+            for (xkb_level_index_t level = 0; level < xkb_keymap_num_levels_for_key(keymap, keycode, LAYOUT); ++level) {
+                xkb_mod_mask_t masks[16];
+                const auto     COUNT = xkb_keymap_key_get_mods_for_level(keymap, keycode, LAYOUT, level, masks, 16);
+                for (size_t i = 0; i < COUNT; ++i) {
+                    if ((masks[i] & lockMods) || (bare && masks[i]) || (best && std::popcount(masks[i]) >= std::popcount(best->second)))
+                        continue;
+                    xkb_state_update_mask(state, masks[i], 0, locked, 0, 0, group);
+                    if (xkb_state_key_get_one_sym(state, keycode) == keysym)
+                        best = {{keycode - 8, masks[i]}};
+                }
+            }
+        }
+        xkb_state_unref(state);
+        return best;
+    }
+
+    // The key and modifiers that type `keysym`: under the user's locks if any key gives it there, else with the locks
+    // off for its keystroke, as Caps Lock makes French é a capital and its shifted level a digit. A chord's key (`bare`)
+    // is the one that gives it with no modifiers or locks.
+    std::optional<std::pair<uint32_t, SMods>> keyFor(xkb_keymap* keymap, xkb_keysym_t keysym, xkb_mod_mask_t locked, xkb_layout_index_t group, bool bare) {
+        if (keysym == XKB_KEY_NoSymbol)
+            return std::nullopt;
+        for (const xkb_mod_mask_t LOCKED : {bare ? 0 : locked, 0u}) {
+            if (const auto KEY = keyUnder(keymap, keysym, LOCKED, group, bare))
+                return std::pair{KEY->first, SMods{.depressed = KEY->second, .locked = LOCKED}};
+        }
+        return std::nullopt;
+    }
+
+    // Characters become the keys that type them on the keymap clients have now, the active keyboard's, so the text
+    // arrives as written whatever the user's layout and Caps Lock. A character no key gives is refused, not skipped.
+    std::optional<std::string> resolveKeys(KeyEvents& events, const SP<IKeyboard>& keyboard) {
+        std::map<std::pair<uint32_t, bool>, std::pair<uint32_t, SMods>> found;
+        for (auto& event : events) {
+            if (event.kind == SKeyEvent::CODE)
+                continue;
+            const bool BARE = event.kind == SKeyEvent::KEY_OF;
+            auto       it   = found.find({event.code, BARE});
+            if (it == found.end()) {
+                const auto KEY = keyFor(keyboard->m_xkbKeymap, keysymOf(event.code), keyboard->m_modifiersState.locked, keyboard->m_modifiersState.group, BARE);
+                if (!KEY)
+                    return std::format("no key on the active keymap gives U+{:04X}{}", event.code, BARE ? " without modifiers" : "");
+                it = found.emplace(std::pair{event.code, BARE}, *KEY).first;
+            }
+            event.code = it->second.first;
+            event.kind = SKeyEvent::CODE;
+            if (!BARE)
+                event.mods = it->second.second;
+        }
+        return std::nullopt;
+    }
+
     std::optional<std::string> startKeys(SKeyOp op, uint64_t ticket) {
         const auto WINDOW = op.window.lock();
         if (!WINDOW || !WINDOW->mapped())
@@ -934,29 +1047,62 @@ namespace {
         const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
         if (!KEYBOARD || !KEYBOARD->m_xkbKeymap)
             return "no keyboard";
+        if (const auto ERROR = resolveKeys(op.events, KEYBOARD))
+            return ERROR;
         op.ticket = ticket;
         op.x11    = WINDOW->backend().isX11();
         op.xkb    = scratchState(KEYBOARD);
+        op.locked = KEYBOARD->m_modifiersState.locked;
         g_keyOp.emplace(std::move(op));
         g_keyOp->timer = makeShared<CEventLoopTimer>(ms(1), keyTick, nullptr);
         g_pEventLoopManager->addTimer(g_keyOp->timer);
         return std::nullopt;
     }
 
-    // `+code` or `-code` words from `first` on, appended to `events`.
+    std::optional<uint32_t> codePoint(std::string_view hex) {
+        uint32_t value = 0;
+        const auto [END, ERROR] = std::from_chars(hex.data(), hex.data() + hex.size(), value, 16);
+        if (hex.empty() || ERROR != std::errc{} || END != hex.data() + hex.size() || value == 0 || value > 0x10FFFF)
+            return std::nullopt;
+        return value;
+    }
+
+    // Key event words from `first` on, appended to `events`: `+code` and `-code` press and release an evdev key code,
+    // `pHEX` and `rHEX` the key that gives character U+HEX with no modifiers, and `tHEX` types U+HEX as one keystroke. A
+    // word that starts with `-` and is not a number would be a hyprctl flag, so characters take letters.
     std::optional<std::string> parseKeys(const std::vector<std::string>& args, size_t first, KeyEvents& events) {
         for (size_t i = first; i < args.size(); ++i) {
-            const auto CODE = args[i].size() > 1 ? number(args[i].substr(1)) : std::nullopt;
-            if ((args[i][0] != '+' && args[i][0] != '-') || !CODE || *CODE < 1 || *CODE > 247)
-                return "bad key event '" + args[i] + "'";
-            events.emplace_back(static_cast<uint32_t>(*CODE), args[i][0] == '+');
+            const std::string_view WORD = args[i];
+            const auto             BAD  = "bad key event '" + args[i] + "'";
+            if (WORD[0] == 't') {
+                const auto CHAR = codePoint(WORD.substr(1));
+                if (!CHAR)
+                    return BAD;
+                events.push_back({.kind = SKeyEvent::TYPED, .code = *CHAR, .press = true});
+                events.push_back({.kind = SKeyEvent::TYPED, .code = *CHAR, .press = false});
+                continue;
+            }
+            if (WORD[0] == 'p' || WORD[0] == 'r') {
+                const auto CHAR = codePoint(WORD.substr(1));
+                if (!CHAR)
+                    return BAD;
+                events.push_back({.kind = SKeyEvent::KEY_OF, .code = *CHAR, .press = WORD[0] == 'p'});
+                continue;
+            }
+            if (WORD[0] != '+' && WORD[0] != '-')
+                return BAD;
+            const bool PRESS = WORD[0] == '+';
+            const auto CODE = number(std::string(WORD.substr(1)));
+            if (!CODE || *CODE < 1 || *CODE > 247)
+                return BAD;
+            events.push_back({.code = static_cast<uint32_t>(*CODE), .press = PRESS});
         }
         return std::nullopt;
     }
 
     IPC::Socket1::SResponse stageCommand(const std::vector<std::string>& args) {
         if (args.size() < 4)
-            return refuse("usage: deskpilot stage <txn> <+code|-code>...");
+            return refuse("usage: deskpilot stage <txn> <key event>...");
         auto it = g_staged.find(args[2]);
         if (it == g_staged.end()) {
             if (g_staged.size() >= MAX_STAGED)
@@ -972,7 +1118,7 @@ namespace {
 
     IPC::Socket1::SResponse keysCommand(const std::vector<std::string>& args) {
         if (args.size() < 6)
-            return refuse("usage: deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <+code|-code>...");
+            return refuse("usage: deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <key event>...");
         const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
         const auto HOLD = number(args[3]), GAP = number(args[4]);
         // The user's keys wait out each hold, so neither may be longer than a key would be held by hand.
@@ -1046,7 +1192,7 @@ namespace {
         if ((VERB == "click" && args.size() == 7) || (VERB == "scroll" && args.size() == 6))
             return pointerCommand(args, req.command);
         return refuse("usage: deskpilot click <window> <x> <y> <button> <count> | scroll <window> <x> <y> <dy> | keys <window> <hold-ms> <gap-ms> <txn|none> "
-                      "<+code|-code>... | stage <txn> <+code|-code>... | wait <ticket> | status");
+                      "<key event>... | stage <txn> <key event>... | wait <ticket> | status; a key event is +code, -code, pHEX, rHEX or tHEX");
     }
 }
 

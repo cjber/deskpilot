@@ -161,12 +161,17 @@ def test_old_shots_are_pruned(tmp_path, monkeypatch):
     assert len(list(screen.shots_dir().glob("*.png"))) == screen.KEEP
 
 
-def test_chords_and_text():
-    assert keys.parse_chord("ctrl+shift+t") == [keys.CTRL, keys.SHIFT, 20]
-    assert keys.parse_chord("Return") == [28]
-    assert keys.text_strokes("/Ab?") == [(53, False), (30, True), (48, False), (53, True)]
-    with pytest.raises(ValueError, match="£"):
-        keys.text_strokes("£5")
+def test_chords_name_keys_and_text_names_characters():
+    """Characters go to the plugin as code points, resolved there on the user's keymap, so any layout types them."""
+    assert keys.chord_words("ctrl+shift+T") == ["+29", "+42", "p74", "r74", "-42", "-29"]
+    assert keys.chord_words("Return") == ["+28", "-28"]
+    assert keys.chord_words("A") == ["t41"] and keys.chord_words("+") == ["t2b"]
+    assert keys.text_words("é\n") == ["te9", "ta"]
+    # hyprctl takes any word that starts with '-' and is not a number as one of its own flags.
+    words = keys.chord_words("ctrl+alt+shift+super+a+F4") + keys.text_words("-x")
+    assert all(not w.startswith("-") or w[1:].isdigit() for w in words)
+    with pytest.raises(ValueError, match="unknown key 'hyper'"):
+        keys.chord_words("ctrl+hyper")
 
 
 def test_hyprland_parses_clients_and_uses_lua_dispatch():
@@ -270,37 +275,40 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
     desk, fake, inp, plugin, _ = make_desk(tmp_path, monkeypatch)
     desk.key("ctrl+a", "battle")
     desk.type("Hi", "battle", delay=0.05)
-    a, h, i = keys.key_code("a"), keys.key_code("h"), keys.key_code("i")
     assert plugin.calls == [
-        ("keys", "0xabc", [(keys.CTRL, True), (a, True), (a, False), (keys.CTRL, False)], {}),
+        ("keys", "0xabc", ["+29", "p61", "r61", "-29"], {}),
         # The whole text is one action, timed inside the plugin, so no other caller's keys land between characters.
-        (
-            "keys",
-            "0xabc",
-            [(keys.SHIFT, True), (h, True), (h, False), (keys.SHIFT, False), (i, True), (i, False)],
-            {"hold": 0.05, "gap": 0.05},
-        ),
+        ("keys", "0xabc", ["t48", "t69"], {"hold": 0.05, "gap": 0.05}),
     ]
     assert not any(c[0] == "dispatch" and "focus" in c[1] for c in fake.calls)
     assert inp.events == []
 
 
+def test_keys_without_a_window_go_to_the_focused_one_and_take_focus_focuses_first(tmp_path, monkeypatch):
+    desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk.key("Return")
+    assert plugin.calls[-1] == ("keys", "0xabc", ["+28", "-28"], {})
+    desk.type("x", "battle", take_focus=True)
+    assert ["dispatch", 'hl.dsp.focus({window="address:0xabc"})'] in fake.calls
+    assert plugin.calls[-1][:3] == ("keys", "0xabc", ["t78"])
+
+
 def test_plugin_formats_key_events():
     calls = []
-    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", [(29, True), (30, True)], hold=0.03, gap=0.1)
-    assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "+30"]]
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", ["+29", "t61"], hold=0.03, gap=0.1)
+    assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "t61"]]
 
 
 def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
     calls = []
-    events = [(30, down) for _ in range(5000) for down in (True, False)]
+    events = [word for _ in range(5000) for word in ("+30", "-30")]
     Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", events)
     *stages, last = calls
     assert stages and all(c[:2] == ["deskpilot", "stage"] for c in stages)
     txn = stages[0][2]
     assert all(c[2] == txn for c in stages) and last[:6] == ["deskpilot", "keys", "0xabc", "0", "0", txn]
     sent = [w for c in stages for w in c[3:]] + last[6:]
-    assert sent == [f"{'+' if down else '-'}{code}" for code, down in events]
+    assert sent == events
     assert all(request_size(c[1:]) <= REQUEST_BYTES for c in calls)
     # The fewest requests: every one but the first staged is full, and the keys request takes all that fit after it.
     assert len(calls) == -(-request_size(["keys", "0xabc", "0", "0", txn, *sent]) // REQUEST_BYTES)
@@ -323,9 +331,9 @@ def test_a_refusal_from_a_stale_plugin_names_the_build_and_the_fix():
         return '{"ok":false,"error":"hold and gap must be 0 to 10000 milliseconds"}'
 
     with pytest.raises(PluginError, match=r"build 000000000000, not this CLI's .*deskpilot plugin load.*hold and gap"):
-        Plugin(lambda args: run(args, "000000000000")).keys("0xabc", [(28, True), (28, False)])
+        Plugin(lambda args: run(args, "000000000000")).keys("0xabc", ["+28", "-28"])
     with pytest.raises(PluginError, match=r"^hold and gap must be"):
-        Plugin(lambda args: run(args, source_hash())).keys("0xabc", [(28, True), (28, False)])
+        Plugin(lambda args: run(args, source_hash())).keys("0xabc", ["+28", "-28"])
 
 
 def test_plugin_sends_button_codes_and_reads_replies():

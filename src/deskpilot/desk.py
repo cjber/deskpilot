@@ -1,8 +1,8 @@
 """The actions an agent takes, shared by the CLI and the MCP server.
 
-Clicks, scrolls and keys for a named window go through the deskpilot Hyprland plugin, which leaves the user's
-pointer and keyboard focus where they were; the agent cursor overlay shows where clicks land. `take_pointer` and
-`take_focus` instead move the user's own pointer or focus and press through the uinput device.
+Clicks, scrolls and keys go through the deskpilot Hyprland plugin, which leaves the user's pointer and keyboard focus
+where they were; the agent cursor overlay shows where clicks land. `take_pointer` instead moves the user's own pointer
+and clicks through the uinput device, and `take_focus` focuses the window before its keys.
 """
 
 from __future__ import annotations
@@ -184,25 +184,23 @@ class Desk:
         return gx, gy
 
     def key(self, combo: str, query: str | None = None, take_focus: bool = False) -> None:
-        """Press a chord in a window without focusing it, or with take_focus focus it and press through uinput.
-        With no window the keys go to whatever has focus."""
-        if query and not take_focus:
-            self.plugin.keys(self.window(query).address, keys.chord_events(combo))
-            return
-        if query:
-            self.focus(query)
-            time.sleep(0.1)
-        self.input.chord(combo)
+        """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
+        keys go to the focused window."""
+        self.plugin.keys(self._key_target(query, take_focus).address, keys.chord_words(combo))
 
     def type(self, text: str, query: str | None = None, delay: float = 0.03, take_focus: bool = False) -> None:
-        if query and not take_focus:
-            events = [event for code, shift in keys.text_strokes(text) for event in keys.stroke_events(code, shift)]
-            self.plugin.keys(self.window(query).address, events, hold=delay, gap=delay)
-            return
-        if query:
-            self.focus(query)
-            time.sleep(0.1)
-        self.input.type_text(text, delay)
+        """Type text as written, on the user's own keymap. Each key is held `delay` seconds, and the next follows
+        `delay` seconds later."""
+        target = self._key_target(query, take_focus)
+        self.plugin.keys(target.address, keys.text_words(text), hold=delay, gap=delay)
+
+    def _key_target(self, query: str | None, take_focus: bool) -> Window:
+        if query is None:
+            focused = next((w for w in self.hypr.windows() if w.focused), None)
+            if focused is None:
+                raise WindowNotFound("no window has keyboard focus; name one with a window query")
+            return focused
+        return self.focus(query) if take_focus else self.window(query)
 
     def wait_for(self, query: str, timeout: float = 60, gone: bool = False) -> Window | None:
         """Wait until a window matching `query` exists (or, with gone, no longer does)."""

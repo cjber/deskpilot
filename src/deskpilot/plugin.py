@@ -138,11 +138,10 @@ class Plugin:
     def scroll(self, address: str, gx: int, gy: int, dy: int) -> dict:
         return self._call("scroll", address, str(gx), str(gy), str(dy))
 
-    def keys(self, address: str, events: list[tuple[int, bool]], hold: float = 0.0, gap: float = 0.0) -> dict:
-        """Press and release key codes in a window without focusing it, as one action. Each press is held `hold`
+    def keys(self, address: str, words: list[str], hold: float = 0.0, gap: float = 0.0) -> dict:
+        """Send key events (see keys.py) to a window without focusing it, as one action. Each press is held `hold`
         seconds, and keystrokes (runs of events that end with no key down) are `gap` seconds apart. A sequence too long
         for one request is staged ahead in parts and queued whole by the last, so no other keys land in between."""
-        words = [f"{'+' if down else '-'}{code}" for code, down in events]
         head = ["keys", address, str(round(hold * 1000)), str(round(gap * 1000))]
         if request_size([*head, "none", *words]) <= REQUEST_BYTES:
             return self._call(*head, "none", *words)

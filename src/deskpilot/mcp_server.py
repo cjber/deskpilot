@@ -99,8 +99,8 @@ def key(combo: str, window: str | None = None, take_focus: bool = False) -> str:
 
 @_tool()
 def type_text(text: str, window: str | None = None, delay: float = 0.03, take_focus: bool = False) -> str:
-    """Type text on a US layout into a window without focusing it. Each key is held `delay` seconds and the next
-    follows after the same gap; use 0.1 or more for games."""
+    """Type text as written, on the user's keymap, into a window without focusing it. Each key is held `delay`
+    seconds and the next follows after the same gap; use 0.1 or more for games."""
     desk.type(text, window, delay, take_focus)
     return "ok"
 
