@@ -24,6 +24,7 @@ A11Y_ROOT_PATH = "/org/a11y/atspi/accessible/root"
 ACCESSIBLE_INTERFACE = "org.a11y.atspi.Accessible"
 COMPONENT_INTERFACE = "org.a11y.atspi.Component"
 TEXT_INTERFACE = "org.a11y.atspi.Text"
+SELECTION_INTERFACE = "org.a11y.atspi.Selection"
 PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 DBUS_INTERFACE = "org.freedesktop.DBus"
 DBUS_PATH = "/org/freedesktop/DBus"
@@ -271,6 +272,29 @@ def _children(bus: _Bus, destination: str, object_path: str) -> list[tuple[str, 
         raise A11yError(f"Accessibility object {object_path} returned invalid child references: {exc}") from exc
 
 
+def _selected(bus: _Bus, destination: str, object_path: str, interfaces: tuple[str, ...]) -> set[tuple[str, str]]:
+    """The objects a container says are chosen, through its Selection interface. A GTK combo box reports its active
+    item only here: the item itself carries no selected state, and its name may be the combo box's label."""
+    if SELECTION_INTERFACE not in interfaces:
+        return set()
+    count = _property(bus, destination, object_path, SELECTION_INTERFACE, "NSelectedChildren")
+    try:
+        count = int(cast(Any, count))
+    except (TypeError, ValueError) as exc:
+        raise A11yError(f"Accessibility object {object_path} returned an invalid selection count: {count!r}") from exc
+    chosen = set()
+    for index in range(max(count, 0)):
+        reply = _reply_value(
+            _call(bus, destination, object_path, SELECTION_INTERFACE, "GetSelectedChild", "i", (index,))
+        )
+        try:
+            child_bus, child_path = cast(Any, reply)
+        except (TypeError, ValueError) as exc:
+            raise A11yError(f"Accessibility object {object_path} returned an invalid selected child: {exc}") from exc
+        chosen.add((str(child_bus), str(child_path)))
+    return chosen
+
+
 def _states(value: object) -> tuple[str, ...]:
     """GetState's `au`: a 64-bit StateType bitset as two 32-bit words, low word first."""
     try:
@@ -421,6 +445,9 @@ def snapshot(
         node_count = 0
         truncated = False
 
+        # What each container with a Selection reports as chosen, as it is reached: a chosen item lies below it.
+        chosen: set[tuple[str, str]] = set()
+
         def walk(destination: str, object_path: str, depth: int) -> Element:
             nonlocal node_count, truncated
             node_count += 1
@@ -432,6 +459,9 @@ def snapshot(
                 _reply_value(_call(connection, destination, object_path, ACCESSIBLE_INTERFACE, "GetState"))
             )
             interfaces = _interfaces(connection, destination, object_path)
+            chosen.update(_selected(connection, destination, object_path, interfaces))
+            if (destination, object_path) in chosen and "selected" not in states:
+                states = (*states, "selected")
             bounds = (
                 _bounds(connection, destination, object_path) if COMPONENT_INTERFACE in interfaces else (0, 0, 0, 0)
             )
