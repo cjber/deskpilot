@@ -57,8 +57,8 @@
 //
 // `hyprctl deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <event>...` sends the same key events (the
 // window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
-// The seat's selection never changes, so the user's clipboard and every other client's stay as they are. Once the
-// client has read the text, or after PASTE_WAIT, it gets the clipboard it would otherwise have: the user's if it has
+// The seat's selection never changes, so the user's clipboard and every other client's stay as they are. After
+// PASTE_WAIT, or at the next paste, the client gets the clipboard it would otherwise have: the user's if it has
 // keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard.
 //
 // A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
@@ -1537,14 +1537,9 @@ namespace {
                     break;
                 write->written += N;
             }
-            // Read once: the window has its text, so it gets the user's clipboard back (or none, when unfocused).
-            // Restored here rather than later, so no callback into this plugin is left queued if it is unloaded.
-            auto* source = write->source;
-            std::erase(source->m_writes, write);
+            std::erase(write->source->m_writes, write);
             wl_event_source_remove(write->event);
             delete write;
-            if (g_paste && g_paste->source.get() == source)
-                restorePaste();
             return 0;
         }
 
@@ -1552,7 +1547,10 @@ namespace {
         std::vector<SWrite*> m_writes;
     };
 
-    // How long a window may take to read a pasted text before its clipboard is given back anyway.
+    // How long a window keeps the pasted text as its clipboard. A client may read the text as soon as it is offered,
+    // as Chrome does to cache it, and paste that copy when the chord arrives; another reads it at the chord. Nothing
+    // tells when a client is done with it, and taking it back after the first read left Chrome with an empty
+    // clipboard by the time its chord arrived, so the offer lasts this long.
     constexpr auto PASTE_WAIT = std::chrono::seconds(10);
 
     // The window's client sees the clipboard it would have without the paste: the user's, if it has keyboard focus,
@@ -1572,7 +1570,7 @@ namespace {
         ((*PROTO::data).*member(SSendSelection{}))(DEVICE, FOCUSED ? g_pSeatManager->m_selection.currentSelection.lock() : nullptr);
     }
 
-    // Offers `text` as the clipboard of `window`'s client alone, until it has read it or PASTE_WAIT passes.
+    // Offers `text` as the clipboard of `window`'s client alone, until PASTE_WAIT passes or the next paste.
     std::optional<std::string> offerPaste(const PHLWINDOW& window, std::string text) {
         if (!window || !window->mapped())
             return "the window closed before its text was offered";
