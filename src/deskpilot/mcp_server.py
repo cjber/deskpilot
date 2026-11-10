@@ -63,10 +63,14 @@ def click(
     shot: str | None = None,
     show: bool = False,
     take_pointer: bool = False,
+    take_focus: bool = False,
 ) -> dict:
     """Click a point given in pixels of `shot`, or of the window's latest screenshot. The user's pointer and
-    keyboard focus stay put unless take_pointer is set."""
-    gx, gy = desk.click(window, x, y, button, 2 if double else 1, take_pointer=take_pointer, shot=shot, show=show)
+    keyboard focus stay put unless take_pointer is set, or take_focus, which focuses the window first and leaves it
+    focused: use it for a menu or dropdown that closes as soon as it opens."""
+    gx, gy = desk.click(
+        window, x, y, button, 2 if double else 1, take_pointer=take_pointer, shot=shot, show=show, take_focus=take_focus
+    )
     return {"x": gx, "y": gy}
 
 
@@ -106,10 +110,49 @@ def type_text(text: str, window: str | None = None, delay: float = 0.03, take_fo
 
 
 @_tool()
-def wait_for(window: str, timeout: float = 60, gone: bool = False) -> dict | str:
-    """Wait for a window to appear, or with gone=True to close."""
-    win = desk.wait_for(window, timeout, gone)
+def paste_text(text: str, window: str | None = None, take_focus: bool = False, keys: str = "ctrl+v") -> str:
+    """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `keys` (the app's
+    paste chord, ctrl+shift+v in most terminals) is pressed there. Pastes any text, including characters the keymap
+    cannot type. Not for XWayland windows, which share one clipboard."""
+    desk.paste(text, window, take_focus, keys)
+    return "ok"
+
+
+@_tool()
+def clipboard() -> str:
+    """The user's clipboard text. An empty clipboard, or one holding no text, is an error saying so."""
+    return desk.clipboard()
+
+
+@_tool()
+def copy_text(text: str) -> str:
+    """Replace the user's clipboard with text."""
+    desk.set_clipboard(text)
+    return "ok"
+
+
+@_tool()
+def wait_for(
+    window: str,
+    timeout: float = 60,
+    gone: bool = False,
+    focused: bool = False,
+    title: str | None = None,
+    size: tuple[int, int] | None = None,
+) -> dict | str:
+    """Wait for a window to appear, or with gone=True to close. focused, title (a substring) and size (window pixels)
+    also wait for it to have keyboard focus, that title or that size. Returns the window as it matched."""
+    win = desk.wait_for(window, timeout, gone, focused, title, size)
     return win.to_dict() if win else "gone"
+
+
+@_tool()
+def wait_changed(window: str, shot: str, timeout: float = 60, region: tuple[int, int, int, int] | None = None) -> list:
+    """Wait until a window looks different from one of its shots, in all of it or in region (x, y, width, height in
+    that shot's pixels). Any pixel difference counts. Returns a shot of the change, its id and the box that
+    changed."""
+    taken, box = desk.wait_changed(window, shot, timeout, region)
+    return [Image(path=taken.path), {**taken.to_dict(), "changed": list(box)}]
 
 
 def serve() -> None:

@@ -1,11 +1,12 @@
 import json
+import pathlib
 import subprocess
 from dataclasses import asdict, replace
 
 import pytest
 from PIL import Image
 
-from deskpilot import keys, screen
+from deskpilot import clipboard, keys, screen
 from deskpilot.desk import Desk, NotVisible
 from deskpilot.hypr import (
     AmbiguousWindow,
@@ -284,6 +285,15 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
     assert inp.events == []
 
 
+def test_click_with_take_focus_focuses_the_window_before_the_plugin_clicks(tmp_path, monkeypatch):
+    desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
+    desk.click("battle", 10, 10, take_focus=True)
+    focus = ["dispatch", 'hl.dsp.focus({window="address:0xabc"})']
+    assert focus in fake.calls and plugin.calls[-1][0] == "click"
+    desk.click("battle", 10, 10)
+    assert fake.calls.count(focus) == 1
+
+
 def test_keys_without_a_window_go_to_the_focused_one_and_take_focus_focuses_first(tmp_path, monkeypatch):
     desk, fake, _, plugin, _ = make_desk(tmp_path, monkeypatch)
     desk.key("Return")
@@ -297,6 +307,20 @@ def test_plugin_formats_key_events():
     calls = []
     Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", ["+29", "t61"], hold=0.03, gap=0.1)
     assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "t61"]]
+
+
+def test_paste_sends_its_text_in_a_file_the_request_names_and_removes_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    seen = []
+
+    def run(args):
+        seen.append((args, pathlib.Path(args[3]).read_text()))
+        return '{"ok":true}'
+
+    Plugin(run).keys("0xabc", ["p76"], paste="naïve 日本 ✓")
+    ((args, text),) = seen
+    assert args[:3] == ["deskpilot", "paste", "0xabc"] and args[4:] == ["0", "0", "none", "p76"]
+    assert text == "naïve 日本 ✓" and not pathlib.Path(args[3]).exists()
 
 
 def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
@@ -465,3 +489,52 @@ def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "desk", desk)
     with pytest.raises(ToolError, match="is not on screen"):
         asyncio.run(mcp_server.mcp.call_tool("click", {"window": "battle", "x": 1, "y": 1}))
+
+
+def test_clipboard_reads_plain_text_and_not_another_text_type(monkeypatch):
+    offered, asked = ["text/x-moz-url", "text/html"], []
+
+    def wl_paste(cmd, **kwargs):
+        if cmd[1] == "--list-types":
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(offered), "")
+        asked.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "café".encode(), b"")
+
+    monkeypatch.setattr(clipboard.subprocess, "run", wl_paste)
+    with pytest.raises(clipboard.ClipboardError, match="no plain text; it offers text/x-moz-url, text/html"):
+        clipboard.read()
+    offered.append("text/plain")
+    assert clipboard.read() == "café" and asked == ["text/plain"]
+
+
+def test_wait_for_returns_once_the_window_has_the_title_and_size_asked(tmp_path, monkeypatch):
+    desk, fake, *_ = make_desk(tmp_path, monkeypatch)
+    changes = iter([{"title": "Battle.net - Login"}, {"size": [800, 600]}])
+    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda _: fake.clients[0].update(next(changes)))
+    win = desk.wait_for("battle", 5, title="Login", size=(800, 600))
+    assert (win.title, win.width, win.height) == ("Battle.net - Login", 800, 600)
+    with pytest.raises(TimeoutError, match="is not 1x1 after 0s"):
+        desk.wait_for("battle", 0, title="Login", size=(1, 1))
+
+
+def test_wait_changed_returns_a_shot_of_the_change_and_where_it_is(tmp_path, monkeypatch):
+    desk, *_ = make_desk(tmp_path, monkeypatch)
+    frames = iter([None, None, (10, 20), (10, 20)])
+
+    def grim(cmd, **kwargs):
+        image = Image.new("RGB", (1266, 684))
+        if (dot := next(frames)) is not None:
+            image.putpixel(dot, (255, 255, 255))
+        image.save(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(screen.subprocess, "run", grim)
+    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda _: None)
+    base = desk.shot("battle")
+    shot, box = desk.wait_changed("battle", base.id, 5)
+    assert box == (10, 20, 11, 21) and Image.open(shot.path).getpixel((10, 20)) == (255, 255, 255)
+    assert [r.stem for r in sorted(screen.shots_dir().glob("*.json"))] == sorted(["abc-1", base.id, shot.id])
+    with pytest.raises(ValueError, match="not inside shot"):
+        desk.wait_changed("battle", base.id, 5, (1200, 0, 100, 10))
+    with pytest.raises(TimeoutError, match="did not change from shot"):
+        desk.wait_changed("battle", shot.id, 0)

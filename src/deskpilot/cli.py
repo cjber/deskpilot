@@ -46,6 +46,18 @@ def _point_parser(sub, name: str, helptext: str) -> argparse.ArgumentParser:
     return s
 
 
+def _text(arg: str) -> str:
+    return sys.stdin.read() if arg == "-" else arg
+
+
+def _size(text: str) -> tuple[int, int]:
+    w, _, h = text.partition("x")
+    try:
+        return int(w), int(h)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"size must be WIDTHxHEIGHT, not {text!r}") from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deskpilot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -68,6 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = _point_parser(sub, "click", "click a point")
     s.add_argument("--button", choices=["left", "right", "middle"], default="left")
     s.add_argument("--double", action="store_true")
+    s.add_argument(
+        "--take-focus",
+        action="store_true",
+        help="focus the window first and leave it focused, for a menu or dropdown that closes when it is not focused",
+    )
     s = _point_parser(sub, "scroll", "scroll at a point; positive is up")
     s.add_argument("dy", type=int)
 
@@ -88,10 +105,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--delay", type=float, default=0.03, help="seconds each key is held and between keys; games want 0.1 or more"
     )
 
-    s = sub.add_parser("wait-for", help="wait for a window to appear (or --gone to close)")
+    s = sub.add_parser(
+        "paste", help="paste text into a window through a clipboard only it sees; any text, whatever the keymap types"
+    )
+    s.add_argument("text", help="the text, or - to read it from stdin")
+    s.add_argument("--window", help="paste into this window; without it the text goes to the focused window")
+    s.add_argument("--take-focus", action="store_true", help=focus_help)
+    s.add_argument("--keys", default="ctrl+v", help="the app's paste chord, e.g. ctrl+shift+v in a terminal")
+
+    s = sub.add_parser("clipboard", help="print the user's clipboard text, or replace it with --set")
+    s.add_argument("--set", metavar="TEXT", help="the text to copy, or - to read it from stdin")
+
+    s = sub.add_parser(
+        "wait-for", help="wait for a window to appear, close, take focus, change title or size, or look different"
+    )
     s.add_argument("window")
     s.add_argument("--timeout", type=float, default=60)
-    s.add_argument("--gone", action="store_true")
+    s.add_argument("--gone", action="store_true", help="wait for it to close")
+    s.add_argument("--focused", action="store_true", help="wait until it has keyboard focus")
+    s.add_argument("--title", help="wait until its title contains this")
+    s.add_argument("--size", type=_size, metavar="WxH", help="wait until it is this size in window pixels")
+    s.add_argument(
+        "--changed", metavar="SHOT", help="wait until it looks different from this shot; prints a shot of the change"
+    )
+    s.add_argument(
+        "--region", type=int, nargs=4, metavar=("X", "Y", "W", "H"), help="with --changed, only this part of the shot"
+    )
 
     sub.add_parser("cursor", help="print the cursor's global position")
     sub.add_parser("mcp", help="run the MCP server on stdio")
@@ -123,6 +162,7 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 args.take_pointer,
                 shot=args.shot,
                 show=args.show,
+                take_focus=args.take_focus,
             )
             return {"x": gx, "y": gy}
         case "scroll":
@@ -136,8 +176,23 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
         case "type":
             desk.type(args.text, args.window, args.delay, args.take_focus)
             return "ok"
+        case "paste":
+            desk.paste(_text(args.text), args.window, args.take_focus, args.keys)
+            return "ok"
+        case "clipboard":
+            if args.set is None:
+                return desk.clipboard()
+            desk.set_clipboard(_text(args.set))
+            return "ok"
         case "wait-for":
-            win = desk.wait_for(args.window, args.timeout, args.gone)
+            if args.changed:
+                if args.gone or args.focused or args.title is not None or args.size:
+                    raise ValueError("--changed waits on pixels alone: drop --gone, --focused, --title and --size")
+                shot, box = desk.wait_changed(args.window, args.changed, args.timeout, args.region)
+                return {**shot.to_dict(), "changed": list(box)}
+            if args.region:
+                raise ValueError("--region needs --changed")
+            win = desk.wait_for(args.window, args.timeout, args.gone, args.focused, args.title, args.size)
             return win.to_dict() if win else "gone"
         case "plugin":
             if args.action == "build":

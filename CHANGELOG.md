@@ -14,6 +14,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Keys always go through the plugin.** `--take-focus` focuses the window and then sends keys as `--window` does,
   and `key` and `type` without `--window` go to the focused window, so neither needs `/dev/uinput` any more. These
   keys do not trigger Hyprland keybinds.
+- **Paste any text into a window without touching your clipboard.** `deskpilot paste TEXT --window W` (MCP
+  `paste_text`) gives the window a clipboard only it sees and presses its paste chord (`--keys`, `ctrl+v` by default),
+  so text the keymap cannot type and long text arrive whole. XWayland windows share one clipboard and are refused.
+- **Read and write the clipboard.** `deskpilot clipboard` prints the clipboard's text and `--set TEXT` replaces it (MCP
+  `clipboard` and `copy_text`).
+- **Wait for what is on screen.** `wait-for` takes `--focused`, `--title TEXT` and `--size WxH`, and `--changed SHOT`
+  (with an optional `--region X Y W H`) waits until the window looks different from that shot, then prints a shot of
+  the change and the box that changed (MCP `wait_for` and `wait_changed`).
+- **Dropdowns stay open with `click --take-focus`.** Chrome and other apps close a menu or dropdown when their
+  window is not the focused one, so a click that left the user's focus in place closed the list it opened.
+  `click --take-focus` (MCP `take_focus`) focuses the window first and leaves it focused.
 - **Your mouse moves as usual during an agent's click.** Motion made while a click or scroll ran was added up and
   applied as one jump, skipping pointer acceleration and the relative motion a pointer-locked game reads, and a
   tablet or other absolute device could move the pointer mid-click. All of it is now held and replayed in order
