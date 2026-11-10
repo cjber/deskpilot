@@ -17,7 +17,7 @@ from deskpilot.hypr import (
     pick_instance,
     run_hyprctl,
 )
-from deskpilot.plugin import REQUEST_BYTES, Plugin, PluginError, parse_reply, request_size
+from deskpilot.plugin import REQUEST_BYTES, Plugin, PluginError, parse_reply, request_size, source_hash
 
 
 def win(address="0x1", cls="wow.exe", title="World of Warcraft", x=1440, y=560, w=3440, h=1440):
@@ -314,6 +314,18 @@ def test_plugin_waits_on_a_queued_action_until_it_finishes():
     assert calls[1:] == [["deskpilot", "wait", "7"], ["deskpilot", "wait", "7"]]
     with pytest.raises(PluginError, match="queue is full"):
         Plugin(lambda args: '{"ok":false,"error":"the deskpilot queue is full"}').scroll("0xabc", 1, 2, 3)
+
+
+def test_a_refusal_from_a_stale_plugin_names_the_build_and_the_fix():
+    def run(args, version):
+        if args[1] == "status":
+            return f'{{"ok":true,"version":"{version}"}}'
+        return '{"ok":false,"error":"hold and gap must be 0 to 10000 milliseconds"}'
+
+    with pytest.raises(PluginError, match=r"build 000000000000, not this CLI's .*deskpilot plugin load.*hold and gap"):
+        Plugin(lambda args: run(args, "000000000000")).keys("0xabc", [(28, True), (28, False)])
+    with pytest.raises(PluginError, match=r"^hold and gap must be"):
+        Plugin(lambda args: run(args, source_hash())).keys("0xabc", [(28, True), (28, False)])
 
 
 def test_plugin_sends_button_codes_and_reads_replies():
