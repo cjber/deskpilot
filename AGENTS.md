@@ -36,8 +36,10 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 ## Rules
 
 - The user's pointer and focus are theirs. Only `--take-pointer`, `--take-focus` and `--show` may move them; every
-  other action goes through the plugin, which must restore both and replay input the user made meanwhile. A window
-  that is not on screen is an error, never a reason to focus it.
+  other action goes through the plugin, which sends input to the target app's own pointer and keyboard and never
+  holds the user's input, except where the target can only be reached through the seat (an XWayland window, or the
+  app the user's pointer or keyboard focus is in): there it must restore both and replay input the user made
+  meanwhile. A window that is not on screen is an error unless the action is hidden, never a reason to focus it.
 - A point is resolved against a recorded shot. A shot is of one window at one size; any other use is refused.
 - A plugin build loads only into the Hyprland it was built against. Builds are named after the Hyprland commit and
   the plugin source hash, so a changed source or an upgrade rebuilds rather than reusing a stale build.
@@ -52,8 +54,8 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
   A character no key on that keymap gives is an error, never skipped.
 - A paste offers its text to the target window's client alone and never sets the seat's selection, so the user's
   clipboard is untouched. A client that can only read the shared clipboard (XWayland) is refused.
-- A pointer action (click, scroll, drag, hover) holds the user's pointer input while it runs, so it is bounded in
-  steps and time, and it lets go of every button it pressed however it ends.
+- A pointer action (click, scroll, drag, hover) is bounded in steps and time, and it lets go of every button it
+  pressed however it ends.
 - An element is targeted where the app reports it when the action runs, never from a stale snapshot. An app that
   exposes no accessibility tree is an error, never a guessed tree.
 - Tests never touch the real compositor, `/dev/uinput`, or `grim`. Pass fakes into `Desk` and

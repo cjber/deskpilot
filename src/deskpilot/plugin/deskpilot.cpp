@@ -202,8 +202,8 @@ namespace {
         ms                    wait{0};
     };
 
-    // How an action's pointer reaches the window. SHOWN and PLAIN move the seat's pointer onto a window on screen, SHOWN
-    // with the agent cursor gliding there first; HIDDEN drives the window client's own pointer, on screen or not.
+    // What an action shows. SHOWN and PLAIN act on a window on screen, SHOWN with the agent cursor gliding there first;
+    // HIDDEN acts on a window wherever it is and shows nothing. How the input gets there is SOp::direct.
     enum class eMode : uint8_t {
         SHOWN,
         PLAIN,
@@ -224,6 +224,10 @@ namespace {
         size_t                             next = 0;
         std::vector<uint32_t>              down; // buttons this action holds down, released when it ends however it ends
         bool                               answered = false; // a path's `n` step has answered its caller already
+        // The input goes to the window client's own pointer (see "hidden pointer" below), leaving the user's pointer,
+        // focus and input alone. Otherwise the seat's pointer is moved onto the window and the user's input is held:
+        // for an XWayland window, which reads the one X pointer, and for a window of the app the user's pointer is on.
+        bool                               direct = false;
         // HIDDEN: the surface the client's pointer is on and the client's wl_pointer resources, entered there.
         WP<CWLSurfaceResource>             surface;
         Vector2D                           local;
@@ -264,7 +268,10 @@ namespace {
         std::vector<WP<CWLKeyboardResource>> keyboards;
         bool                               entered = false;
         WP<CWLSurfaceResource>             sibling;
-        bool                               holding = false; // the user's input is held until the stroke ends
+        bool                               inStroke = false;
+        // The user's input is held until the stroke ends: only when their keys could reach the stroke's keyboards,
+        // since their keyboard focus is in the window's app, or the window is an XWayland one, which X focus reaches.
+        bool                               holding = false;
         // A keyboard focus change Hyprland asked for mid-stroke, applied when the stroke ends.
         std::optional<WP<CWLSurfaceResource>> deferredFocus;
         std::optional<std::chrono::steady_clock::time_point> clientDeadline;
@@ -322,8 +329,8 @@ namespace {
         return true;
     }
 
-    // The user's pointer input during an action: each event is held while a pointer action runs (a hidden one only
-    // while it holds a button) or a keystroke is held, and replayed after it in the order it came, through Hyprland's
+    // The user's pointer input during an action: each event is held while a pointer action moves the seat's pointer
+    // or a keystroke holds the user's input, and replayed after it in the order it came, through Hyprland's
     // own handler, so acceleration, relative motion for pointer-locked games and absolute devices work as they would.
     // A held event is replayed with the time it is replayed at, so it never reaches a client dated before the
     // agent's own events that went ahead of it.
@@ -334,7 +341,7 @@ namespace {
             event.timeMs = now();
             run(event);
         };
-        if (g_op && (g_op->mode != eMode::HIDDEN || !g_op->down.empty())) {
+        if (g_op && !g_op->direct) {
             g_op->heldInput.emplace_back(replay);
             return;
         }
@@ -369,12 +376,32 @@ namespace {
     // Hyprland refocuses on its own events (a layer surface closing, a window opening) as well as on the user's input,
     // and a focus change sends every wl_keyboard a leave, the window being typed into included. Mid-stroke the change
     // waits for the stroke to end, as the user's own input does. Hyprland's record of the focused window updates at once.
+    //
+    // Each change also sends every client's keyboard a leave. Mid-stroke, a change between other apps' surfaces goes
+    // ahead without the stroke's keyboards getting it (g_shieldKeys); one into the window's own app waits, since that
+    // app's keyboard is in use.
+    bool g_shieldKeys = false;
+
     void hkSetKeyboardFocus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
-        if (g_keyOp && g_keyOp->holding) {
-            g_keyOp->deferredFocus = surface;
-            return;
+        if (g_keyOp && g_keyOp->inStroke) {
+            const auto TARGET = g_keyOp->surface.lock();
+            if (g_keyOp->holding || (surface && TARGET && surface->client() == TARGET->client())) {
+                g_keyOp->deferredFocus = surface;
+                return;
+            }
+            g_shieldKeys = true;
         }
         reinterpret_cast<FocusFn>(g_focusHook->m_original)(self, surface);
+        g_shieldKeys = false;
+    }
+
+    using KeyboardLeaveFn = void (*)(CWLKeyboardResource*);
+    CFunctionHook* g_keyboardLeaveHook = nullptr;
+
+    void hkKeyboardSendLeave(CWLKeyboardResource* self) {
+        if (g_shieldKeys && g_keyOp && std::ranges::any_of(g_keyOp->keyboards, [self](const auto& keyboard) { return keyboard.get() == self; }))
+            return;
+        reinterpret_cast<KeyboardLeaveFn>(g_keyboardLeaveHook->m_original)(self);
     }
 
     std::string jsonString(const std::string& s) {
@@ -822,9 +849,10 @@ namespace {
     void hiddenWheel(SOp& op, int sign);
     void hiddenLeave(SOp& op);
     void pumpFrames(const PHLWINDOW& window);
+    PHLWINDOW windowOf(const SOp& op);
 
-    bool hidden() {
-        return g_op->mode == eMode::HIDDEN;
+    bool direct() {
+        return g_op->direct;
     }
 
     // The pointer to the first point of an action: entered there, and moved there only once that is the target, so a
@@ -833,7 +861,7 @@ namespace {
         g_op->target = pos;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(pos);
-        if (hidden()) {
+        if (direct()) {
             hiddenEnter(*g_op, pos);
             return;
         }
@@ -851,7 +879,7 @@ namespace {
         g_op->target = pos;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(pos);
-        if (hidden()) {
+        if (direct()) {
             hiddenMove(*g_op, pos);
             return;
         }
@@ -870,11 +898,11 @@ namespace {
 
     // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
     void press(uint32_t button) {
-        if (hidden() ? !hiddenReady(*g_op) : !targetUnderPointer())
+        if (direct() ? !hiddenReady(*g_op) : !targetUnderPointer())
             return;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::press();
-        if (hidden())
+        if (direct())
             hiddenButton(*g_op, button, WL_POINTER_BUTTON_STATE_PRESSED);
         else {
             g_pSeatManager->sendPointerButton(now(), button, WL_POINTER_BUTTON_STATE_PRESSED);
@@ -898,11 +926,8 @@ namespace {
         g_op->down.erase(IT);
         if (g_op->mode == eMode::SHOWN && g_op->down.empty())
             agentcursor::release();
-        if (hidden()) {
+        if (direct()) {
             hiddenButton(*g_op, button, WL_POINTER_BUTTON_STATE_RELEASED);
-            // A hidden action holds the user's input only while it holds a button.
-            if (g_op->down.empty())
-                replayHeld(g_op->heldInput);
             return;
         }
         if (PROTO::data->dndActive()) {
@@ -916,7 +941,7 @@ namespace {
     // One wheel notch as onMouseWheel sends it with a scroll factor of 1: delta 15, one discrete step, value120 of 120.
     // Negative is up in Wayland.
     void wheel(int sign) {
-        if (hidden()) {
+        if (direct()) {
             if (hiddenReady(*g_op))
                 hiddenWheel(*g_op, sign);
             return;
@@ -953,7 +978,7 @@ namespace {
         if (!op.down.empty())
             PROTO::data->abortDndIfPresent();
 
-        if (op.mode == eMode::HIDDEN) {
+        if (op.direct) {
             // Every button it still holds goes up, and the client's pointer leaves its window.
             for (const auto BUTTON : op.down)
                 hiddenButton(op, BUTTON, WL_POINTER_BUTTON_STATE_RELEASED);
@@ -1008,7 +1033,12 @@ namespace {
         if (PROTO::data->dndActive())
             return "a drag and drop is in progress: try again when it ends";
         op.ticket = ticket;
-        if (op.mode != eMode::HIDDEN) {
+        // A window of the app the user's pointer is on cannot take it directly: one wl_pointer is on one surface.
+        const auto WINDOW = windowOf(op);
+        const auto USER   = g_pSeatManager->m_state.pointerFocus.lock();
+        const auto MINE   = WINDOW && WINDOW->wlSurface() && WINDOW->wlSurface()->resource() ? WINDOW->wlSurface()->resource()->client() : nullptr;
+        op.direct         = op.mode == eMode::HIDDEN || (WINDOW && !WINDOW->backend().isX11() && (!USER || USER->client() != MINE));
+        if (!op.direct) {
             op.saved        = g_pInputManager->getMouseCoordsInternal();
             op.focusWindow  = Desktop::focusState()->window();
             op.focusSurface = Desktop::focusState()->surface();
@@ -1016,7 +1046,7 @@ namespace {
         }
         g_op.emplace(std::move(op));
 
-        if (!hidden())
+        if (!direct())
             g_pHyprRenderer->setCursorHidden(true);
         g_op->timer = makeShared<CEventLoopTimer>(ms(1), runNext, nullptr);
         g_pEventLoopManager->addTimer(g_op->timer);
@@ -1231,7 +1261,7 @@ namespace {
             return;
         }
         op.focusChange = g_pSeatManager->m_events.pointerFocusChange.listen([] {
-            if (!g_op || g_op->mode != eMode::HIDDEN || !g_op->error.empty())
+            if (!g_op || !g_op->direct || !g_op->error.empty())
                 return;
             // A drag and drop the press started takes the seat's pointer focus; finish() cancels it.
             if (!g_op->down.empty() && PROTO::data->dndActive()) {
@@ -1385,7 +1415,7 @@ namespace {
     bool           g_shieldHidden     = false;
 
     void hkSetPointerFocus(CSeatManager* self, SP<CWLSurfaceResource> surface, const Vector2D& local) {
-        const auto OURS = g_op && g_op->mode == eMode::HIDDEN && g_op->surface.lock();
+        const auto OURS = g_op && g_op->direct && g_op->surface.lock();
         g_shieldHidden  = OURS && (!surface || surface->client() != g_op->surface.lock()->client());
         reinterpret_cast<PointerFocusFn>(g_pointerFocusHook->m_original)(self, surface, local);
         g_shieldHidden = false;
@@ -1620,7 +1650,8 @@ namespace {
     // The stroke is over: a focus change Hyprland made meanwhile takes effect, the user's held input is replayed, and
     // the next stroke follows after the gap.
     std::optional<ms> endStroke(SKeyOp& op) {
-        op.holding = false;
+        op.holding  = false;
+        op.inStroke = false;
         // A window off screen draws what the keys changed only with frame callbacks.
         pumpFrames(op.window.lock());
         if (const auto DEFERRED = std::exchange(op.deferredFocus, std::nullopt))
@@ -1727,7 +1758,8 @@ namespace {
                     op.phase = SKeyOp::DONE;
                     return std::nullopt;
                 }
-                op.holding = true;
+                op.inStroke = true;
+                op.holding  = !op.entered || op.sibling || op.x11;
                 if (op.entered) {
                     if (op.x11) {
                         op.xid = xidOf(WINDOW);
@@ -2249,6 +2281,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pointerFocusHook = hook(handle, "CSeatManager", "setPointerFocus", reinterpret_cast<void*>(&hkSetPointerFocus));
     g_leaveHook        = hook(handle, "CWLPointerResource", "sendLeave", reinterpret_cast<void*>(&hkSendLeave));
     g_popupFocusHook   = hook(handle, "CPopup", "focusAvailable", reinterpret_cast<void*>(&hkPopupFocusAvailable));
+    g_keyboardLeaveHook = hook(handle, "CWLKeyboardResource", "sendLeave", reinterpret_cast<void*>(&hkKeyboardSendLeave));
 
     agentcursor::init();
     g_pumpTimer = makeShared<CEventLoopTimer>(std::nullopt, pumpTick, nullptr);

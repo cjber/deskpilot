@@ -3,12 +3,14 @@
 Desktop control for agents on Hyprland. An agent takes a screenshot of a window, picks a point in it, and clicks
 or types there, in any app: native Wayland, XWayland and Wine programs such as the Battle.net launcher and games.
 
-The user keeps their own pointer and keyboard focus. Clicks, scrolls and keys run inside the compositor through
-the deskpilot Hyprland plugin: in one step it holds the user's mouse input, delivers the event to the target window
-through the user's own seat, then puts the pointer back where it was, applying any mouse motion the user made
-meanwhile. Only pointer focus moves, so keyboard focus stays on the user's window and the target is not raised, even
-with `focus_on_activate` set. Wayland, XWayland and Wine clients all receive the press as a real click. The plugin refuses
-a click when another window covers the point.
+Deskpilot never blocks the user. Clicks, scrolls, drags and keys run inside the compositor through the deskpilot
+Hyprland plugin, which sends them straight to the target app's own pointer and keyboard: the user's pointer, cursor,
+keyboard focus and input are left alone while they keep working, and the target is not raised, even with
+`focus_on_activate` set. Two cases cannot work that way, and there the plugin briefly holds the user's mouse input,
+moves the seat's pointer onto the window, presses, and puts the pointer back, applying the motion the user made
+meanwhile: an XWayland window (X11 and Wine apps, which read the one X pointer), and a window of the app the user's
+pointer is on. Keys likewise hold the user's input for a stroke only when their keyboard focus is in the target's app
+or the target is an XWayland window. In those cases the plugin refuses a click when another window covers the point.
 
 An agent cursor shows where deskpilot acts. The plugin draws it above every window, separate from the user's
 pointer: it glides along an arc to each point before the action starts, shrinks and sends out a ring at each press,
@@ -104,8 +106,8 @@ pointer there and press through the input device instead.
 the user's pointer left where it is: sliders, text selection, drawing, and drag and drop within the window. `hover`
 rests the pointer on a point for `--wait` seconds and prints a screenshot taken while it is there, so a tooltip or a
 hover state shows in it; `--click X Y` clicks a second point next instead, before the pointer leaves, for a menu
-that opens on hover. Both hold the user's pointer input for as long as they take and replay it after, so they are
-bounded: a drag or hover that fails, or whose window closes, still lets go of its button.
+that opens on hover. Both are bounded, and a drag or hover that fails, or whose window closes, still lets go of its
+button.
 
 `elements` prints the window's accessibility tree (AT-SPI): each element's id, role, name, states, text and bounds
 in window pixels. `click`, `move`, `scroll` and `hover` take `--element ID` instead of a point, and act on the
