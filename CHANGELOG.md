@@ -7,6 +7,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Reloading the plugin no longer crashes Hyprland.** Loading a plugin build that had already been loaded and
+  unloaded in the same Hyprland session, then unloading it again, aborted Hyprland (a double free in the plugin's exit).
+  The plugin is now built so that unloading really unloads it, and its exit leaves nothing behind.
+
 - **A stale plugin is named, not blamed on your arguments.** When a loaded plugin build of other source refuses
   a request, the error names the loaded build and the fix (`deskpilot plugin load`) instead of an argument error
   such as `hold and gap must be 0 to 10000 milliseconds`.

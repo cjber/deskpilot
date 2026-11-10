@@ -1112,4 +1112,5 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_tickets.clear();
     if (g_x)
         xcb_disconnect(g_x);
+    g_x = nullptr;
 }
