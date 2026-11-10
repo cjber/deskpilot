@@ -98,13 +98,30 @@ class Plugin:
         the plugin, which answers within hyprctl's five second read timeout: an action still queued or running answers
         with a ticket to wait on again."""
         try:
-            reply = self._send(*args)
-        except PluginNotLoaded:
-            self.load()
-            reply = self._send(*args)
-        while "pending" in reply:
-            reply = self._send("wait", str(reply["pending"]))
+            try:
+                reply = self._send(*args)
+            except PluginNotLoaded:
+                self.load()
+                reply = self._send(*args)
+            while "pending" in reply:
+                reply = self._send("wait", str(reply["pending"]))
+        except PluginError as error:
+            raise self._mismatch(error) from error
         return reply
+
+    def _mismatch(self, refusal: PluginError) -> PluginError:
+        """A refusal from a loaded build of other source names that build: its requests may differ from this CLI's, so
+        the refusal can blame arguments the caller got right."""
+        try:
+            version = self.status().get("version")
+        except PluginError:
+            return refusal
+        if version == source_hash():
+            return refusal
+        return PluginError(
+            f"the loaded deskpilot plugin is build {version or 'unknown'}, not this CLI's {source_hash()}, so it may"
+            f" not understand the request: run `deskpilot plugin load` to replace it. The plugin answered: {refusal}"
+        )
 
     def loaded(self) -> bool:
         try:

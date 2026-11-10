@@ -7,6 +7,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **A stale plugin is named, not blamed on your arguments.** When a loaded plugin build of other source refuses
+  a request, the error names the loaded build and the fix (`deskpilot plugin load`) instead of an argument error
+  such as `hold and gap must be 0 to 10000 milliseconds`.
+
 ## [0.2.0] - 2026-11-10
 
 - **Install from PyPI.** Each release is published to PyPI, so `uv tool install deskpilot` installs it.
