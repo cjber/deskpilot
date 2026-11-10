@@ -46,6 +46,10 @@ def _point_parser(sub, name: str, helptext: str) -> argparse.ArgumentParser:
     return s
 
 
+def _text(arg: str) -> str:
+    return sys.stdin.read() if arg == "-" else arg
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deskpilot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -87,6 +91,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--delay", type=float, default=0.03, help="seconds each key is held and between keys; games want 0.1 or more"
     )
+
+    s = sub.add_parser(
+        "paste", help="paste text into a window through a clipboard only it sees; any text, whatever the keymap types"
+    )
+    s.add_argument("text", help="the text, or - to read it from stdin")
+    s.add_argument("--window", help="paste into this window; without it the text goes to the focused window")
+    s.add_argument("--take-focus", action="store_true", help=focus_help)
+    s.add_argument("--keys", default="ctrl+v", help="the app's paste chord, e.g. ctrl+shift+v in a terminal")
+
+    s = sub.add_parser("clipboard", help="print the user's clipboard text, or replace it with --set")
+    s.add_argument("--set", metavar="TEXT", help="the text to copy, or - to read it from stdin")
 
     s = sub.add_parser("wait-for", help="wait for a window to appear (or --gone to close)")
     s.add_argument("window")
@@ -135,6 +150,14 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             return "ok"
         case "type":
             desk.type(args.text, args.window, args.delay, args.take_focus)
+            return "ok"
+        case "paste":
+            desk.paste(_text(args.text), args.window, args.take_focus, args.keys)
+            return "ok"
+        case "clipboard":
+            if args.set is None:
+                return desk.clipboard()
+            desk.set_clipboard(_text(args.set))
             return "ok"
         case "wait-for":
             win = desk.wait_for(args.window, args.timeout, args.gone)

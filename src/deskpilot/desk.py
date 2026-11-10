@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from . import keys, screen
+from . import clipboard, keys, screen
 from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound
 from .overlay import AgentCursor
 from .plugin import Plugin, PluginError
@@ -193,6 +193,20 @@ class Desk:
         `delay` seconds later."""
         target = self._key_target(query, take_focus)
         self.plugin.keys(target.address, keys.text_words(text), hold=delay, gap=delay)
+
+    def paste(self, text: str, query: str | None = None, take_focus: bool = False, combo: str = "ctrl+v") -> None:
+        """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `combo` (the app's
+        paste chord, ctrl+shift+v in most terminals) is pressed there. Any text pastes, whatever the keymap types."""
+        target = self._key_target(query, take_focus)
+        self.plugin.keys(target.address, keys.chord_words(combo), paste=text)
+
+    def clipboard(self) -> str:
+        """The user's clipboard text."""
+        return clipboard.read()
+
+    def set_clipboard(self, text: str) -> None:
+        """Replace the user's clipboard with text."""
+        clipboard.write(text)
 
     def _key_target(self, query: str | None, take_focus: bool) -> Window:
         if query is None:

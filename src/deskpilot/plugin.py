@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,11 +139,25 @@ class Plugin:
     def scroll(self, address: str, gx: int, gy: int, dy: int) -> dict:
         return self._call("scroll", address, str(gx), str(gy), str(dy))
 
-    def keys(self, address: str, words: list[str], hold: float = 0.0, gap: float = 0.0) -> dict:
+    def keys(
+        self, address: str, words: list[str], hold: float = 0.0, gap: float = 0.0, paste: str | None = None
+    ) -> dict:
         """Send key events (see keys.py) to a window without focusing it, as one action. Each press is held `hold`
         seconds, and keystrokes (runs of events that end with no key down) are `gap` seconds apart. A sequence too long
-        for one request is staged ahead in parts and queued whole by the last, so no other keys land in between."""
-        head = ["keys", address, str(round(hold * 1000)), str(round(gap * 1000))]
+        for one request is staged ahead in parts and queued whole by the last, so no other keys land in between. With
+        `paste`, that text is the window's clipboard, and its alone, when the keys (its paste chord) arrive."""
+        if paste is None:
+            return self._keys(["keys", address], words, hold, gap)
+        fd, path = tempfile.mkstemp(prefix="deskpilot-paste-", dir=os.environ.get("XDG_RUNTIME_DIR"))
+        try:
+            with os.fdopen(fd, "wb") as file:
+                file.write(paste.encode())
+            return self._keys(["paste", address, path], words, hold, gap)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def _keys(self, verb: list[str], words: list[str], hold: float, gap: float) -> dict:
+        head = [*verb, str(round(hold * 1000)), str(round(gap * 1000))]
         if request_size([*head, "none", *words]) <= REQUEST_BYTES:
             return self._call(*head, "none", *words)
         txn = secrets.token_hex(8)

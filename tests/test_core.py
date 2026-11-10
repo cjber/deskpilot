@@ -1,11 +1,12 @@
 import json
+import pathlib
 import subprocess
 from dataclasses import asdict, replace
 
 import pytest
 from PIL import Image
 
-from deskpilot import keys, screen
+from deskpilot import clipboard, keys, screen
 from deskpilot.desk import Desk, NotVisible
 from deskpilot.hypr import (
     AmbiguousWindow,
@@ -299,6 +300,20 @@ def test_plugin_formats_key_events():
     assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "t61"]]
 
 
+def test_paste_sends_its_text_in_a_file_the_request_names_and_removes_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    seen = []
+
+    def run(args):
+        seen.append((args, pathlib.Path(args[3]).read_text()))
+        return '{"ok":true}'
+
+    Plugin(run).keys("0xabc", ["p76"], paste="naïve 日本 ✓")
+    ((args, text),) = seen
+    assert args[:3] == ["deskpilot", "paste", "0xabc"] and args[4:] == ["0", "0", "none", "p76"]
+    assert text == "naïve 日本 ✓" and not pathlib.Path(args[3]).exists()
+
+
 def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
     calls = []
     events = [word for _ in range(5000) for word in ("+30", "-30")]
@@ -465,3 +480,19 @@ def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "desk", desk)
     with pytest.raises(ToolError, match="is not on screen"):
         asyncio.run(mcp_server.mcp.call_tool("click", {"window": "battle", "x": 1, "y": 1}))
+
+
+def test_clipboard_reads_plain_text_and_not_another_text_type(monkeypatch):
+    offered, asked = ["text/x-moz-url", "text/html"], []
+
+    def wl_paste(cmd, **kwargs):
+        if cmd[1] == "--list-types":
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(offered), "")
+        asked.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "café".encode(), b"")
+
+    monkeypatch.setattr(clipboard.subprocess, "run", wl_paste)
+    with pytest.raises(clipboard.ClipboardError, match="no plain text; it offers text/x-moz-url, text/html"):
+        clipboard.read()
+    offered.append("text/plain")
+    assert clipboard.read() == "café" and asked == ["text/plain"]

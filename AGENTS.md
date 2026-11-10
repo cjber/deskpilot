@@ -30,6 +30,7 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 - `src/deskpilot/overlay.py`: the agent cursor, drawn by `cua-driver`
 - `src/deskpilot/uinput.py`: the virtual mouse behind `--take-pointer`
 - `src/deskpilot/keys.py`: key names, chords and text as the plugin's key events
+- `src/deskpilot/clipboard.py`: the user's clipboard through wl-clipboard
 
 ## Rules
 
@@ -45,6 +46,8 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 - The agent cursor is feedback, never input: any overlay failure turns it off and the action goes ahead.
 - Text is typed as written on the user's active keymap, resolved in the plugin, never through a fixed layout table.
   A character no key on that keymap gives is an error, never skipped.
+- A paste offers its text to the target window's client alone and never sets the seat's selection, so the user's
+  clipboard is untouched. A client that can only read the shared clipboard (XWayland) is refused.
 - Tests never touch the real compositor, `/dev/uinput`, `grim` or `cua-driver`. Pass fakes into `Desk` and
   `Hyprland`, as `tests/test_core.py` does.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change

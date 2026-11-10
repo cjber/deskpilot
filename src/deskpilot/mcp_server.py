@@ -106,6 +106,28 @@ def type_text(text: str, window: str | None = None, delay: float = 0.03, take_fo
 
 
 @_tool()
+def paste_text(text: str, window: str | None = None, take_focus: bool = False, keys: str = "ctrl+v") -> str:
+    """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `keys` (the app's
+    paste chord, ctrl+shift+v in most terminals) is pressed there. Pastes any text, including characters the keymap
+    cannot type. Not for XWayland windows, which share one clipboard."""
+    desk.paste(text, window, take_focus, keys)
+    return "ok"
+
+
+@_tool()
+def clipboard() -> str:
+    """The user's clipboard text. An empty clipboard, or one holding no text, is an error saying so."""
+    return desk.clipboard()
+
+
+@_tool()
+def copy_text(text: str) -> str:
+    """Replace the user's clipboard with text."""
+    desk.set_clipboard(text)
+    return "ok"
+
+
+@_tool()
 def wait_for(window: str, timeout: float = 60, gone: bool = False) -> dict | str:
     """Wait for a window to appear, or with gone=True to close."""
     win = desk.wait_for(window, timeout, gone)
