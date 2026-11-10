@@ -38,7 +38,7 @@ compositor treats as real hardware. Tools that synthesize input another way, suc
 ## Install
 
 ```sh
-uv tool install git+https://github.com/cjber/deskpilot
+uv tool install deskpilot
 ```
 
 The agent skill, which teaches an agent the steps below, installs in Claude Code with:

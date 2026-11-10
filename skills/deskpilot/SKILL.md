@@ -9,7 +9,7 @@ Run `deskpilot --help` for the command list, and put `--json` before the command
 actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `key`, `type_text` and `wait_for`.
 
 If `deskpilot` is not on `PATH`, ask the user before installing it with
-`uv tool install git+https://github.com/cjber/deskpilot`.
+`uv tool install deskpilot`.
 
 1. The first click, scroll or key loads the plugin for the running Hyprland, building it if needed, which can take
    a minute once per Hyprland version. `deskpilot plugin status` reports the loaded build.
