@@ -14,6 +14,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Keys always go through the plugin.** `--take-focus` focuses the window and then sends keys as `--window` does,
   and `key` and `type` without `--window` go to the focused window, so neither needs `/dev/uinput` any more. These
   keys do not trigger Hyprland keybinds.
+- **Your mouse moves as usual during an agent's click.** Motion made while a click or scroll ran was added up and
+  applied as one jump, skipping pointer acceleration and the relative motion a pointer-locked game reads, and a
+  tablet or other absolute device could move the pointer mid-click. All of it is now held and replayed in order
+  through Hyprland's own handling.
 
 ## [0.2.1] - 2026-11-10
 
