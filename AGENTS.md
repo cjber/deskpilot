@@ -64,3 +64,7 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
   `Hyprland`, as `tests/test_core.py` does.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change
   updates `README.md` and `skills/deskpilot/SKILL.md` too.
+
+## Standards
+
+- `repo-standards`: the RS-* requirements every cjber repo meets (repo, Actions and security settings, rulesets, CI hardening, community files), a skill in cjber/skills whose `audit.py` checks this repo
