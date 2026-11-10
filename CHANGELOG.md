@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-10
+
 - **Text arrives as written on any keyboard layout.** `type` and `key` used US key positions, so another layout or
   Caps Lock typed other characters. The plugin now finds the key for each character on the active keymap and sets
   the modifiers it needs, keeping Caps Lock and the layout. A character the keymap cannot type is refused with its
