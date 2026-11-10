@@ -275,15 +275,17 @@ class Desk:
             before = image.convert("RGB").crop(box)
         deadline = time.monotonic() + timeout
         while True:
-            time.sleep(0.5)
             win = self._on_screen(self.window(query), False)
             now = screen.capture(win, max_width=base.width)
-            if (win.width, win.height) != (base.window_width, base.window_height):
+            # A resize, or a move to a monitor of another scale, changes the whole image.
+            if (now.width, now.height) != (base.width, base.height):
                 return now, (0, 0, now.width, now.height)
             with Image.open(now.path) as image:
                 diff = ImageChops.difference(before, image.convert("RGB").crop(box)).getbbox()
             if diff:
                 return now, (x + diff[0], y + diff[1], x + diff[2], y + diff[3])
             screen.discard(now)
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError(f"{win.cls} did not change from shot {shot} within {timeout:g}s")
+            time.sleep(min(0.5, remaining))

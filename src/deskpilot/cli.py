@@ -180,6 +180,8 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             return "ok"
         case "wait-for":
             if args.changed:
+                if args.gone or args.focused or args.title is not None or args.size:
+                    raise ValueError("--changed waits on pixels alone: drop --gone, --focused, --title and --size")
                 shot, box = desk.wait_changed(args.window, args.changed, args.timeout, args.region)
                 return {**shot.to_dict(), "changed": list(box)}
             if args.region:

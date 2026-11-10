@@ -510,7 +510,7 @@ def test_wait_for_returns_once_the_window_has_the_title_and_size_asked(tmp_path,
 
 def test_wait_changed_returns_a_shot_of_the_change_and_where_it_is(tmp_path, monkeypatch):
     desk, *_ = make_desk(tmp_path, monkeypatch)
-    frames = iter([None, None, (10, 20)])
+    frames = iter([None, None, (10, 20), (10, 20)])
 
     def grim(cmd, **kwargs):
         image = Image.new("RGB", (1266, 684))
@@ -527,3 +527,5 @@ def test_wait_changed_returns_a_shot_of_the_change_and_where_it_is(tmp_path, mon
     assert [r.stem for r in sorted(screen.shots_dir().glob("*.json"))] == sorted(["abc-1", base.id, shot.id])
     with pytest.raises(ValueError, match="not inside shot"):
         desk.wait_changed("battle", base.id, 5, (1200, 0, 100, 10))
+    with pytest.raises(TimeoutError, match="did not change from shot"):
+        desk.wait_changed("battle", shot.id, 0)
