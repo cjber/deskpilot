@@ -6,7 +6,7 @@ import subprocess
 
 
 class ClipboardError(RuntimeError):
-    pass
+    code = "unavailable"
 
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:

@@ -6,17 +6,19 @@ import functools
 from typing import Literal
 
 from mcp.server.mcpserver import Image, MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult, TextContent
 
-from .desk import EXPECTED, Desk
+from .desk import EXPECTED, Desk, error_code
 
 mcp = MCPServer("deskpilot")
 desk = Desk()
 
 
 def _tool(**options):
-    """Register a tool whose expected failures reach the agent as their message. The SDK reports any other
-    exception as only `Error executing tool <name>`, which hides why a click was refused."""
+    """Register a tool whose expected failures come back as an error result: `<code>: <message>` for the model to
+    read, and `{"code", "message"}` as structured content, the code one stable word (see `error_code`) a program
+    branches on. Returning the result rather than raising keeps the SDK's `Error executing tool <name>` prefix off it,
+    and any other exception reaches the agent as only that prefix, which would hide why a click was refused."""
 
     def register(fn):
         @functools.wraps(fn)
@@ -24,7 +26,12 @@ def _tool(**options):
             try:
                 return fn(*args, **kwargs)
             except EXPECTED as error:
-                raise ToolError(str(error)) from error
+                code = error_code(error)
+                return CallToolResult(
+                    content=[TextContent(type="text", text=f"{code}: {error}")],
+                    structured_content={"code": code, "message": str(error)},
+                    is_error=True,
+                )
 
         return mcp.tool(**options)(wrapper)
 
@@ -179,9 +186,11 @@ def drag(
 
 @_tool()
 def elements(window: str, show: bool = False, hidden: bool = False) -> dict:
-    """The window's accessibility tree: each element's id, role, name, states, text and bounds in window pixels.
-    click, hover, move and scroll take an id as `element` and act on where the app says it is now. An app that
-    exposes no tree is an error saying so."""
+    """The window's accessibility tree: each element's id, role, name, states, text and bounds in window pixels,
+    and on the root the snapshot id. click, hover, move and scroll take an id as `element` and act on where the app
+    says it is now. Each snapshot numbers its elements afresh: `<snapshot>:<id>` is refused (stale) once a newer
+    snapshot replaces that one, and an element whose role or name changed since is stale too. An app that exposes no
+    tree is an error (no_tree)."""
     return desk.elements(window, show, hidden).to_dict()
 
 

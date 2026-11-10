@@ -111,7 +111,10 @@ button.
 
 `elements` prints the window's accessibility tree (AT-SPI): each element's id, role, name, states, text and bounds
 in window pixels. `click`, `move`, `scroll` and `hover` take `--element ID` instead of a point, and act on the
-element's centre where the app reports it at that moment. GTK and Qt apps expose a tree; Chromium, Electron and
+element's centre where the app reports it at that moment. Each `elements` call prints a snapshot id, and
+`SNAPSHOT:e5` pins an id to that snapshot: it is refused as stale once a newer snapshot replaces it, since every
+snapshot numbers its elements afresh. An element whose role or name changed since is stale too, and one no longer
+showing is offscreen. GTK and Qt apps expose a tree; Chromium, Electron and
 Firefox expose one only when started with accessibility on (`--force-renderer-accessibility` for Chromium and
 Electron), and Wine games expose none. An app with no tree is an error saying so, never a guessed one.
 
@@ -149,6 +152,11 @@ id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`,
 `take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements` and
 `wait_changed` take `hidden`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
 keeps one input device open for the session.
+
+Every expected failure has a code, one stable word to branch on: `not_found`, `ambiguous`, `not_visible`,
+`offscreen`, `stale`, `covered` (another window is over the point), `gone` (the window closed), `refused`, `busy`,
+`no_tree`, `unavailable`, `timeout` or `invalid`. The CLI prints `deskpilot: CODE: message`. An MCP tool returns
+an error result whose text is `CODE: message` and whose structured content is `{"code": ..., "message": ...}`.
 
 ```sh
 claude mcp add deskpilot -- deskpilot mcp

@@ -35,6 +35,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Target elements of the accessibility tree.** `deskpilot elements` prints an app's AT-SPI tree with roles, names,
   states, text and bounds, and `--element ID` on `click`, `move`, `scroll` and `hover` acts where the app says the
   element is now (MCP `elements` and `element`). An app that exposes no tree says so.
+- **Element ids name their snapshot.** Each `elements` call has a snapshot id, and `SNAPSHOT:e5` refers to that
+  snapshot's element: once a newer snapshot replaces it, the id is refused as stale rather than read against the
+  new numbering. An element whose role or name changed since the snapshot is stale too, and one no longer showing
+  is offscreen.
+- **Errors carry a code.** Every expected failure starts with one stable word a program can branch on: not_found,
+  ambiguous, not_visible, offscreen, stale, covered, gone, refused, busy, no_tree, unavailable, timeout or invalid.
+  The CLI prints `deskpilot: CODE: message`; MCP returns an error result whose text is `CODE: message` and whose
+  structured content is `{"code", "message"}`. A click refused because another window is over the point is
+  `covered`.
 - **Clicks move the pointer before pressing.** Each click and scroll now sends a motion event at its point before
   the press, as a real pointer does, for clients that track the pointer from motion.
 

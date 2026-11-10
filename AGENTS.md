@@ -58,6 +58,8 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
   pressed however it ends.
 - An element is targeted where the app reports it when the action runs, never from a stale snapshot. An app that
   exposes no accessibility tree is an error, never a guessed tree.
+- An expected failure carries a code (`error_code` in `desk.py`), set where the failure is produced, as the plugin
+  does for `covered` and `gone`. Never derive a code from message text.
 - Tests never touch the real compositor, `/dev/uinput`, or `grim`. Pass fakes into `Desk` and
   `Hyprland`, as `tests/test_core.py` does.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change
