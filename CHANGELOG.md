@@ -9,7 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - **Act on windows out of view with `--hidden`.** `shot`, `click`, `scroll`, `drag`, `hover`, `elements` and
   `wait-for --changed` take `--hidden` (MCP `hidden`) to act on a window wherever it is, a hidden or special workspace
-  included, without switching workspace, showing a cursor, or touching your pointer, focus or screen. Native Wayland
+  included, without switching workspace, showing a cursor, or touching your pointer, focus or screen. Tooltips and
+  menus the window opens show in its screenshots and take clicks, and your own pointer moving meanwhile does not close
+  them. Native Wayland
   windows only: XWayland windows, and windows of the app your pointer is on, are refused.
 - **The agent cursor is drawn by the plugin.** It no longer needs `cua-driver`. It glides along an arc to each point
   before the action starts, shrinks with a ring at each press, follows drags as they move, and fades when idle.

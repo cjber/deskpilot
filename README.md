@@ -18,7 +18,8 @@ follows a drag as it moves, and fades after a few idle seconds. Window screensho
 `--hidden` acts on a window wherever it is, on a hidden or special workspace included, fully out of the user's
 view: no workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
 sends pointer input straight to that window's own client, and lets it draw while off screen so a screenshot after the
-action shows the result. It works for native Wayland windows. An XWayland window (X11 and Wine apps) is refused,
+action shows the result. Tooltips and menus it opens show in that screenshot and take its clicks, and they never
+grab the user's input. It works for native Wayland windows. An XWayland window (X11 and Wine apps) is refused,
 since X clients read the one X pointer only the user's pointer moves; so is a window of the app the user's pointer is
 on, and a drag and drop the press starts is cancelled.
 

@@ -75,6 +75,7 @@
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/ViewHitTester.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
+#include <hyprland/src/desktop/view/Popup.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/desktop/state/ViewQuery.hpp>
 #include <hyprland/src/desktop/state/ViewState.hpp>
@@ -946,6 +947,11 @@ namespace {
         op.focusChange.reset();
         if (op.mode == eMode::SHOWN && !op.down.empty())
             agentcursor::release();
+        // An action that ends early (an error, `end`, an unload) still lets go of every button it holds. A drag and
+        // drop started while it held one is its own, since the user's input is held meanwhile: it is cancelled rather
+        // than dropped wherever the pointer happened to be.
+        if (!op.down.empty())
+            PROTO::data->abortDndIfPresent();
 
         if (op.mode == eMode::HIDDEN) {
             // Every button it still holds goes up, and the client's pointer leaves its window.
@@ -954,10 +960,6 @@ namespace {
             hiddenLeave(op);
             pumpFrames(Desktop::viewState()->query().selector(std::format("address:0x{:x}", op.window)).runWindow());
         } else {
-            // An action that ends early (an error, `end`, an unload) still lets go of every button it holds. A drag and
-            // drop it started is cancelled rather than dropped wherever the pointer happened to be.
-            if (!op.down.empty())
-                PROTO::data->abortDndIfPresent();
             for (const auto BUTTON : op.down) {
                 g_pSeatManager->sendPointerButton(now(), BUTTON, WL_POINTER_BUTTON_STATE_RELEASED);
                 g_pSeatManager->sendPointerFrame();
@@ -1142,13 +1144,14 @@ namespace {
     //
     //   - A wl_pointer is on one surface at a time, so the client the user's pointer is on is refused: entering the
     //     window would take the pointer from under the user.
-    //   - Each change of the seat's pointer focus sends every client's pointer a leave. With no button down the window
-    //     is entered again at once; with one down the change ends the action, since the leave let the button go.
+    //   - Hyprland sends every client's pointer a leave on each change of the seat's pointer focus. The action's
+    //     pointer is spared it while the user's pointer moves between other clients (hkSetPointerFocus), so what the
+    //     hover raised stays up.
     //   - An XWayland window is refused: X clients read the pointer from the X server, which has one pointer for all
     //     of them, and only the seat's pointer moves it.
     //   - A drag and drop the press starts would follow the user's pointer, so it is cancelled and the action ends.
-    //   - A window off screen gets no frame callbacks, so after the action it gets them for PUMP, to draw what the
-    //     input changed before a screenshot.
+    //   - A window off screen gets no frame callbacks, so after input it and its popups get them for PUMP, to draw
+    //     what the input changed before a screenshot.
 
     struct SSeatPointers {
         friend constexpr auto member(SSeatPointers);
@@ -1228,10 +1231,11 @@ namespace {
             return;
         }
         op.focusChange = g_pSeatManager->m_events.pointerFocusChange.listen([] {
-            if (!g_op || g_op->mode != eMode::HIDDEN)
+            if (!g_op || g_op->mode != eMode::HIDDEN || !g_op->error.empty())
                 return;
-            if (!g_op->down.empty()) {
-                g_op->error = "the pointer focus changed while the action held a button, which let it go";
+            // A drag and drop the press started takes the seat's pointer focus; finish() cancels it.
+            if (!g_op->down.empty() && PROTO::data->dndActive()) {
+                g_op->error = "the press started a drag and drop, which a hidden action cannot carry: it was cancelled";
                 return;
             }
             if (hiddenReady(*g_op))
@@ -1325,7 +1329,17 @@ namespace {
             const auto WINDOW = ref.lock();
             if (!WINDOW->mapped() || g_pHyprRenderer->shouldRenderWindow(WINDOW) || !WINDOW->wlSurface() || !WINDOW->wlSurface()->resource())
                 continue;
-            WINDOW->wlSurface()->resource()->breadthfirst([&NOW](SP<CWLSurfaceResource> surface, const Vector2D&, void*) { surface->frame(NOW); }, nullptr);
+            const auto FRAME = [&NOW](SP<CWLSurfaceResource> surface, const Vector2D&, void*) { surface->frame(NOW); };
+            WINDOW->wlSurface()->resource()->breadthfirst(FRAME, nullptr);
+            // A popup (a menu, a tooltip) is a surface tree of its own, and draws only on its own frame callbacks.
+            if (const auto HEAD = WINDOW->popupHead()) {
+                HEAD->breadthfirst(
+                    [&FRAME](WP<Desktop::View::CPopup> popup, void*) {
+                        if (popup && popup->mapped() && popup->wlSurface() && popup->wlSurface()->resource())
+                            popup->wlSurface()->resource()->breadthfirst(FRAME, nullptr);
+                    },
+                    nullptr);
+            }
         }
         if (!g_pumped.empty())
             g_pumpTimer->updateTimeout(agentcursor::FRAME * 2);
@@ -1358,6 +1372,44 @@ namespace {
         if (WINDOW && !g_pHyprRenderer->shouldRenderWindow(WINDOW))
             return;
         reinterpret_cast<GrabFn>(g_grabHook->m_original)(self, popup);
+    }
+
+    // Hyprland sends every client's pointer a leave on each change of the seat's pointer focus, wherever it was. A
+    // hidden action's pointer is not the seat's: while the user's pointer moves between other clients' surfaces, the
+    // leave it would get there is not sent, so a tooltip or hover state the action raised stays up. A move onto a
+    // surface of the action's own client still leaves it, and the action is refused there (hiddenReady).
+    using PointerFocusFn = void (*)(CSeatManager*, SP<CWLSurfaceResource>, const Vector2D&);
+    using LeaveFn = void (*)(CWLPointerResource*);
+    CFunctionHook* g_pointerFocusHook = nullptr;
+    CFunctionHook* g_leaveHook        = nullptr;
+    bool           g_shieldHidden     = false;
+
+    void hkSetPointerFocus(CSeatManager* self, SP<CWLSurfaceResource> surface, const Vector2D& local) {
+        const auto OURS = g_op && g_op->mode == eMode::HIDDEN && g_op->surface.lock();
+        g_shieldHidden  = OURS && (!surface || surface->client() != g_op->surface.lock()->client());
+        reinterpret_cast<PointerFocusFn>(g_pointerFocusHook->m_original)(self, surface, local);
+        g_shieldHidden = false;
+    }
+
+    void hkSendLeave(CWLPointerResource* self) {
+        if (g_shieldHidden && g_op && std::ranges::any_of(g_op->pointers, [self](const auto& pointer) { return pointer.get() == self; }))
+            return;
+        reinterpret_cast<LeaveFn>(g_leaveHook->m_original)(self);
+    }
+
+    // Hyprland takes a popup of a window off screen as one that cannot take input, and both the popup hit test and a
+    // window capture leave out such popups: a tooltip or menu a hidden action opened would neither show in its
+    // screenshot nor take its clicks. Being on screen is no part of that here: the seat's own hit test only reaches
+    // windows on screen, and such a popup gets no grab (hkAddOrStartGrab), so the user's input still never goes there.
+    using PopupFocusFn = bool (*)(const Desktop::View::CPopup*);
+    CFunctionHook* g_popupFocusHook = nullptr;
+
+    bool hkPopupFocusAvailable(const Desktop::View::CPopup* self) {
+        if (reinterpret_cast<PopupFocusFn>(g_popupFocusHook->m_original)(self))
+            return true;
+        const auto WINDOW = self->windowOwner();
+        return WINDOW && WINDOW->mapped() && WINDOW->acceptsInput() && !g_pHyprRenderer->shouldRenderWindow(WINDOW) && self->wlSurface() &&
+            self->wlSurface()->resource();
     }
 
     // ---- paste ----
@@ -2194,6 +2246,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_activateHook = hook(handle, "CWindow", "activate", reinterpret_cast<void*>(&hkActivate));
     g_focusHook    = hook(handle, "CSeatManager", "setKeyboardFocus", reinterpret_cast<void*>(&hkSetKeyboardFocus));
     g_grabHook     = hook(handle, "CXDGShellProtocol", "addOrStartGrab", reinterpret_cast<void*>(&hkAddOrStartGrab));
+    g_pointerFocusHook = hook(handle, "CSeatManager", "setPointerFocus", reinterpret_cast<void*>(&hkSetPointerFocus));
+    g_leaveHook        = hook(handle, "CWLPointerResource", "sendLeave", reinterpret_cast<void*>(&hkSendLeave));
+    g_popupFocusHook   = hook(handle, "CPopup", "focusAvailable", reinterpret_cast<void*>(&hkPopupFocusAvailable));
 
     agentcursor::init();
     g_pumpTimer = makeShared<CEventLoopTimer>(std::nullopt, pumpTick, nullptr);
