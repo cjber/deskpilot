@@ -129,8 +129,9 @@ compositor, so they never trigger a Hyprland keybind: use `hyprctl dispatch` for
 type, and the user's clipboard stays as it is. XWayland windows share one clipboard, so `paste` refuses them: use
 `type`. `clipboard` reads the user's clipboard, and `clipboard --set` replaces it.
 
-Games read keys once per frame, so type into them with `--delay 0.1` or more: each key is held that long, with the
-same gap before the next.
+`type` sends keys as fast as the app reads them, about 1 KB a second into Chrome. Games read keys once per frame,
+so type into them with `--delay 0.1` or more: each key is held that long, with the same gap before the next. For
+long text, `paste` is faster still.
 
 `wait-for` waits for a window to appear, or with `--gone` to close. `--focused`, `--title TEXT` and `--size WxH` also
 wait for it to have keyboard focus, a title containing TEXT or that size. `--changed SHOT` waits until the window
