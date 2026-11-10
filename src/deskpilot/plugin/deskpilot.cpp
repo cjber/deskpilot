@@ -3,9 +3,10 @@
 // `hyprctl deskpilot click <window> <x> <y> <button> <count>` and `hyprctl deskpilot scroll <window> <x> <y> <dy>`
 // run one input sequence on the user's own seat, so every client receives them, XWayland and Wine included:
 //
-//   1. The user's mouse input is held through hooks on CInputManager's onMouseMoved, onMouseButton and
-//      onMouseWheel, which see the device as well as the event: a replayed release must name the device that
-//      pressed, or Hyprland drops it and the button stays held. Nothing the user does can move the pointer mid-click.
+//   1. The user's pointer input is held through hooks on CInputManager's mouse and tablet handlers (onMouseMoved,
+//      onMouseWarp, onMouseButton, onMouseWheel, onTabletAxis, onTabletProximity, onTabletTip and onTabletButton),
+//      which see the device as well as the event: a replayed release must name the device that pressed, or Hyprland
+//      drops it and the button stays held. Nothing the user does can move the pointer mid-click.
 //   2. The cursor image is hidden, the pointer warps to the point, and the window under it must be <window>;
 //      anything else on top refuses before any press is sent. Only the seat's pointer focus moves: Hyprland's
 //      focus-follows-mouse and click-to-focus never run, so keyboard focus stays on the user's window and the
@@ -15,9 +16,9 @@
 //      sees them as separate events. Before each press or wheel notch Hyprland's hit tester must still find <window>
 //      at the point and the seat's pointer focus must still be on it, so a window, layer surface or popup that
 //      appears mid-sequence never has the click passed on to it. Releases always go, so no button is left down.
-//   4. The pointer goes back to where the user left it plus the motion they made meanwhile, keyboard focus goes
-//      back to the surface that had it if anything moved it, the cursor's visibility is restored and the held input
-//      is replayed.
+//   4. The pointer goes back to where the user left it, keyboard focus goes back to the surface that had it if
+//      anything moved it, the cursor's visibility is restored, and the held input is replayed in the order it came
+//      through Hyprland's own handlers, so the user's motion keeps its acceleration and reaches pointer-locked games.
 //
 // `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
 // without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
@@ -68,6 +69,7 @@
 #include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/desktop/view/window/X11Backend.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
+#include <hyprland/src/devices/Tablet.hpp>
 #include <hyprland/src/helpers/defer/Promise.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/ipc/s1/S1.hpp>
@@ -120,10 +122,7 @@ constexpr const char* VERSION = DESKPILOT_SOURCE;
 inline HANDLE PHANDLE = nullptr;
 
 namespace {
-    using MoveFn     = void (*)(CInputManager*, IPointer::SMotionEvent);
-    using ButtonFn   = void (*)(CInputManager*, IPointer::SButtonEvent, SP<IPointer>);
     using ActivateFn = void (*)(Desktop::View::CWindow*, bool);
-    using WheelFn    = void (*)(CInputManager*, IPointer::SAxisEvent, SP<IPointer>);
     using KeyFn      = void (*)(CInputManager*, const IKeyboard::SKeyEvent&, SP<IKeyboard>);
     using ModFn      = void (*)(CInputManager*, SP<IKeyboard>);
     using FocusFn    = void (*)(CSeatManager*, SP<CWLSurfaceResource>);
@@ -176,7 +175,6 @@ namespace {
         int                                count  = 0;
         int                                scroll = 0; // wheel notches, positive up; 0 for a click
         Vector2D                           saved;
-        Vector2D                           heldMotion;
         bool                               hadFocus = false;
         PHLWINDOWREF                       focusWindow;
         WP<CWLSurfaceResource>             focusSurface;
@@ -189,8 +187,13 @@ namespace {
     };
 
     CFunctionHook*     g_moveHook     = nullptr;
+    CFunctionHook*     g_warpHook     = nullptr;
     CFunctionHook*     g_buttonHook   = nullptr;
     CFunctionHook*     g_wheelHook    = nullptr;
+    CFunctionHook*     g_tabletAxis   = nullptr;
+    CFunctionHook*     g_tabletNear   = nullptr;
+    CFunctionHook*     g_tabletTip    = nullptr;
+    CFunctionHook*     g_tabletButton = nullptr;
     CFunctionHook*     g_keyHook      = nullptr;
     CFunctionHook*     g_modHook      = nullptr;
     CFunctionHook*     g_activateHook = nullptr;
@@ -270,24 +273,24 @@ namespace {
         return true;
     }
 
-    void hkOnMouseMoved(CInputManager* self, IPointer::SMotionEvent e) {
-        if (g_op) {
-            g_op->heldMotion += e.delta;
-            return;
-        }
-        if (holdForStroke([self, e] { reinterpret_cast<MoveFn>(g_moveHook->m_original)(self, e); }))
-            return;
-        reinterpret_cast<MoveFn>(g_moveHook->m_original)(self, e);
-    }
-
-    void hkOnMouseButton(CInputManager* self, IPointer::SButtonEvent e, SP<IPointer> mouse) {
-        auto replay = [self, e, mouse] { reinterpret_cast<ButtonFn>(g_buttonHook->m_original)(self, e, mouse); };
+    // The user's pointer input during an action: each event is held while a click or scroll runs, or a keystroke is
+    // held, and replayed after it in the order it came, through Hyprland's own handler, so acceleration, relative
+    // motion for pointer-locked games and absolute devices work as they would have.
+    // A held event is replayed with the time it is replayed at, so it never reaches a client dated before the
+    // agent's own events that went ahead of it.
+    template <CFunctionHook*& HOOK, typename EVENT, typename... REST>
+    void holdPointer(CInputManager* self, EVENT event, REST... rest) {
+        auto run    = [self, rest...](EVENT e) { reinterpret_cast<void (*)(CInputManager*, EVENT, REST...)>(HOOK->m_original)(self, e, rest...); };
+        auto replay = [run, event]() mutable {
+            event.timeMs = now();
+            run(event);
+        };
         if (g_op) {
             g_op->heldInput.emplace_back(replay);
             return;
         }
         if (!holdForStroke(replay))
-            replay();
+            run(event);
     }
 
     // A client clicked or typed into while unfocused asks to be activated (an X client sends _NET_ACTIVE_WINDOW), and
@@ -301,15 +304,6 @@ namespace {
         reinterpret_cast<ActivateFn>(g_activateHook->m_original)(self, force);
     }
 
-    void hkOnMouseWheel(CInputManager* self, IPointer::SAxisEvent e, SP<IPointer> pointer) {
-        auto replay = [self, e, pointer] { reinterpret_cast<WheelFn>(g_wheelHook->m_original)(self, e, pointer); };
-        if (g_op) {
-            g_op->heldInput.emplace_back(replay);
-            return;
-        }
-        if (!holdForStroke(replay))
-            replay();
-    }
 
     void hkOnKeyboardKey(CInputManager* self, const IKeyboard::SKeyEvent& e, SP<IKeyboard> keyboard) {
         auto replay = [self, e, keyboard] { reinterpret_cast<KeyFn>(g_keyHook->m_original)(self, e, keyboard); };
@@ -526,7 +520,7 @@ namespace {
         g_op.reset();
         dropTimer(op.timer);
 
-        Pointer::mgr()->warpTo(op.saved + op.heldMotion);
+        Pointer::mgr()->warpTo(op.saved);
         enterUnderPointer();
         // Keyboard focus goes back to the window, layer surface or nothing that had it. One that closed meanwhile
         // leaves focus where Hyprland put it.
@@ -1396,9 +1390,14 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error("deskpilot: built for another Hyprland version, rebuild it with `deskpilot plugin build`");
     }
 
-    g_moveHook     = hook(handle, "CInputManager", "onMouseMoved", reinterpret_cast<void*>(&hkOnMouseMoved));
-    g_buttonHook   = hook(handle, "CInputManager", "onMouseButton", reinterpret_cast<void*>(&hkOnMouseButton));
-    g_wheelHook    = hook(handle, "CInputManager", "onMouseWheel", reinterpret_cast<void*>(&hkOnMouseWheel));
+    g_moveHook     = hook(handle, "CInputManager", "onMouseMoved", reinterpret_cast<void*>(&holdPointer<g_moveHook, IPointer::SMotionEvent>));
+    g_warpHook     = hook(handle, "CInputManager", "onMouseWarp", reinterpret_cast<void*>(&holdPointer<g_warpHook, IPointer::SMotionAbsoluteEvent>));
+    g_buttonHook   = hook(handle, "CInputManager", "onMouseButton", reinterpret_cast<void*>(&holdPointer<g_buttonHook, IPointer::SButtonEvent, SP<IPointer>>));
+    g_wheelHook    = hook(handle, "CInputManager", "onMouseWheel", reinterpret_cast<void*>(&holdPointer<g_wheelHook, IPointer::SAxisEvent, SP<IPointer>>));
+    g_tabletAxis   = hook(handle, "CInputManager", "onTabletAxis", reinterpret_cast<void*>(&holdPointer<g_tabletAxis, CTablet::SAxisEvent>));
+    g_tabletNear   = hook(handle, "CInputManager", "onTabletProximity", reinterpret_cast<void*>(&holdPointer<g_tabletNear, CTablet::SProximityEvent>));
+    g_tabletTip    = hook(handle, "CInputManager", "onTabletTip", reinterpret_cast<void*>(&holdPointer<g_tabletTip, CTablet::STipEvent>));
+    g_tabletButton = hook(handle, "CInputManager", "onTabletButton", reinterpret_cast<void*>(&holdPointer<g_tabletButton, CTablet::SButtonEvent>));
     g_keyHook      = hook(handle, "CInputManager", "onKeyboardKey", reinterpret_cast<void*>(&hkOnKeyboardKey));
     g_modHook      = hook(handle, "CInputManager", "onKeyboardMod", reinterpret_cast<void*>(&hkOnKeyboardMod));
     g_activateHook = hook(handle, "CWindow", "activate", reinterpret_cast<void*>(&hkActivate));

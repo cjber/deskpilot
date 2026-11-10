@@ -22,10 +22,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Wait for what is on screen.** `wait-for` takes `--focused`, `--title TEXT` and `--size WxH`, and `--changed SHOT`
   (with an optional `--region X Y W H`) waits until the window looks different from that shot, then prints a shot of
   the change and the box that changed (MCP `wait_for` and `wait_changed`).
-
 - **Dropdowns stay open with `click --take-focus`.** Chrome and other apps close a menu or dropdown when their
   window is not the focused one, so a click that left the user's focus in place closed the list it opened.
   `click --take-focus` (MCP `take_focus`) focuses the window first and leaves it focused.
+- **Your mouse moves as usual during an agent's click.** Motion made while a click or scroll ran was added up and
+  applied as one jump, skipping pointer acceleration and the relative motion a pointer-locked game reads, and a
+  tablet or other absolute device could move the pointer mid-click. All of it is now held and replayed in order
+  through Hyprland's own handling.
 
 ## [0.2.1] - 2026-11-10
 
