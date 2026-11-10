@@ -128,6 +128,11 @@ def _path_commands(sub) -> None:
 
     s = sub.add_parser("elements", help="print a window's accessibility tree, with ids that --element takes")
     s.add_argument("window")
+    s.add_argument(
+        "--peek",
+        action="store_true",
+        help="read the tree without replacing the latest snapshot, whose ids stay good; a peek's ids name nothing",
+    )
     _view_args(s)
 
 
@@ -308,8 +313,10 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             )
             return {"x": gx, "y": gy}
         case "elements":
-            tree = desk.elements(args.window, args.show, args.hidden).to_dict()
-            return tree if args.json else [f"snapshot {tree['snapshot']}", *_tree(tree)]
+            tree = desk.elements(args.window, args.show, args.hidden, args.peek).to_dict()
+            if args.json:
+                return tree
+            return [f"snapshot {tree['snapshot']}", *_tree(tree)] if "snapshot" in tree else _tree(tree)
         case "key":
             desk.key(args.combo, args.window, args.take_focus, args.hold)
             return "ok"
