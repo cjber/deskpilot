@@ -26,8 +26,9 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    refused.
 5. Type with `deskpilot type "TEXT" --window WINDOW` and press keys with `deskpilot key ctrl+a --window WINDOW`. Games
    read keys once per frame, so add `--delay 0.1` or more for them: each key is held that long, with the same gap
-   before the next. Text is typed on a US layout, and a character it cannot type is an error. Several agents may act
-   at once: actions run one after another in arrival order, and one `type` is never interleaved with another's keys.
+   before the next. Text arrives as written on the user's keymap; a character no key on it types is an error.
+   Several agents may act at once: actions run one after another in arrival order, and one `type` is never
+   interleaved with another's keys.
 6. Take a new `shot` after each action that changes the window, and confirm the result before the next step.
    `deskpilot wait-for WINDOW --timeout 120` waits for a window to open, and `--gone` for it to close.
 
@@ -36,15 +37,16 @@ Done when a fresh `shot` shows the state the user asked for.
 ## Taking the user's pointer or focus
 
 By default the user's pointer and keyboard focus stay where they are, so the user can keep working. Two flags take
-them instead, through a virtual input device that needs write access to `/dev/uinput`:
+them instead:
 
-- `--take-pointer` on `click`, `move` or `scroll` moves the user's own pointer there. Use it only when the app must
-  see a hover, such as a tooltip or a menu that opens on mouse-over.
+- `--take-pointer` on `click`, `move` or `scroll` moves the user's own pointer there, through a virtual mouse that
+  needs write access to `/dev/uinput`. Use it only when the app must see a hover, such as a tooltip or a menu that
+  opens on mouse-over.
 - `--take-focus` on `key` or `type` focuses the window and leaves it focused. Use it only for an app that ignores
   keys while unfocused, after a plain `--window` attempt did nothing.
 
 Both interrupt whatever the user is doing, so tell the user before using them. `key` and `type` without `--window`
-also press into whatever has focus, which may be the user's own window: always pass `--window`.
+press into the focused window, which may be the user's own: always pass `--window`.
 
 ## Errors
 

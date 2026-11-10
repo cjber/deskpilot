@@ -28,8 +28,8 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
   compositor and puts the user's pointer and focus back
 - `src/deskpilot/screen.py`: grim toplevel screenshots, shot ids, and the mapping from shot pixels back to the screen
 - `src/deskpilot/overlay.py`: the agent cursor, drawn by `cua-driver`
-- `src/deskpilot/uinput.py`: the virtual mouse and keyboard behind `--take-pointer` and `--take-focus`
-- `src/deskpilot/keys.py`: key names, chords and US-layout text to Linux key codes
+- `src/deskpilot/uinput.py`: the virtual mouse behind `--take-pointer`
+- `src/deskpilot/keys.py`: key names, chords and text as the plugin's key events
 
 ## Rules
 
@@ -43,7 +43,8 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 - A window name that matches several windows is an error listing them, and a point outside the window or under
   another window is refused. Never guess a target.
 - The agent cursor is feedback, never input: any overlay failure turns it off and the action goes ahead.
-- Text is typed on a US layout. A character it cannot type is an error, never skipped.
+- Text is typed as written on the user's active keymap, resolved in the plugin, never through a fixed layout table.
+  A character no key on that keymap gives is an error, never skipped.
 - Tests never touch the real compositor, `/dev/uinput`, `grim` or `cua-driver`. Pass fakes into `Desk` and
   `Hyprland`, as `tests/test_core.py` does.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change

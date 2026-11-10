@@ -1,16 +1,14 @@
-"""A virtual mouse and keyboard through /dev/uinput.
+"""A virtual mouse through /dev/uinput, behind `--take-pointer`.
 
-The compositor sees the device as real hardware, so its clicks and keys reach every client, XWayland and Wine
-included, where XTest (`xdotool`) and the virtual-keyboard protocol (`wtype`) can be ignored. Pointer position is
-set by the compositor (see hypr.Hyprland.move_cursor); this device only presses buttons, scrolls and nudges.
+The compositor sees the device as real hardware, so its clicks reach every client, XWayland and Wine included, where
+XTest (`xdotool`) can be ignored. Pointer position is set by the compositor (see hypr.Hyprland.move_cursor); this
+device only presses buttons, scrolls and nudges.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-
-from . import keys
 
 BUTTONS = {"left": "BTN_LEFT", "right": "BTN_RIGHT", "middle": "BTN_MIDDLE"}
 # libinput adds a new device asynchronously; events sent before it is added are lost.
@@ -23,7 +21,7 @@ class VirtualInput:
         from evdev import ecodes as e
 
         self._e = e
-        key_codes = sorted({getattr(e, name) for name in BUTTONS.values()} | set(keys.all_codes()))
+        key_codes = sorted(getattr(e, name) for name in BUTTONS.values())
         caps: dict[int, Sequence[int]] = {e.EV_KEY: key_codes, e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL]}
         self._ui = UInput(caps, name="deskpilot")
         time.sleep(settle)
@@ -68,29 +66,3 @@ class VirtualInput:
         for _ in range(abs(dx)):
             self._emit(e.EV_REL, e.REL_HWHEEL, 1 if dx > 0 else -1)
             time.sleep(0.03)
-
-    def key(self, code: int, down: bool) -> None:
-        self._emit(self._e.EV_KEY, code, 1 if down else 0)
-
-    def chord(self, combo: str, hold: float = 0.04) -> None:
-        """Press a combination such as 'ctrl+shift+t' or 'Return': modifiers down, key tapped, modifiers up."""
-        codes = keys.parse_chord(combo)
-        for code in codes:
-            self.key(code, True)
-            time.sleep(0.01)
-        time.sleep(hold)
-        for code in reversed(codes):
-            self.key(code, False)
-            time.sleep(0.01)
-
-    def type_text(self, text: str, delay: float = 0.03) -> None:
-        """Type text on a US layout. Games drop keys sent faster than a frame, so raise delay for them."""
-        for code, shift in keys.text_strokes(text):
-            if shift:
-                self.key(keys.SHIFT, True)
-            self.key(code, True)
-            time.sleep(0.01)
-            self.key(code, False)
-            if shift:
-                self.key(keys.SHIFT, False)
-            time.sleep(delay)

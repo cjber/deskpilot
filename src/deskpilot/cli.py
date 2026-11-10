@@ -3,9 +3,9 @@
 Coordinates for move, click and scroll are pixels in the window's last `deskpilot shot`, so read the screenshot,
 pick a point, click it. Pass --scale 1 to give window pixels instead.
 
-Clicks, scrolls, and keys and text sent to a --window run inside the compositor through the deskpilot Hyprland plugin
-(`deskpilot plugin load`), so the user's pointer and keyboard focus stay where they are. --take-pointer and
---take-focus move the user's own pointer or focus instead.
+Clicks, scrolls, keys and text run inside the compositor through the deskpilot Hyprland plugin (`deskpilot plugin
+load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on the user's
+keymap. --take-pointer and --take-focus move the user's own pointer or focus instead.
 """
 
 from __future__ import annotations
@@ -74,13 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("plugin", help="build, load or check the deskpilot Hyprland plugin")
     s.add_argument("action", choices=["build", "load", "status"])
 
-    focus_help = "focus the window and press through the input device instead of leaving focus in place"
+    focus_help = "focus the window first and leave it focused, for an app that ignores keys while unfocused"
     s = sub.add_parser("key", help="press a key or chord, e.g. Return, ctrl+a, alt+F4")
     s.add_argument("combo")
     s.add_argument("--window", help="press it in this window; without it the keys go to the focused window")
     s.add_argument("--take-focus", action="store_true", help=focus_help)
 
-    s = sub.add_parser("type", help="type text (US layout)")
+    s = sub.add_parser("type", help="type text as written, on the user's keymap")
     s.add_argument("text")
     s.add_argument("--window", help="type into this window; without it the keys go to the focused window")
     s.add_argument("--take-focus", action="store_true", help=focus_help)

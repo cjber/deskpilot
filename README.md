@@ -19,10 +19,13 @@ the user's modifiers never leak into them. X11 apps take keys only from the wind
 XWayland target gets X focus for each stroke and sees a focus-in and focus-out around it; Hyprland's own focus
 does not move.
 
-`--take-pointer` and `--take-focus` use a virtual input device made with `/dev/uinput` instead, which the
-compositor treats as real hardware. Tools that synthesize input another way, such as `xdotool` (XTest) or `wtype`
-(the virtual keyboard protocol), are ignored by some clients: Battle.net drops `xdotool` clicks, and a game drops
-`wtype` keys.
+Text is typed as written on the user's own keymap, whatever its layout and with Caps Lock on: the plugin finds the
+key that gives each character on the active keyboard's keymap, which every client has, and sets the modifiers it
+needs directly. A character no key on that keymap gives is an error rather than skipped.
+
+`--take-pointer` uses a virtual mouse made with `/dev/uinput` instead, which the compositor treats as real
+hardware. Tools that synthesize input another way, such as `xdotool` (XTest), are ignored by some clients:
+Battle.net drops `xdotool` clicks.
 
 ## Requirements
 
@@ -31,8 +34,8 @@ compositor treats as real hardware. Tools that synthesize input another way, suc
   Arch's `hyprland` package), `libxcb` and `libxkbcommon`.
 - Optional: `cua-driver` for the agent cursor.
 - `grim` for screenshots.
-- For `--take-pointer`, `--take-focus` and keys without `--window`: write access to `/dev/uinput`, usually through
-  the `input` group or a udev ACL. Check with `test -w /dev/uinput`.
+- For `--take-pointer`: write access to `/dev/uinput`, usually through the `input` group or a udev ACL. Check with
+  `test -w /dev/uinput`.
 - Python 3.12 or later and `uv`.
 
 ## Install
@@ -78,8 +81,9 @@ pointer there and press through the input device instead, for a hover the app mu
 A shell started before Hyprland restarted keeps a stale `HYPRLAND_INSTANCE_SIGNATURE`. deskpilot then talks to
 the one instance whose socket answers, and with several live instances it stops and names them.
 
-`key` and `type` without `--window` press keys into whatever has focus. `--take-focus` focuses the window and
-leaves it focused, for an app that ignores keys while unfocused.
+`key` and `type` without `--window` press keys into the focused window. `--take-focus` focuses the window first and
+leaves it focused, for an app that ignores keys while unfocused. Keys go to the window's client, not through the
+compositor, so they never trigger a Hyprland keybind: use `hyprctl dispatch` for those.
 
 Games read keys once per frame, so type into them with `--delay 0.1` or more: each key is held that long, with the
 same gap before the next.
@@ -100,7 +104,8 @@ claude mcp add deskpilot -- deskpilot mcp
 
 ## Limits
 
-- Text is typed on a US layout; a character that layout cannot type is an error rather than skipped.
+- Text can only contain characters the active keymap types; a character it lacks (such as `é` on a US layout) is
+  an error rather than skipped.
 - Hyprland plugins load only into the exact Hyprland they were built against, so `deskpilot plugin load` builds
   one per Hyprland commit and plugin source under `~/.local/share/deskpilot`, and replaces a loaded build of
   other source.

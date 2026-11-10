@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Text arrives as written on any keyboard layout.** `type` and `key` used US key positions, so another layout or
+  Caps Lock typed other characters. The plugin now finds the key for each character on the active keymap and sets
+  the modifiers it needs, keeping Caps Lock and the layout. A character the keymap cannot type is refused with its
+  code point. `key A` types a capital A, and a chord's letter (`ctrl+a`) is the key that gives it on the layout.
+- **Keys always go through the plugin.** `--take-focus` focuses the window and then sends keys as `--window` does,
+  and `key` and `type` without `--window` go to the focused window, so neither needs `/dev/uinput` any more. These
+  keys do not trigger Hyprland keybinds.
+
 ## [0.2.1] - 2026-11-10
 
 - **Reloading the plugin no longer crashes Hyprland.** Loading a plugin build that had already been loaded and
