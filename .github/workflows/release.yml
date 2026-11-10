@@ -1,7 +1,7 @@
 name: Release
 
-# Pushing a vX.Y.Z tag publishes a GitHub release whose notes are that version's CHANGELOG.md entry. The tag must be
-# on main, where CI has already checked the commit.
+# Pushing a vX.Y.Z tag publishes a GitHub release whose notes are that version's CHANGELOG.md entry, then uploads
+# the package to PyPI through trusted publishing. The tag must be on main, where CI has already checked the commit.
 on:
   push:
     tags: ["v*.*.*"]
@@ -47,3 +47,29 @@ jobs:
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
           fi
+
+  pypi:
+    name: PyPI
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/deskpilot/
+    permissions:
+      id-token: write # trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.18"
+          enable-cache: false
+
+      - name: Build
+        run: uv build
+
+      - name: Publish
+        run: uv publish --trusted-publishing always
