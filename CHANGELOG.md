@@ -19,6 +19,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   so text the keymap cannot type and long text arrive whole. XWayland windows share one clipboard and are refused.
 - **Read and write the clipboard.** `deskpilot clipboard` prints the clipboard's text and `--set TEXT` replaces it (MCP
   `clipboard` and `copy_text`).
+- **Wait for what is on screen.** `wait-for` takes `--focused`, `--title TEXT` and `--size WxH`, and `--changed SHOT`
+  (with an optional `--region X Y W H`) waits until the window looks different from that shot, then prints a shot of
+  the change and the box that changed (MCP `wait_for` and `wait_changed`).
 
 ## [0.2.1] - 2026-11-10
 

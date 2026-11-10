@@ -6,7 +6,8 @@ description: Click, scroll and type in desktop app windows on Hyprland with the 
 # deskpilot
 
 Run `deskpilot --help` for the command list, and put `--json` before the command for JSON output. Over MCP the same
-actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `key`, `type_text`, `paste_text`, `clipboard`, `copy_text` and `wait_for`.
+actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `key`, `type_text`, `paste_text`,
+`clipboard`, `copy_text`, `wait_for` and `wait_changed`.
 
 If `deskpilot` is not on `PATH`, ask the user before installing it with
 `uv tool install deskpilot`.
@@ -33,7 +34,10 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    Several agents may act at once: actions run one after another in arrival order, and one `type` is never
    interleaved with another's keys.
 6. Take a new `shot` after each action that changes the window, and confirm the result before the next step.
-   `deskpilot wait-for WINDOW --timeout 120` waits for a window to open, and `--gone` for it to close.
+   `deskpilot wait-for WINDOW --timeout 120` waits for a window to open, and `--gone` for it to close; `--focused`,
+   `--title TEXT` and `--size WxH` wait for those. After an action whose result takes time to show, wait with
+   `deskpilot wait-for WINDOW --changed ID` (optionally `--region X Y W H` in that shot's pixels) instead of
+   sleeping: it returns a shot of the change, so read that shot rather than taking another.
 
 Done when a fresh `shot` shows the state the user asked for.
 

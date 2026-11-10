@@ -496,3 +496,36 @@ def test_clipboard_reads_plain_text_and_not_another_text_type(monkeypatch):
         clipboard.read()
     offered.append("text/plain")
     assert clipboard.read() == "café" and asked == ["text/plain"]
+
+
+def test_wait_for_returns_once_the_window_has_the_title_and_size_asked(tmp_path, monkeypatch):
+    desk, fake, *_ = make_desk(tmp_path, monkeypatch)
+    changes = iter([{"title": "Battle.net - Login"}, {"size": [800, 600]}])
+    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda _: fake.clients[0].update(next(changes)))
+    win = desk.wait_for("battle", 5, title="Login", size=(800, 600))
+    assert (win.title, win.width, win.height) == ("Battle.net - Login", 800, 600)
+    with pytest.raises(TimeoutError, match="is not 1x1 after 0s"):
+        desk.wait_for("battle", 0, title="Login", size=(1, 1))
+
+
+def test_wait_changed_returns_a_shot_of_the_change_and_where_it_is(tmp_path, monkeypatch):
+    desk, *_ = make_desk(tmp_path, monkeypatch)
+    frames = iter([None, None, (10, 20), (10, 20)])
+
+    def grim(cmd, **kwargs):
+        image = Image.new("RGB", (1266, 684))
+        if (dot := next(frames)) is not None:
+            image.putpixel(dot, (255, 255, 255))
+        image.save(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(screen.subprocess, "run", grim)
+    monkeypatch.setattr("deskpilot.desk.time.sleep", lambda _: None)
+    base = desk.shot("battle")
+    shot, box = desk.wait_changed("battle", base.id, 5)
+    assert box == (10, 20, 11, 21) and Image.open(shot.path).getpixel((10, 20)) == (255, 255, 255)
+    assert [r.stem for r in sorted(screen.shots_dir().glob("*.json"))] == sorted(["abc-1", base.id, shot.id])
+    with pytest.raises(ValueError, match="not inside shot"):
+        desk.wait_changed("battle", base.id, 5, (1200, 0, 100, 10))
+    with pytest.raises(TimeoutError, match="did not change from shot"):
+        desk.wait_changed("battle", shot.id, 0)
