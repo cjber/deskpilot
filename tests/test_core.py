@@ -502,6 +502,8 @@ def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
     """An expected failure is an error result carrying its code, both in the text and as structured content."""
     import asyncio
 
+    from mcp.types import CallToolResult, TextContent
+
     from deskpilot import mcp_server
 
     desk, fake, _, _ = make_desk(tmp_path, monkeypatch)
@@ -510,9 +512,11 @@ def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
 
     def refusal(tool, arguments):
         result = asyncio.run(mcp_server.mcp.call_tool(tool, arguments))
-        assert result.is_error
-        assert result.content[0].text == f"{result.structured_content['code']}: {result.structured_content['message']}"
-        return result.structured_content
+        assert isinstance(result, CallToolResult) and result.is_error
+        text, refused = result.content[0], result.structured_content
+        assert isinstance(text, TextContent) and refused is not None
+        assert text.text == f"{refused['code']}: {refused['message']}"
+        return refused
 
     assert refusal("click", {"window": "battle", "x": 1, "y": 1})["code"] == "not_visible"
     assert "is not on screen" in refusal("click", {"window": "battle", "x": 1, "y": 1})["message"]
