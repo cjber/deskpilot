@@ -201,7 +201,7 @@ class Desk:
         self.plugin.keys(target.address, keys.chord_words(combo), paste=text)
 
     def clipboard(self) -> str:
-        """The user's clipboard text, "" when nothing is copied."""
+        """The user's clipboard text."""
         return clipboard.read()
 
     def set_clipboard(self, text: str) -> None:

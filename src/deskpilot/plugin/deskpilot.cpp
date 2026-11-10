@@ -769,6 +769,8 @@ namespace {
             const auto& TEXT  = write->source->m_text;
             while (!(mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) && write->written < TEXT.size()) {
                 const auto N = ::write(write->fd.get(), TEXT.data() + write->written, TEXT.size() - write->written);
+                if (N < 0 && errno == EINTR)
+                    continue;
                 if (N < 0 && errno == EAGAIN)
                     return 0;
                 if (N <= 0)

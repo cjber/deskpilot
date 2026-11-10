@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 import pytest
 from PIL import Image
 
-from deskpilot import keys, screen
+from deskpilot import clipboard, keys, screen
 from deskpilot.desk import Desk, NotVisible
 from deskpilot.hypr import (
     AmbiguousWindow,
@@ -480,3 +480,19 @@ def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "desk", desk)
     with pytest.raises(ToolError, match="is not on screen"):
         asyncio.run(mcp_server.mcp.call_tool("click", {"window": "battle", "x": 1, "y": 1}))
+
+
+def test_clipboard_reads_plain_text_and_not_another_text_type(monkeypatch):
+    offered, asked = ["text/x-moz-url", "text/html"], []
+
+    def wl_paste(cmd, **kwargs):
+        if cmd[1] == "--list-types":
+            return subprocess.CompletedProcess(cmd, 0, "\n".join(offered), "")
+        asked.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "café".encode(), b"")
+
+    monkeypatch.setattr(clipboard.subprocess, "run", wl_paste)
+    with pytest.raises(clipboard.ClipboardError, match="no plain text; it offers text/x-moz-url, text/html"):
+        clipboard.read()
+    offered.append("text/plain")
+    assert clipboard.read() == "café" and asked == ["text/plain"]

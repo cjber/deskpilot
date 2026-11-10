@@ -116,7 +116,7 @@ def paste_text(text: str, window: str | None = None, take_focus: bool = False, k
 
 @_tool()
 def clipboard() -> str:
-    """The user's clipboard text, "" when nothing is copied."""
+    """The user's clipboard text. An empty clipboard, or one holding no text, is an error saying so."""
     return desk.clipboard()
 
 
