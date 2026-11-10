@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **Paste works in Chrome.** Chrome reads a pasted text as soon as it is offered, and the window's clipboard was
+  taken back after that first read, so Chrome pasted nothing. The text now stays the window's clipboard for 10
+  seconds, or until the next paste.
 - **Act on windows out of view with `--hidden`.** `shot`, `click`, `scroll`, `drag`, `hover`, `elements` and
   `wait-for --changed` take `--hidden` (MCP `hidden`) to act on a window wherever it is, a hidden or special workspace
   included, without switching workspace, showing a cursor, or touching your pointer, focus or screen. Tooltips and
