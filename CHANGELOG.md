@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-10
+
 - **Typing no longer flickers a window's title bar.** Keys went to a window with a keyboard enter and leave around
   each keystroke, so an app that draws its own title bar, such as Chrome, redrew it focused and unfocused for every
   character. The window is now entered once for the whole sequence.
