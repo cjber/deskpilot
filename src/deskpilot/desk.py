@@ -20,7 +20,7 @@ from .plugin import BUTTON_CODES, Plugin, PluginError
 
 
 class NotVisible(LookupError):
-    pass
+    code = "not_visible"
 
 
 # Failures an agent should read and act on: a refusal, a missing window, a tool that failed. Anything else is a bug.
@@ -34,6 +34,21 @@ EXPECTED = (
     TimeoutError,
     RuntimeError,
 )
+
+
+def error_code(error: BaseException) -> str:
+    """The kind of an expected failure, one stable word a program branches on rather than reading the message:
+    not_found, ambiguous, not_visible, offscreen, stale, covered, gone, refused, busy, no_tree, unavailable, timeout or
+    invalid."""
+    code = getattr(error, "code", None)
+    if isinstance(code, str):
+        return code
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ValueError):
+        return "invalid"
+    return "refused"
+
 
 # How long `show` waits for a focused window to come on screen: a workspace switch or a scrolling layout's
 # animation has to finish before the window's area is its own.

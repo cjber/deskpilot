@@ -236,6 +236,9 @@ namespace {
         SP<CEventLoopTimer>                timer;
         uint64_t                           ticket = 0;
         std::string                        error;
+        // What kind of failure `error` is, a word a program reads: covered (another window or layer is over the point),
+        // gone (the window or surface went away), unavailable (the plugin was unloaded) or refused (anything else).
+        std::string                        code = "refused";
     };
 
     CFunctionHook*     g_moveHook     = nullptr;
@@ -284,6 +287,7 @@ namespace {
         SP<CEventLoopTimer>                timer;
         uint64_t                           ticket = 0;
         std::string                        error;
+        std::string                        code = "refused"; // see SOp::code
     };
     std::optional<SKeyOp> g_keyOp;
     xcb_connection_t*     g_x = nullptr;
@@ -420,12 +424,14 @@ namespace {
         return R"({"ok":true})";
     }
 
-    std::string errorReply(const std::string& why) {
-        return std::format(R"({{"ok":false,"error":{}}})", jsonString(why));
+    // `code` is the kind of failure for a program to branch on; see SOp::code. A request the plugin turns down before it
+    // runs is refused, and busy when only the queue is full.
+    std::string errorReply(const std::string& why, const std::string& code = "refused") {
+        return std::format(R"({{"ok":false,"error":{},"code":{}}})", jsonString(why), jsonString(code));
     }
 
-    IPC::Socket1::SResponse refuse(const std::string& why) {
-        return IPC::Socket1::SResponse(errorReply(why));
+    IPC::Socket1::SResponse refuse(const std::string& why, const std::string& code = "refused") {
+        return IPC::Socket1::SResponse(errorReply(why, code));
     }
 
     void dropTimer(const SP<CEventLoopTimer>& timer) {
@@ -495,7 +501,7 @@ namespace {
 
     IPC::Socket1::SResponse enqueue(Start start) {
         if (g_queue.size() >= MAX_QUEUED)
-            return refuse(std::format("the deskpilot queue is full: {} actions are waiting behind the running one, try again when they finish", g_queue.size()));
+            return refuse(std::format("the deskpilot queue is full: {} actions are waiting behind the running one, try again when they finish", g_queue.size()), "busy");
         const auto TICKET = g_nextTicket++;
         g_tickets[TICKET] = {};
         g_queue.push_back({TICKET, std::move(start)});
@@ -791,12 +797,14 @@ namespace {
     bool targetUnderPointer() {
         if (const auto BLOCKER = blockerAt(g_op->target, g_op->window)) {
             g_op->error = *BLOCKER;
+            g_op->code  = "covered";
             return false;
         }
         const auto UNDER = windowUnderPointer();
         if (UNDER && reinterpret_cast<uintptr_t>(UNDER.get()) == g_op->window)
             return true;
         g_op->error = std::format("the pointer focus is on {}, not the target, at {},{}", UNDER ? describe(UNDER) : "no window", g_op->target.x, g_op->target.y);
+        g_op->code  = "covered";
         return false;
     }
 
@@ -1008,7 +1016,7 @@ namespace {
         replayHeld(op.heldInput);
 
         if (!op.answered)
-            complete(op.ticket, op.error.empty() ? std::format(R"({{"ok":true,{}}})", pointAt(op.target)) : errorReply(op.error));
+            complete(op.ticket, op.error.empty() ? std::format(R"({{"ok":true,{}}})", pointAt(op.target)) : errorReply(op.error, op.code));
         startNext();
     }
 
@@ -1211,6 +1219,7 @@ namespace {
         const auto SURFACE = op.surface.lock();
         if (!SURFACE) {
             op.error = "the surface under the action's pointer is gone";
+            op.code  = "gone";
             return false;
         }
         if (const auto USER = g_pSeatManager->m_state.pointerFocus.lock(); USER && USER->client() == SURFACE->client()) {
@@ -1230,6 +1239,7 @@ namespace {
         const auto WINDOW = windowOf(op);
         if (!WINDOW || !WINDOW->mapped()) {
             op.error = "the window closed";
+            op.code  = "gone";
             return false;
         }
         surface = Desktop::viewState()->hitTest().windowSurfaceAt(pos, WINDOW, local);
@@ -1643,7 +1653,7 @@ namespace {
             xkb_state_unref(op.xkb);
         for (auto& replay : op.heldInput)
             replay();
-        complete(op.ticket, op.error.empty() ? okReply() : errorReply(op.error));
+        complete(op.ticket, op.error.empty() ? okReply() : errorReply(op.error, op.code));
         startNext();
     }
 
@@ -1724,6 +1734,7 @@ namespace {
                 const auto WINDOW = op.window.lock();
                 if (!WINDOW || !WINDOW->mapped()) {
                     op.error = "the window closed mid-sequence";
+                    op.code  = "gone";
                     op.phase = SKeyOp::DONE;
                     return std::nullopt;
                 }
@@ -1800,6 +1811,7 @@ namespace {
             case SKeyOp::KEY: {
                 if (!op.window.lock() || !op.surface.lock()) {
                     op.error = "the window closed mid-sequence";
+                    op.code  = "gone";
                     return restoreStroke(op);
                 }
                 // Xwayland hands keys to the X focus, which Hyprland moves when it focuses another X window.
@@ -2293,18 +2305,20 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
 // The running action is ended and the user's pointer and focus put back; everything queued or waiting is answered.
 APICALL EXPORT void PLUGIN_EXIT() {
-    const auto UNLOADED = errorReply("the deskpilot plugin was unloaded");
+    const auto UNLOADED = errorReply("the deskpilot plugin was unloaded", "unavailable");
     for (auto& queued : g_queue)
         complete(queued.ticket, UNLOADED);
     g_queue.clear();
     if (g_op) {
         g_op->error = "the deskpilot plugin was unloaded";
+        g_op->code  = "unavailable";
         finish();
     }
     if (g_keyOp) {
         if (g_keyOp->holding)
             restoreStroke(*g_keyOp);
         g_keyOp->error = "the deskpilot plugin was unloaded";
+        g_keyOp->code  = "unavailable";
         finishKeys();
     }
     for (auto& [ticket, entry] : g_tickets) {

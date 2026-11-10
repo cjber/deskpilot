@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from .desk import EXPECTED, Desk
+from .desk import EXPECTED, Desk, error_code
 
 
 def _print(data, as_json: bool) -> None:
@@ -52,7 +52,11 @@ def _point_parser(sub, name: str, helptext: str, take_pointer: bool = True) -> a
     s.add_argument("window")
     s.add_argument("x", type=float, nargs="?")
     s.add_argument("y", type=float, nargs="?")
-    s.add_argument("--element", help="an element id from `deskpilot elements`, instead of x and y")
+    s.add_argument(
+        "--element",
+        help="an element id from `deskpilot elements`, instead of x and y: e5, or SNAPSHOT:e5 to refuse it once a newer"
+        " snapshot has renumbered the elements",
+    )
     _shot_args(s)
     if take_pointer:
         s.add_argument(
@@ -302,7 +306,7 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             return {"x": gx, "y": gy}
         case "elements":
             tree = desk.elements(args.window, args.show, args.hidden).to_dict()
-            return tree if args.json else _tree(tree)
+            return tree if args.json else [f"snapshot {tree['snapshot']}", *_tree(tree)]
         case "key":
             desk.key(args.combo, args.window, args.take_focus, args.hold)
             return "ok"
@@ -350,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _print(run(args, desk), args.json)
     except EXPECTED as error:
-        print(f"deskpilot: {error}", file=sys.stderr)
+        print(f"deskpilot: {error_code(error)}: {error}", file=sys.stderr)
         return 2
     finally:
         desk.close()

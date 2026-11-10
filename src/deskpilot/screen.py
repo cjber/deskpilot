@@ -28,7 +28,7 @@ KEEP = 20
 
 
 class StaleShot(ValueError):
-    pass
+    code = "stale"
 
 
 def state_dir() -> Path:

@@ -18,7 +18,7 @@ Runner = Callable[[list[str]], str]
 
 
 class HyprctlError(RuntimeError):
-    pass
+    code = "unavailable"
 
 
 def socket_alive(path: Path) -> bool:
@@ -132,11 +132,11 @@ class Monitor:
 
 
 class WindowNotFound(LookupError):
-    pass
+    code = "not_found"
 
 
 class AmbiguousWindow(LookupError):
-    pass
+    code = "ambiguous"
 
 
 class Hyprland:

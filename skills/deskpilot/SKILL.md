@@ -66,10 +66,17 @@ press into the focused window, which may be the user's own: always pass `--windo
 
 ## Errors
 
+Each error starts with a code: `deskpilot: CODE: message`, or in MCP the result's structured `code`.
+
 - "is not on screen": the window is on a hidden workspace or scrolled off. Pass `--hidden`, or ask the user before
   passing `--show`.
 - "take a new shot": the window changed size since the shot. Shoot again and pick the point anew.
 - A plugin build failure names the missing headers or compiler.
 - A stale `HYPRLAND_INSTANCE_SIGNATURE` is handled: deskpilot finds the live Hyprland, and stops with a list when
   several are live. Ask the user which one to use.
-- A refused click names why. Take a new `shot`, since the window may have moved, resized or been covered.
+- `covered`: another window or layer is over the point. `gone`: the window closed. Take a new `shot`, since the
+  window may have moved, resized or been covered.
+- `stale`: the element id is from a replaced snapshot, or the element's role or name changed. Run `elements`
+  again and pick the id anew; pass ids as `SNAPSHOT:e5` so an old one cannot match a renumbered tree.
+- `offscreen`: the element is not showing, as in a collapsed menu or a scrolled-away row.
+- `no_tree`: the app exposes no accessibility tree. Use a shot and points instead.

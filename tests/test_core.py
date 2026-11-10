@@ -389,8 +389,12 @@ def test_plugin_sends_button_codes_and_reads_replies():
     assert calls[-1] == ["deskpilot", "cursor", "10", "20"]
     with pytest.raises(PluginError, match="not loaded"):
         parse_reply("unknown request")
-    with pytest.raises(PluginError, match="is on top"):
-        parse_reply('{"ok":false,"error":"window 0x1 (x) is on top at 1,2"}')
+    with pytest.raises(PluginError, match="is on top") as error:
+        parse_reply('{"ok":false,"error":"window 0x1 (x) is on top at 1,2","code":"covered"}')
+    assert error.value.code == "covered"
+    with pytest.raises(PluginError) as error:
+        parse_reply('{"ok":false,"error":"an older build answers without a code"}')
+    assert error.value.code == "refused"
     assert not Plugin(lambda args: "unknown request").loaded()
 
 
@@ -495,18 +499,25 @@ def test_a_missing_plugin_is_loaded_and_the_command_sent_again(monkeypatch):
 
 
 def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
-    """The SDK hides any exception other than ToolError behind `Error executing tool <name>`."""
+    """An expected failure is an error result carrying its code, both in the text and as structured content."""
     import asyncio
-
-    from mcp.server.mcpserver.exceptions import ToolError
 
     from deskpilot import mcp_server
 
     desk, fake, _, _ = make_desk(tmp_path, monkeypatch)
     fake.showing = "2"
     monkeypatch.setattr(mcp_server, "desk", desk)
-    with pytest.raises(ToolError, match="is not on screen"):
-        asyncio.run(mcp_server.mcp.call_tool("click", {"window": "battle", "x": 1, "y": 1}))
+
+    def refusal(tool, arguments):
+        result = asyncio.run(mcp_server.mcp.call_tool(tool, arguments))
+        assert result.is_error
+        assert result.content[0].text == f"{result.structured_content['code']}: {result.structured_content['message']}"
+        return result.structured_content
+
+    assert refusal("click", {"window": "battle", "x": 1, "y": 1})["code"] == "not_visible"
+    assert "is not on screen" in refusal("click", {"window": "battle", "x": 1, "y": 1})["message"]
+    assert refusal("click", {"window": "nosuchwindow", "x": 1, "y": 1})["code"] == "not_found"
+    assert refusal("scroll", {"window": "battle", "dy": 0, "x": 1, "y": 1, "hidden": True})["code"] == "invalid"
 
 
 def test_clipboard_reads_plain_text_and_not_another_text_type(monkeypatch):

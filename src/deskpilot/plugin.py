@@ -29,11 +29,17 @@ REQUEST_BYTES = 32 * 1024
 
 
 class PluginError(RuntimeError):
-    pass
+    """The plugin's refusal. `code` is the plugin's word for its kind: covered (another window or layer is over the
+    point), gone (the window or surface went away), busy (its queue is full), unavailable, or refused."""
+
+    def __init__(self, message: str, code: str = "refused"):
+        super().__init__(message)
+        self.code = code
 
 
 class PluginNotLoaded(PluginError):
-    pass
+    def __init__(self, message: str):
+        super().__init__(message, "unavailable")
 
 
 def build_dir() -> Path:
@@ -61,9 +67,9 @@ def parse_reply(text: str) -> dict:
     try:
         reply = json.loads(text)
     except ValueError as error:
-        raise PluginError(f"unexpected reply from the deskpilot plugin: {text[:200]}") from error
+        raise PluginError(f"unexpected reply from the deskpilot plugin: {text[:200]}", "unavailable") from error
     if not reply.get("ok"):
-        raise PluginError(reply.get("error", text))
+        raise PluginError(reply.get("error", text), reply.get("code", "refused"))
     return reply
 
 
@@ -90,7 +96,7 @@ class Plugin:
         try:
             out = self.run(["deskpilot", *args])
         except HyprctlError as error:
-            raise PluginError(str(error)) from error
+            raise PluginError(str(error), "unavailable") from error
         return parse_reply(out)
 
     def _call(self, *args: str) -> dict:
@@ -121,7 +127,8 @@ class Plugin:
             return refusal
         return PluginError(
             f"the loaded deskpilot plugin is build {version or 'unknown'}, not this CLI's {source_hash()}, so it may"
-            f" not understand the request: run `deskpilot plugin load` to replace it. The plugin answered: {refusal}"
+            f" not understand the request: run `deskpilot plugin load` to replace it. The plugin answered: {refusal}",
+            refusal.code,
         )
 
     def loaded(self) -> bool:
@@ -186,10 +193,12 @@ class Plugin:
         except PluginError:
             return
         if not status.get("path"):
-            raise PluginError("an older deskpilot plugin is loaded: unload it with `hyprctl plugin unload <its .so>`")
+            raise PluginError(
+                "an older deskpilot plugin is loaded: unload it with `hyprctl plugin unload <its .so>`", "unavailable"
+            )
         out = self.run(["plugin", "unload", status["path"]]).strip()
         if out not in ("ok", ""):
-            raise PluginError(f"hyprctl plugin unload {status['path']}: {out}")
+            raise PluginError(f"hyprctl plugin unload {status['path']}: {out}", "unavailable")
 
     def commit(self) -> str:
         return json.loads(self.run(["-j", "version"]))["commit"]
@@ -205,7 +214,7 @@ class Plugin:
             timeout=600,
         )
         if result.returncode != 0:
-            raise PluginError(f"building the plugin failed:\n{result.stderr.strip()[-2000:]}")
+            raise PluginError(f"building the plugin failed:\n{result.stderr.strip()[-2000:]}", "unavailable")
         return out
 
     def load(self) -> Path:
@@ -218,5 +227,5 @@ class Plugin:
             path = self.build()
         out = self.run(["plugin", "load", str(path)]).strip()
         if out != "ok":
-            raise PluginError(f"hyprctl plugin load {path}: {out}")
+            raise PluginError(f"hyprctl plugin load {path}: {out}", "unavailable")
         return path
