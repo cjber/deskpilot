@@ -1,4 +1,5 @@
 import json
+import pathlib
 import subprocess
 from dataclasses import asdict, replace
 
@@ -297,6 +298,20 @@ def test_plugin_formats_key_events():
     calls = []
     Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", ["+29", "t61"], hold=0.03, gap=0.1)
     assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "t61"]]
+
+
+def test_paste_sends_its_text_in_a_file_the_request_names_and_removes_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    seen = []
+
+    def run(args):
+        seen.append((args, pathlib.Path(args[3]).read_text()))
+        return '{"ok":true}'
+
+    Plugin(run).keys("0xabc", ["p76"], paste="naïve 日本 ✓")
+    ((args, text),) = seen
+    assert args[:3] == ["deskpilot", "paste", "0xabc"] and args[4:] == ["0", "0", "none", "p76"]
+    assert text == "naïve 日本 ✓" and not pathlib.Path(args[3]).exists()
 
 
 def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():

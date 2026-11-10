@@ -42,8 +42,14 @@
 //     makes meanwhile waits for the stroke to end. A step that does not happen in time ends the sequence with an
 //     error.
 //
+// `hyprctl deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <event>...` sends the same key events (the
+// window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
+// The seat's selection never changes, so the user's clipboard and every other client's stay as they are. Once the
+// client has read the text, or after PASTE_WAIT, it gets the clipboard it would otherwise have: the user's if it has
+// keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard.
+//
 // A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
-// <event>...`, and the `keys` request naming <txn> queues all of it as one action.
+// <event>...`, and the `keys` or `paste` request naming <txn> queues all of it as one action.
 //
 // Actions run one at a time in the order they arrive; up to MAX_QUEUED wait behind the running one and any more are
 // refused. Each request is answered when its own action has finished, or after REPLY_WAIT with
@@ -52,6 +58,7 @@
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 
+#include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/ViewHitTester.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
@@ -67,6 +74,7 @@
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
+#include <hyprland/src/protocols/core/DataDevice.hpp>
 #include <hyprland/src/protocols/core/Seat.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/managers/XWaylandManager.hpp>
@@ -90,6 +98,8 @@
 #include <cstdlib>
 #include <deque>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <fstream>
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
 #include <format>
@@ -97,6 +107,7 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -696,6 +707,125 @@ namespace {
         return out;
     }
 
+    // ---- paste ----
+
+    // CWLDataDeviceProtocol keeps the lookup of a client's data device and the sending of a selection to one device
+    // private: Hyprland itself only ever offers the seat's selection to the focused client.
+    struct SDeviceForClient {
+        friend constexpr auto member(SDeviceForClient);
+    };
+    template struct SAccess<&CWLDataDeviceProtocol::dataDeviceForClient, SDeviceForClient>;
+    struct SSendSelection {
+        friend constexpr auto member(SSendSelection);
+    };
+    template struct SAccess<&CWLDataDeviceProtocol::sendSelectionToDevice, SSendSelection>;
+
+    class CPasteSource;
+    struct SPaste {
+        SP<CPasteSource>       source;
+        WP<IDataDevice>        device;
+        WP<CWLSurfaceResource> surface;
+        SP<CEventLoopTimer>    timer;
+    };
+    std::optional<SPaste> g_paste;
+    void                  restorePaste();
+
+    // Text a paste offers as one window client's clipboard. It is never the seat's selection, so the user's clipboard
+    // and every other client's stay as they are. A read is written as the client's pipe takes it, so a long text never
+    // blocks the compositor.
+    class CPasteSource : public IDataSource {
+      public:
+        explicit CPasteSource(std::string text) : m_text(std::move(text)) {}
+        ~CPasteSource() override {
+            for (auto* write : m_writes) {
+                wl_event_source_remove(write->event);
+                delete write;
+            }
+        }
+
+        std::vector<std::string> mimes() override {
+            return {"text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING"};
+        }
+        void send(const std::string&, Hyprutils::OS::CFileDescriptor fd) override {
+            auto* write = new SWrite{.source = this, .fd = std::move(fd)};
+            fcntl(write->fd.get(), F_SETFL, fcntl(write->fd.get(), F_GETFL) | O_NONBLOCK);
+            write->event = wl_event_loop_add_fd(g_pCompositor->m_wlEventLoop, write->fd.get(), WL_EVENT_WRITABLE, onWritable, write);
+            m_writes.push_back(write);
+        }
+        void accepted(const std::string&) override {}
+        void cancelled() override {}
+        void error(uint32_t, const std::string&) override {}
+
+      private:
+        struct SWrite {
+            CPasteSource*                  source = nullptr;
+            Hyprutils::OS::CFileDescriptor fd;
+            size_t                         written = 0;
+            wl_event_source*               event   = nullptr;
+        };
+
+        static int onWritable(int, uint32_t mask, void* data) {
+            auto*       write = static_cast<SWrite*>(data);
+            const auto& TEXT  = write->source->m_text;
+            while (!(mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) && write->written < TEXT.size()) {
+                const auto N = ::write(write->fd.get(), TEXT.data() + write->written, TEXT.size() - write->written);
+                if (N < 0 && errno == EAGAIN)
+                    return 0;
+                if (N <= 0)
+                    break;
+                write->written += N;
+            }
+            // Read once: the window has its text, so it gets the user's clipboard back (or none, when unfocused).
+            // Restored here rather than later, so no callback into this plugin is left queued if it is unloaded.
+            auto* source = write->source;
+            std::erase(source->m_writes, write);
+            wl_event_source_remove(write->event);
+            delete write;
+            if (g_paste && g_paste->source.get() == source)
+                restorePaste();
+            return 0;
+        }
+
+        std::string          m_text;
+        std::vector<SWrite*> m_writes;
+    };
+
+    // How long a window may take to read a pasted text before its clipboard is given back anyway.
+    constexpr auto PASTE_WAIT = std::chrono::seconds(10);
+
+    // The window's client sees the clipboard it would have without the paste: the user's, if it has keyboard focus,
+    // and none otherwise, since Hyprland offers the clipboard only to the focused client.
+    void restorePaste() {
+        if (!g_paste)
+            return;
+        auto paste = std::move(*g_paste);
+        g_paste.reset();
+        dropTimer(paste.timer);
+        const auto DEVICE = paste.device.lock();
+        if (!DEVICE)
+            return;
+        const auto FOCUS   = g_pSeatManager->m_state.keyboardFocusResource.lock();
+        const auto SURFACE = paste.surface.lock();
+        const bool FOCUSED = FOCUS && SURFACE && FOCUS->client() == SURFACE->client();
+        ((*PROTO::data).*member(SSendSelection{}))(DEVICE, FOCUSED ? g_pSeatManager->m_selection.currentSelection.lock() : nullptr);
+    }
+
+    // Offers `text` as the clipboard of `window`'s client alone, until it has read it or PASTE_WAIT passes.
+    std::optional<std::string> offerPaste(const PHLWINDOW& window, std::string text) {
+        if (!window || !window->mapped())
+            return "the window closed before its text was offered";
+        const auto SURFACE = window->wlSurface()->resource();
+        const auto DEVICE  = SURFACE ? ((*PROTO::data).*member(SDeviceForClient{}))(SURFACE->client()) : nullptr;
+        if (!DEVICE || DEVICE->type() != DATA_SOURCE_TYPE_WAYLAND)
+            return "the window's client has no Wayland clipboard to paste from";
+        restorePaste();
+        g_paste.emplace(SPaste{.source = makeShared<CPasteSource>(std::move(text)), .device = DEVICE, .surface = SURFACE});
+        g_paste->timer = makeShared<CEventLoopTimer>(PASTE_WAIT, [](SP<CEventLoopTimer>, void*) { restorePaste(); }, nullptr);
+        g_pEventLoopManager->addTimer(g_paste->timer);
+        ((*PROTO::data).*member(SSendSelection{}))(DEVICE, g_paste->source);
+        return std::nullopt;
+    }
+
     template <typename FN>
     void eachKeyboard(SKeyOp& op, FN&& fn) {
         for (const auto& weak : op.keyboards) {
@@ -1116,33 +1246,75 @@ namespace {
         return IPC::Socket1::SResponse(okReply());
     }
 
+    // How much text one paste may carry, read from the file its request names.
+    constexpr size_t MAX_PASTE = 16 << 20;
+
+    // Reads the text a paste request names into `text`: a file the caller wrote, removed once read so it never
+    // outlives the request.
+    std::optional<std::string> readPaste(const std::string& path, std::string& text) {
+        std::ifstream file(path, std::ios::binary);
+        if (file) {
+            text.resize(MAX_PASTE + 1);
+            file.read(text.data(), text.size());
+            text.resize(file.gcount());
+        }
+        const bool READ = file.good() || file.eof();
+        std::remove(path.c_str());
+        if (!READ)
+            return "cannot read the paste text from " + path;
+        if (text.size() > MAX_PASTE)
+            return std::format("a paste may carry at most {} bytes", MAX_PASTE);
+        return std::nullopt;
+    }
+
+    // `keys <window> <hold> <gap> <txn|none> <event>...`, or `paste <window> <file> ...` with the same words after the
+    // file, which offers the file's text as the window's clipboard just before the keys (its paste chord) are sent.
     IPC::Socket1::SResponse keysCommand(const std::vector<std::string>& args) {
-        if (args.size() < 6)
-            return refuse("usage: deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <key event>...");
+        const bool   PASTE = args[1] == "paste";
+        const size_t AT    = PASTE ? 4 : 3; // where <hold-ms> is
+        if (args.size() < AT + 3)
+            return refuse(PASTE ? "usage: deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>..." :
+                                  "usage: deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <key event>...");
+        std::optional<std::string> text;
+        if (PASTE) {
+            if (const auto ERROR = readPaste(args[3], text.emplace()))
+                return refuse(*ERROR);
+        }
         const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
-        const auto HOLD = number(args[3]), GAP = number(args[4]);
+        const auto HOLD = number(args[AT]), GAP = number(args[AT + 1]);
         // The user's keys wait out each hold, so neither may be longer than a key would be held by hand.
         if (!HOLD || !GAP || *HOLD < 0 || *GAP < 0 || *HOLD > 10000 || *GAP > 10000)
             return refuse("hold and gap must be 0 to 10000 milliseconds");
 
         SKeyOp op;
-        if (args[5] != "none") {
-            auto staged = g_staged.find(args[5]);
+        if (args[AT + 2] != "none") {
+            auto staged = g_staged.find(args[AT + 2]);
             if (staged == g_staged.end())
-                return refuse("no staged key transaction " + args[5]);
+                return refuse("no staged key transaction " + args[AT + 2]);
             op.events = std::move(staged->second.events);
             g_staged.erase(staged);
         }
-        if (const auto ERROR = parseKeys(args, 6, op.events))
+        if (const auto ERROR = parseKeys(args, AT + 3, op.events))
             return refuse(*ERROR);
         if (op.events.empty())
             return refuse("no key events");
         if (!WINDOW || !WINDOW->mapped())
             return refuse("no mapped window " + args[2]);
+        if (PASTE && WINDOW->backend().isX11())
+            return refuse("an XWayland window reads the clipboard every X client shares, so a paste would replace the user's clipboard: type the text instead");
         op.window = WINDOW;
         op.hold   = ms(static_cast<int>(*HOLD));
         op.gap    = ms(static_cast<int>(*GAP));
-        return enqueue([op = std::move(op)](uint64_t ticket) mutable { return startKeys(std::move(op), ticket); });
+        return enqueue([op = std::move(op), text = std::move(text)](uint64_t ticket) mutable -> std::optional<std::string> {
+            if (text) {
+                if (const auto ERROR = offerPaste(op.window.lock(), std::move(*text)))
+                    return ERROR;
+            }
+            const auto ERROR = startKeys(std::move(op), ticket);
+            if (ERROR && text)
+                restorePaste();
+            return ERROR;
+        });
     }
 
     IPC::Socket1::SResponse pointerCommand(const std::vector<std::string>& args, const std::string& command) {
@@ -1187,12 +1359,13 @@ namespace {
         }
         if (VERB == "stage")
             return stageCommand(args);
-        if (VERB == "keys")
+        if (VERB == "keys" || VERB == "paste")
             return keysCommand(args);
         if ((VERB == "click" && args.size() == 7) || (VERB == "scroll" && args.size() == 6))
             return pointerCommand(args, req.command);
         return refuse("usage: deskpilot click <window> <x> <y> <button> <count> | scroll <window> <x> <y> <dy> | keys <window> <hold-ms> <gap-ms> <txn|none> "
-                      "<key event>... | stage <txn> <key event>... | wait <ticket> | status; a key event is +code, -code, pHEX, rHEX or tHEX");
+                      "<key event>... | paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | wait <ticket> | status; a key "
+                      "event is +code, -code, pHEX, rHEX or tHEX");
     }
 }
 
@@ -1256,6 +1429,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
         entry.waiter->resolver->resolve(UNLOADED);
     }
     g_tickets.clear();
+    restorePaste();
     if (g_x)
         xcb_disconnect(g_x);
     g_x = nullptr;

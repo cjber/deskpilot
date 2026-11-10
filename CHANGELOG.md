@@ -14,6 +14,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **Keys always go through the plugin.** `--take-focus` focuses the window and then sends keys as `--window` does,
   and `key` and `type` without `--window` go to the focused window, so neither needs `/dev/uinput` any more. These
   keys do not trigger Hyprland keybinds.
+- **Paste any text into a window without touching your clipboard.** `deskpilot paste TEXT --window W` (MCP
+  `paste_text`) gives the window a clipboard only it sees and presses its paste chord (`--keys`, `ctrl+v` by default),
+  so text the keymap cannot type and long text arrive whole. XWayland windows share one clipboard and are refused.
+- **Read and write the clipboard.** `deskpilot clipboard` prints the clipboard's text and `--set TEXT` replaces it (MCP
+  `clipboard` and `copy_text`).
 
 ## [0.2.1] - 2026-11-10
 

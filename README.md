@@ -34,6 +34,7 @@ Battle.net drops `xdotool` clicks.
   Arch's `hyprland` package), `libxcb` and `libxkbcommon`.
 - Optional: `cua-driver` for the agent cursor.
 - `grim` for screenshots.
+- `wl-clipboard` for `clipboard`.
 - For `--take-pointer`: write access to `/dev/uinput`, usually through the `input` group or a udev ACL. Check with
   `test -w /dev/uinput`.
 - Python 3.12 or later and `uv`.
@@ -58,6 +59,8 @@ deskpilot shot battle.net.exe             # screenshot; prints its id, image pat
 deskpilot click battle.net.exe 920 367 --shot ID    # a point in that screenshot
 deskpilot type "/reload" --window wow.exe --delay 0.12
 deskpilot key ctrl+a --window kitty
+deskpilot paste "Grüße, 日本" --window firefox    # any text, through a clipboard only that window sees
+deskpilot clipboard                       # the user's clipboard text; --set TEXT replaces it
 deskpilot wait-for wow.exe --timeout 120
 ```
 
@@ -85,6 +88,11 @@ the one instance whose socket answers, and with several live instances it stops 
 leaves it focused, for an app that ignores keys while unfocused. Keys go to the window's client, not through the
 compositor, so they never trigger a Hyprland keybind: use `hyprctl dispatch` for those.
 
+`paste` hands text to a window as a clipboard only that window sees, then presses its paste chord (`--keys`,
+`ctrl+v` by default; most terminals want `ctrl+shift+v`). It pastes any text, including characters the keymap cannot
+type, and the user's clipboard stays as it is. XWayland windows share one clipboard, so `paste` refuses them: use
+`type`. `clipboard` reads the user's clipboard, and `clipboard --set` replaces it.
+
 Games read keys once per frame, so type into them with `--delay 0.1` or more: each key is held that long, with the
 same gap before the next.
 
@@ -94,8 +102,8 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 ## MCP
 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
-id), `click`, `move`, `scroll`, `key`, `type_text` and `wait_for`. `click`, `move` and `scroll` take `shot`, `show`
-and `take_pointer`; `key` and `type_text` take `take_focus`. It keeps one input
+id), `click`, `move`, `scroll`, `key`, `type_text`, `paste_text`, `clipboard`, `copy_text` and `wait_for`. `click`,
+`move` and `scroll` take `shot`, `show` and `take_pointer`; `key`, `type_text` and `paste_text` take `take_focus`. It keeps one input
 device and one agent cursor open for the session.
 
 ```sh
@@ -104,8 +112,8 @@ claude mcp add deskpilot -- deskpilot mcp
 
 ## Limits
 
-- Text can only contain characters the active keymap types; a character it lacks (such as `é` on a US layout) is
-  an error rather than skipped.
+- `type` can only send characters the active keymap types; a character it lacks (such as `é` on a US layout) is
+  an error rather than skipped. `paste` takes any text, except into XWayland windows.
 - Hyprland plugins load only into the exact Hyprland they were built against, so `deskpilot plugin load` builds
   one per Hyprland commit and plugin source under `~/.local/share/deskpilot`, and replaces a loaded build of
   other source.

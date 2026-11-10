@@ -6,7 +6,7 @@ description: Click, scroll and type in desktop app windows on Hyprland with the 
 # deskpilot
 
 Run `deskpilot --help` for the command list, and put `--json` before the command for JSON output. Over MCP the same
-actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `key`, `type_text` and `wait_for`.
+actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `key`, `type_text`, `paste_text`, `clipboard`, `copy_text` and `wait_for`.
 
 If `deskpilot` is not on `PATH`, ask the user before installing it with
 `uv tool install deskpilot`.
@@ -26,7 +26,10 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    refused.
 5. Type with `deskpilot type "TEXT" --window WINDOW` and press keys with `deskpilot key ctrl+a --window WINDOW`. Games
    read keys once per frame, so add `--delay 0.1` or more for them: each key is held that long, with the same gap
-   before the next. Text arrives as written on the user's keymap; a character no key on it types is an error.
+   before the next. Text arrives as written on the user's keymap; a character no key on it types is an error, so
+   send such text, or a long one, with `deskpilot paste "TEXT" --window WINDOW` (`--keys ctrl+shift+v` in a
+   terminal). A paste uses a clipboard only that window sees; XWayland windows refuse it. `deskpilot clipboard`
+   reads the user's clipboard, and `--set TEXT` replaces it: only do that when the user asks.
    Several agents may act at once: actions run one after another in arrival order, and one `type` is never
    interleaved with another's keys.
 6. Take a new `shot` after each action that changes the window, and confirm the result before the next step.
