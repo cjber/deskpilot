@@ -708,7 +708,10 @@ namespace {
             return it->second;
         }
 
+        // A held button keeps its cursor in view however long it is held.
         double alpha(const SCursor& cursor) {
+            if (cursor.pressed)
+                return 1;
             const auto IDLE = seconds(cursor.active) - secondsOf(IDLE_HIDE);
             return std::clamp(1.0 - IDLE / secondsOf(FADE), 0.0, 1.0);
         }
@@ -804,16 +807,21 @@ namespace {
             return upload(SURFACE, CR, cursor.tag, scale);
         }
 
-        // Everything a cursor draws now, in global logical coordinates: the marker, brackets, rings and tag.
+        CBox unite(const CBox& a, const CBox& b) {
+            const auto X1 = std::min(a.x, b.x), Y1 = std::min(a.y, b.y);
+            return CBox{X1, Y1, std::max(a.x + a.w, b.x + b.w) - X1, std::max(a.y + a.h, b.y + b.h) - Y1};
+        }
+
+        // Everything a cursor draws now, in global logical coordinates: the marker, brackets, tag, and every press ring,
+        // which stays where it was pressed while the cursor moves on.
         CBox extent(const SCursor& cursor) {
             const double REACH = std::max({PULSE_SIZE, LOCK_FROM + 1, WING + 6});
-            CBox         box{cursor.pos - Vector2D{REACH, REACH}, Vector2D{2 * REACH, 2 * REACH}};
-            if (cursor.tagWidth > 0) {
-                const CBox TAG{cursor.pos + Vector2D{TAG_GAP, -TAG_HEIGHT / 2}, Vector2D{cursor.tagWidth, TAG_HEIGHT}};
-                const auto X1 = std::min(box.x, TAG.x), Y1 = std::min(box.y, TAG.y);
-                const auto X2 = std::max(box.x + box.w, TAG.x + TAG.w), Y2 = std::max(box.y + box.h, TAG.y + TAG.h);
-                box = CBox{X1, Y1, X2 - X1, Y2 - Y1};
-            }
+            const auto   around = [&](Vector2D at) { return CBox{at - Vector2D{REACH, REACH}, Vector2D{2 * REACH, 2 * REACH}}; };
+            CBox         box    = around(cursor.pos);
+            if (cursor.tagWidth > 0)
+                box = unite(box, CBox{cursor.pos + Vector2D{TAG_GAP, -TAG_HEIGHT / 2}, Vector2D{cursor.tagWidth, TAG_HEIGHT}});
+            for (const auto& [at, start] : cursor.pulses)
+                box = unite(box, around(at));
             return box.expand(4);
         }
 
@@ -2525,9 +2533,9 @@ namespace {
             args.push_back(word);
         // args[0] is "deskpilot".
         const std::string VERB = args.size() >= 2 ? args[1] : "";
-        // `agent=NAME` right after the verb names whose agent cursor a path or cursor request moves.
+        // `agent=NAME` right after the verb names whose agent cursor a path or cursor request moves; no other verb takes it.
         std::string agent;
-        if (args.size() >= 3 && args[2].starts_with("agent=")) {
+        if ((VERB == "path" || VERB == "cursor") && args.size() >= 3 && args[2].starts_with("agent=")) {
             agent = args[2].substr(6);
             if (agent.empty() || !agentcursor::validName(agent))
                 return refuse(std::format("bad agent name '{}': use up to {} letters, digits, '-', '_' or '.'", agent, agentcursor::NAME_MAX));
