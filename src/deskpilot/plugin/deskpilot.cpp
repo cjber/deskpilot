@@ -27,10 +27,11 @@
 //      anything moved it, the cursor's visibility is restored, and the held input is replayed in the order it came
 //      through Hyprland's own handlers, so the user's motion keeps its acceleration and reaches pointer-locked games.
 //
-// SHOWN first glides the agent cursor, an arrow the compositor draws, to the first point, then moves it with the action
-// and shows each press (see agentcursor). HIDDEN drives the window client's own pointer instead and touches neither the
-// seat's pointer nor the user's input unless it holds a button, so the window may be off screen (see the hidden
-// pointer section). `hyprctl deskpilot cursor <x> <y>` glides the agent cursor alone.
+// SHOWN first glides the agent cursor, a marker the compositor draws, to the first point, then moves it with the action
+// and shows each press (see agentcursor). Each agent named by `agent=NAME` after the verb has a cursor of its own.
+// HIDDEN drives the window client's own pointer instead and touches neither the seat's pointer nor the user's input
+// unless it holds a button, so the window may be off screen (see the hidden pointer section).
+// `hyprctl deskpilot cursor [agent=NAME] <x> <y>` glides an agent cursor alone.
 //
 // `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
 // without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
@@ -213,6 +214,7 @@ namespace {
     struct SOp {
         uintptr_t                          window = 0;
         eMode                              mode   = eMode::SHOWN;
+        std::string                        agent;  // whose agent cursor shows the action, "" for an unnamed agent
         Vector2D                           start;  // the first point, where the agent cursor glides before the action
         Vector2D                           target; // where the pointer is: the latest point of the action
         Vector2D                           saved;
@@ -557,26 +559,40 @@ namespace {
 
     // ---- agent cursor ----
     //
-    // An arrow the compositor draws where deskpilot acts, so whoever watches the screen sees what the agent does while
-    // the user's own pointer stays where they left it. It is drawn at Hyprland's last render stage, above every window
-    // and layer, and window captures (grim -T) never include it. Before a visible pointer action it glides to the
-    // first point along an arc, fast in the middle and slow at the ends, as cua-driver's cursor does, while the user's
-    // input still runs; the action starts once it lands. It then follows each move of the action, shrinks while a
-    // button is down, and sends a ring out at each press. It fades out after IDLE_HIDE with nothing to show.
+    // A cursor the compositor draws where deskpilot acts, so whoever watches the screen sees what the agent does while
+    // the user's own pointer stays where they left it: a flight-path marker (a ring with wings and a fin, as on a
+    // head-up display) centred on the point. Each agent (DESKPILOT_AGENT) has its own, in a colour of its own with its
+    // name on a tag beside it; any number can show at once. They are drawn at Hyprland's last render stage, above every
+    // window and layer, and window captures (grim -T) never include them. Before a visible pointer action an agent's
+    // cursor glides to the first point along an arc, fast in the middle and slow at the ends, while the user's input
+    // still runs; the action starts once it lands, as lock-on brackets close in around it. It then follows each move
+    // of the action, shrinks while a button is down, and sends a ring out at each press. It fades out after IDLE_HIDE
+    // with nothing to show, and is forgotten once faded.
     namespace agentcursor {
-        constexpr double SIZE        = 26;  // the arrow's height in logical pixels
-        constexpr double PEAK_SPEED  = 900; // logical pixels a second at the middle of a glide, as cua-driver's
+        constexpr double RING        = 5.5;  // the marker's ring radius in logical pixels
+        constexpr double WING        = 13;   // from the centre to a wing tip
+        constexpr double FIN         = 10.5; // from the centre to the fin's tip
+        constexpr double PEAK_SPEED  = 900;  // logical pixels a second at the middle of a glide, as cua-driver's
         constexpr auto   MIN_GLIDE   = ms(120);
         constexpr auto   MAX_GLIDE   = ms(700);
         constexpr double ARC         = 0.2; // how far a glide bows out to the side, as a fraction of its length
         constexpr auto   PULSE       = ms(380);
-        constexpr double PULSE_SIZE  = 34;
-        constexpr double PRESSED     = 0.82; // the arrow's scale while a button is down
+        constexpr double PULSE_SIZE  = 30;
+        constexpr double PRESSED     = 0.85; // the marker's scale while a button is down
+        constexpr auto   LOCK        = ms(160);
+        constexpr double LOCK_FROM   = 30; // the brackets' half-width as the cursor lands, closing to LOCK_TO
+        constexpr double LOCK_TO     = 15;
+        constexpr double BRACKET     = 6;   // the length of a bracket's arm
+        constexpr double TAG_GAP     = LOCK_TO + 6; // from the centre to the tag's left edge, clear of the brackets
+        constexpr double TAG_FONT    = 10;
+        constexpr double TAG_HEIGHT  = 18;
+        constexpr size_t NAME_MAX    = 32;
         constexpr auto   IDLE_HIDE   = std::chrono::seconds(8);
         constexpr auto   FADE        = ms(400);
         constexpr auto   FRAME       = ms(8);
-        // The fill cua-driver gives its default cursor, and a white edge so it shows on any background.
-        const CHyprColor FILL{94 / 255.0, 192 / 255.0, 232 / 255.0, 1.0};
+        // The cursor of an unnamed agent: the colour cua-driver gives its default cursor, and no tag.
+        const CHyprColor DEFAULT{94 / 255.0, 192 / 255.0, 232 / 255.0, 1.0};
+        constexpr double DEFAULT_HUE = 197 / 360.0; // DEFAULT's hue, which named cursors keep apart from
 
         struct SGlide {
             Vector2D              from, bend, to;
@@ -585,18 +601,30 @@ namespace {
             std::function<void()> then;
         };
 
-        struct SState {
+        struct STexture {
+            SP<Render::ITexture> texture;
+            double               scale = 0;
+        };
+
+        struct SCursor {
+            CHyprColor           color;
+            double               hue = DEFAULT_HUE;
             bool                 placed = false; // it has a position to glide from
             Vector2D             pos;
             bool                 pressed = false;
             Time::steady_tp      active; // the last time it moved or pressed
+            Time::steady_tp      landed; // when its last glide ended, for the brackets closing in
             std::optional<SGlide> glide;
             std::vector<std::pair<Vector2D, Time::steady_tp>> pulses;
-            SP<Render::ITexture> texture;
-            double               textureScale = 0;
-            CBox                 drawn; // the global box last drawn, damaged again when it moves or goes
-            SP<CEventLoopTimer>  timer;
-            CHyprSignalListener  render;
+            STexture             marker, tag;
+            double               tagWidth = 0; // logical pixels; 0 for no tag
+            CBox                 drawn;        // the global box last drawn, damaged again when it moves or goes
+        };
+
+        struct SState {
+            std::map<std::string, SCursor> cursors; // by agent name, "" for an unnamed agent
+            SP<CEventLoopTimer>            timer;
+            CHyprSignalListener            render;
         };
         std::unique_ptr<SState> g_state;
 
@@ -604,76 +632,252 @@ namespace {
             return std::chrono::duration<double>(Time::steadyNow() - since).count();
         }
 
-        double alpha() {
-            const auto IDLE = seconds(g_state->active) - std::chrono::duration<double>(IDLE_HIDE).count();
-            return std::clamp(1.0 - IDLE / std::chrono::duration<double>(FADE).count(), 0.0, 1.0);
+        double secondsOf(auto duration) {
+            return std::chrono::duration<double>(duration).count();
         }
 
-        // The arrow, drawn once per monitor scale: tip at the top left, so the texture's corner is the hotspot.
-        SP<Render::ITexture> texture(double scale) {
-            if (g_state->texture && g_state->textureScale == scale)
-                return g_state->texture;
-            const int  PX    = std::ceil(SIZE * scale) + 4;
-            auto*      CAIRO = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, PX, PX);
-            auto*      CR    = cairo_create(CAIRO);
-            const auto S     = SIZE * scale / 26.0;
-            cairo_translate(CR, 2, 2);
-            cairo_move_to(CR, 0, 0);
-            cairo_line_to(CR, 0, 22 * S);
-            cairo_line_to(CR, 6 * S, 17 * S);
-            cairo_line_to(CR, 10 * S, 25 * S);
-            cairo_line_to(CR, 14 * S, 23 * S);
-            cairo_line_to(CR, 10 * S, 15.5 * S);
-            cairo_line_to(CR, 17 * S, 15.5 * S);
-            cairo_close_path(CR);
-            cairo_set_line_join(CR, CAIRO_LINE_JOIN_ROUND);
-            cairo_set_source_rgba(CR, FILL.r, FILL.g, FILL.b, 1.0);
-            cairo_fill_preserve(CR);
+        // Whether `name` may name an agent: it is shown on the tag and travels as one word of a request.
+        bool validName(const std::string& name) {
+            return name.size() <= NAME_MAX && std::ranges::all_of(name, [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.'; });
+        }
+
+        // A colour at one lightness and saturation, which reads on light and dark backgrounds alike.
+        CHyprColor hueColor(double hue) {
+            const double L = 0.6, S = 0.8, C = (1 - std::abs(2 * L - 1)) * S;
+            const auto   channel = [&](double n) {
+                const double K = std::fmod(n + hue * 12, 12);
+                return L - C / 2 * std::max(-1.0, std::min({K - 3, 9 - K, 1.0}));
+            };
+            return CHyprColor{channel(0), channel(8), channel(4), 1.0};
+        }
+
+        double hueDistance(double a, double b) {
+            const auto D = std::abs(a - b);
+            return std::min(D, 1 - D);
+        }
+
+        // A new cursor's hue: from its name's FNV-1a hash, so an agent alone on screen keeps its colour from run to
+        // run; stepped on by the golden angle while it is within MIN_HUE_GAP of a cursor already showing, so cursors
+        // on screen together stay apart. Past MAX_HUES cursors no hue is that far from all of them, and it takes the
+        // last step.
+        constexpr double MIN_HUE_GAP = 0.08;
+        constexpr int    MAX_HUES    = 12;
+        double hueOf(const std::string& name) {
+            uint32_t hash = 2166136261u;
+            for (const unsigned char c : name)
+                hash = (hash ^ c) * 16777619u;
+            double hue = (hash % 3600) / 3600.0;
+            for (int step = 0; step < MAX_HUES; ++step) {
+                const bool CLEAR = std::ranges::all_of(g_state->cursors, [&](const auto& entry) { return entry.first == name || hueDistance(entry.second.hue, hue) >= MIN_HUE_GAP; });
+                if (CLEAR)
+                    break;
+                hue = std::fmod(hue + 0.381966, 1.0);
+            }
+            return hue;
+        }
+
+        void tagFont(cairo_t* cr, double scale) {
+            cairo_select_font_face(cr, "monospace", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+            cairo_set_font_size(cr, TAG_FONT * scale);
+        }
+
+        // The tag's width in logical pixels: the name, a colour dot before it and padding.
+        double tagWidthOf(const std::string& name) {
+            if (name.empty())
+                return 0;
+            auto* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+            auto* cr      = cairo_create(surface);
+            tagFont(cr, 1);
+            cairo_text_extents_t extents;
+            cairo_text_extents(cr, name.c_str(), &extents);
+            cairo_destroy(cr);
+            cairo_surface_destroy(surface);
+            return std::ceil(extents.x_advance) + 26;
+        }
+
+        SCursor& cursorOf(const std::string& name) {
+            auto [it, made] = g_state->cursors.try_emplace(name);
+            if (made) {
+                if (!name.empty()) {
+                    it->second.hue = hueOf(name);
+                    it->second.color = hueColor(it->second.hue);
+                } else
+                    it->second.color = DEFAULT;
+                it->second.tagWidth = tagWidthOf(name);
+            }
+            return it->second;
+        }
+
+        double alpha(const SCursor& cursor) {
+            const auto IDLE = seconds(cursor.active) - secondsOf(IDLE_HIDE);
+            return std::clamp(1.0 - IDLE / secondsOf(FADE), 0.0, 1.0);
+        }
+
+        // How far the brackets have closed in: 0 in flight, to 1 a moment after landing.
+        double lock(const SCursor& cursor) {
+            if (cursor.glide)
+                return 0;
+            const auto T = std::clamp(seconds(cursor.landed) / secondsOf(LOCK), 0.0, 1.0);
+            return 1 - std::pow(1 - T, 3);
+        }
+
+        SP<Render::ITexture> upload(cairo_surface_t* surface, cairo_t* cr, STexture& cache, double scale) {
+            cairo_surface_flush(surface);
+            cache.texture = g_pHyprRenderer->createTexture(surface);
+            cache.scale   = scale;
+            cairo_destroy(cr);
+            cairo_surface_destroy(surface);
+            return cache.texture;
+        }
+
+        // The marker for one monitor scale, centred in its texture: a soft shadow, a white edge so it shows on any
+        // background, and the agent's colour.
+        SP<Render::ITexture> marker(SCursor& cursor, double scale) {
+            if (cursor.marker.texture && cursor.marker.scale == scale)
+                return cursor.marker.texture;
+            const int  PX      = std::ceil((2 * WING + 12) * scale);
+            auto*      SURFACE = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, PX, PX);
+            auto*      CR      = cairo_create(SURFACE);
+            const auto SHAPE   = [&] {
+                cairo_new_path(CR);
+                cairo_arc(CR, 0, 0, RING, 0, 2 * M_PI);
+                cairo_move_to(CR, -RING, 0);
+                cairo_line_to(CR, -WING, 0);
+                cairo_move_to(CR, RING, 0);
+                cairo_line_to(CR, WING, 0);
+                cairo_move_to(CR, 0, -RING);
+                cairo_line_to(CR, 0, -FIN);
+            };
+            cairo_translate(CR, PX / 2.0, PX / 2.0);
+            cairo_scale(CR, scale, scale);
+            cairo_set_line_cap(CR, CAIRO_LINE_CAP_ROUND);
+            // A shadow as widening, fading strokes a little below: a blur's look without a blur pass.
+            cairo_save(CR);
+            cairo_translate(CR, 0, 1.2);
+            for (const auto [width, a] : {std::pair{9.0, 0.06}, {7.0, 0.1}, {5.5, 0.16}}) {
+                SHAPE();
+                cairo_set_line_width(CR, width);
+                cairo_set_source_rgba(CR, 0, 0, 0, a);
+                cairo_stroke(CR);
+            }
+            cairo_restore(CR);
+            SHAPE();
+            cairo_set_line_width(CR, 4.4);
             cairo_set_source_rgba(CR, 1, 1, 1, 1);
-            cairo_set_line_width(CR, 1.6 * S);
             cairo_stroke(CR);
-            cairo_surface_flush(CAIRO);
-            g_state->texture      = g_pHyprRenderer->createTexture(CAIRO);
-            g_state->textureScale = scale;
-            cairo_destroy(CR);
-            cairo_surface_destroy(CAIRO);
-            return g_state->texture;
+            SHAPE();
+            cairo_set_line_width(CR, 2.2);
+            cairo_set_source_rgba(CR, cursor.color.r, cursor.color.g, cursor.color.b, 1);
+            cairo_stroke(CR);
+            cairo_arc(CR, 0, 0, 1.4, 0, 2 * M_PI);
+            cairo_fill(CR);
+            return upload(SURFACE, CR, cursor.marker, scale);
         }
 
-        // Everything it draws now, in global logical coordinates: the arrow and any rings.
-        CBox extent() {
-            CBox box{g_state->pos - Vector2D{PULSE_SIZE, PULSE_SIZE}, Vector2D{SIZE, SIZE} + Vector2D{2 * PULSE_SIZE, 2 * PULSE_SIZE}};
+        // The name tag for one monitor scale: a dark pill edged in the agent's colour, a dot of it, and the name in
+        // monospace, legible on any background and in any hue.
+        SP<Render::ITexture> tag(SCursor& cursor, const std::string& name, double scale) {
+            if (cursor.tag.texture && cursor.tag.scale == scale)
+                return cursor.tag.texture;
+            const int  W       = std::ceil(cursor.tagWidth * scale) + 2, H = std::ceil(TAG_HEIGHT * scale) + 2;
+            auto*      SURFACE = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+            auto*      CR      = cairo_create(SURFACE);
+            const auto R       = TAG_HEIGHT / 2;
+            cairo_translate(CR, 1, 1);
+            cairo_scale(CR, scale, scale);
+            cairo_new_sub_path(CR);
+            cairo_arc(CR, cursor.tagWidth - R, R, R, -M_PI / 2, M_PI / 2);
+            cairo_arc(CR, R, R, R, M_PI / 2, 3 * M_PI / 2);
+            cairo_close_path(CR);
+            cairo_set_source_rgba(CR, 0.08, 0.09, 0.11, 0.86);
+            cairo_fill_preserve(CR);
+            cairo_set_source_rgba(CR, cursor.color.r, cursor.color.g, cursor.color.b, 0.9);
+            cairo_set_line_width(CR, 1.2);
+            cairo_stroke(CR);
+            cairo_arc(CR, 10, R, 3.2, 0, 2 * M_PI);
+            cairo_fill(CR);
+            cairo_scale(CR, 1 / scale, 1 / scale);
+            tagFont(CR, scale);
+            cairo_set_source_rgba(CR, 0.95, 0.96, 0.98, 1);
+            cairo_move_to(CR, 18 * scale, 12.6 * scale);
+            cairo_show_text(CR, name.c_str());
+            return upload(SURFACE, CR, cursor.tag, scale);
+        }
+
+        // Everything a cursor draws now, in global logical coordinates: the marker, brackets, rings and tag.
+        CBox extent(const SCursor& cursor) {
+            const double REACH = std::max({PULSE_SIZE, LOCK_FROM + 1, WING + 6});
+            CBox         box{cursor.pos - Vector2D{REACH, REACH}, Vector2D{2 * REACH, 2 * REACH}};
+            if (cursor.tagWidth > 0) {
+                const CBox TAG{cursor.pos + Vector2D{TAG_GAP, -TAG_HEIGHT / 2}, Vector2D{cursor.tagWidth, TAG_HEIGHT}};
+                const auto X1 = std::min(box.x, TAG.x), Y1 = std::min(box.y, TAG.y);
+                const auto X2 = std::max(box.x + box.w, TAG.x + TAG.w), Y2 = std::max(box.y + box.h, TAG.y + TAG.h);
+                box = CBox{X1, Y1, X2 - X1, Y2 - Y1};
+            }
             return box.expand(4);
         }
 
-        void damage() {
-            if (!g_state->drawn.empty())
-                g_pHyprRenderer->damageBox(g_state->drawn);
-            g_state->drawn = g_state->placed && alpha() > 0 ? extent() : CBox{};
-            if (!g_state->drawn.empty())
-                g_pHyprRenderer->damageBox(g_state->drawn);
+        void damage(SCursor& cursor) {
+            if (!cursor.drawn.empty())
+                g_pHyprRenderer->damageBox(cursor.drawn);
+            cursor.drawn = cursor.placed && alpha(cursor) > 0 ? extent(cursor) : CBox{};
+            if (!cursor.drawn.empty())
+                g_pHyprRenderer->damageBox(cursor.drawn);
+        }
+
+        void rect(Render::CRenderContext& ctx, const PHLMONITOR& monitor, const CBox& global, const CHyprColor& color, double round) {
+            CRectPassElement::SRectData data;
+            data.box   = CBox{global.pos() - monitor->m_position, global.size()}.scale(monitor->m_scale).round();
+            data.round = std::round(round * monitor->m_scale);
+            data.color = color;
+            g_pHyprRenderer->addPassElement(ctx, makeUnique<CRectPassElement>(data));
+        }
+
+        void drawOne(Render::CRenderContext& ctx, const PHLMONITOR& monitor, const std::string& name, SCursor& cursor) {
+            const auto A = alpha(cursor);
+            if (!cursor.placed || A <= 0 || CBox{monitor->m_position, monitor->m_size}.intersection(extent(cursor)).empty())
+                return;
+            const auto& COLOR = cursor.color;
+            for (const auto& [at, start] : cursor.pulses) {
+                const auto T      = std::clamp(seconds(start) / secondsOf(PULSE), 0.0, 1.0);
+                const auto RADIUS = PULSE_SIZE * (0.3 + 0.7 * (1 - std::pow(1 - T, 3)));
+                rect(ctx, monitor, CBox{at - Vector2D{RADIUS, RADIUS}, {2 * RADIUS, 2 * RADIUS}}, COLOR.modifyA(static_cast<float>(0.3 * (1 - T) * A)), RADIUS);
+            }
+            // Lock-on brackets: four corners that close in from LOCK_FROM to LOCK_TO as the cursor lands.
+            const auto L    = lock(cursor);
+            const auto HALF = LOCK_FROM + (LOCK_TO - LOCK_FROM) * L;
+            const auto BA   = COLOR.modifyA(static_cast<float>((0.35 + 0.65 * L) * A));
+            constexpr double T = 1.8;
+            for (const int SX : {-1, 1}) {
+                for (const int SY : {-1, 1}) {
+                    const Vector2D CORNER = cursor.pos + Vector2D{SX * HALF, SY * HALF};
+                    const double   HX     = SX < 0 ? CORNER.x - T / 2 : CORNER.x - BRACKET + T / 2;
+                    const double   VY     = SY < 0 ? CORNER.y - T / 2 : CORNER.y - BRACKET + T / 2;
+                    rect(ctx, monitor, CBox{HX, CORNER.y - T / 2, BRACKET, T}, BA, T / 2);
+                    rect(ctx, monitor, CBox{CORNER.x - T / 2, VY, T, BRACKET}, BA, T / 2);
+                }
+            }
+            const auto                   SCALE = cursor.pressed ? PRESSED : 1.0;
+            CTexPassElement::SRenderData data;
+            data.tex        = marker(cursor, monitor->m_scale);
+            const auto SIZE = data.tex->m_size / monitor->m_scale * SCALE;
+            data.box        = CBox{cursor.pos - monitor->m_position - SIZE / 2, SIZE}.scale(monitor->m_scale).round();
+            data.a          = A;
+            g_pHyprRenderer->addPassElement(ctx, makeUnique<CTexPassElement>(std::move(data)));
+            if (cursor.tagWidth > 0) {
+                CTexPassElement::SRenderData label;
+                label.tex = tag(cursor, name, monitor->m_scale);
+                label.box = CBox{cursor.pos + Vector2D{TAG_GAP, -TAG_HEIGHT / 2} - monitor->m_position - Vector2D{1, 1} / monitor->m_scale, label.tex->m_size / monitor->m_scale}
+                                .scale(monitor->m_scale)
+                                .round();
+                label.a = A;
+                g_pHyprRenderer->addPassElement(ctx, makeUnique<CTexPassElement>(std::move(label)));
+            }
         }
 
         void draw(Render::CRenderContext& ctx, const PHLMONITOR& monitor) {
-            const auto A = alpha();
-            if (!g_state->placed || A <= 0 || CBox{monitor->m_position, monitor->m_size}.intersection(extent()).empty())
-                return;
-            const auto LOCAL = g_state->pos - monitor->m_position;
-            for (const auto& [at, start] : g_state->pulses) {
-                const auto T      = std::clamp(seconds(start) / std::chrono::duration<double>(PULSE).count(), 0.0, 1.0);
-                const auto RADIUS = PULSE_SIZE * (0.3 + 0.7 * (1 - std::pow(1 - T, 3)));
-                CRectPassElement::SRectData ring;
-                ring.box   = CBox{at - monitor->m_position - Vector2D{RADIUS, RADIUS}, {2 * RADIUS, 2 * RADIUS}}.scale(monitor->m_scale).round();
-                ring.round = std::round(RADIUS * monitor->m_scale);
-                ring.color = FILL.modifyA(static_cast<float>(0.45 * (1 - T) * A));
-                g_pHyprRenderer->addPassElement(ctx, makeUnique<CRectPassElement>(ring));
-            }
-            const auto                   SCALE = g_state->pressed ? PRESSED : 1.0;
-            CTexPassElement::SRenderData arrow;
-            arrow.tex = texture(monitor->m_scale);
-            arrow.box = CBox{LOCAL - Vector2D{2, 2} * SCALE / monitor->m_scale, arrow.tex->m_size * SCALE / monitor->m_scale}.scale(monitor->m_scale).round();
-            arrow.a   = A;
-            g_pHyprRenderer->addPassElement(ctx, makeUnique<CTexPassElement>(std::move(arrow)));
+            for (auto& [name, cursor] : g_state->cursors)
+                drawOne(ctx, monitor, name, cursor);
         }
 
         // A point on the glide's arc (a quadratic Bezier through a bend to one side), at an eased fraction of the way.
@@ -682,74 +886,97 @@ namespace {
             return glide.from * ((1 - E) * (1 - E)) + glide.bend * (2 * (1 - E) * E) + glide.to * (E * E);
         }
 
-        // One animation frame; the timer runs only while something moves, pulses or fades.
+        // One animation frame for every cursor; the timer runs only while something moves, closes in, pulses or
+        // fades. A cursor that has faded out is forgotten.
         void tick(SP<CEventLoopTimer>, void*) {
             if (!g_state)
                 return;
-            std::function<void()> landed;
-            if (g_state->glide) {
-                const auto T   = std::min(seconds(g_state->glide->start) / g_state->glide->seconds, 1.0);
-                g_state->pos    = along(*g_state->glide, T);
-                g_state->active = Time::steadyNow();
-                if (T >= 1) {
-                    landed = std::move(g_state->glide->then);
-                    g_state->glide.reset();
+            std::vector<std::function<void()>> landed;
+            bool                               moving = false;
+            auto                               untilFade = ms::max();
+            for (auto it = g_state->cursors.begin(); it != g_state->cursors.end();) {
+                auto& cursor = it->second;
+                if (cursor.glide) {
+                    const auto T  = std::min(seconds(cursor.glide->start) / cursor.glide->seconds, 1.0);
+                    cursor.pos    = along(*cursor.glide, T);
+                    cursor.active = Time::steadyNow();
+                    if (T >= 1) {
+                        landed.push_back(std::move(cursor.glide->then));
+                        cursor.glide.reset();
+                        cursor.landed = Time::steadyNow();
+                    }
                 }
+                std::erase_if(cursor.pulses, [](const auto& pulse) { return seconds(pulse.second) >= secondsOf(PULSE); });
+                damage(cursor);
+                const bool VISIBLE = cursor.placed && alpha(cursor) > 0;
+                if (!cursor.glide && cursor.pulses.empty() && !VISIBLE) {
+                    it = g_state->cursors.erase(it);
+                    continue;
+                }
+                const auto FADE_IN = std::chrono::duration_cast<ms>(cursor.active + IDLE_HIDE - Time::steadyNow());
+                if (cursor.glide || !cursor.pulses.empty() || lock(cursor) < 1 || FADE_IN <= FRAME)
+                    moving = true;
+                else
+                    untilFade = std::min(untilFade, FADE_IN);
+                ++it;
             }
-            std::erase_if(g_state->pulses, [](const auto& pulse) { return seconds(pulse.second) >= std::chrono::duration<double>(PULSE).count(); });
-            damage();
             for (const auto& monitor : State::monitorState()->monitors())
                 monitor->scheduleFrame();
-            const bool MORE = g_state->glide || !g_state->pulses.empty() || (g_state->placed && alpha() > 0);
-            if (MORE) {
-                // Waiting out the idle time needs no frames: the next one is when the fade starts.
-                const auto UNTIL_FADE = std::chrono::duration_cast<ms>(g_state->active + IDLE_HIDE - Time::steadyNow());
-                const bool STILL      = !g_state->glide && g_state->pulses.empty() && UNTIL_FADE > FRAME;
-                g_state->timer->updateTimeout(STILL ? UNTIL_FADE : FRAME);
+            // Waiting out the idle time needs no frames: the next one is when the first fade starts.
+            if (moving)
+                g_state->timer->updateTimeout(FRAME);
+            else if (untilFade != ms::max())
+                g_state->timer->updateTimeout(untilFade);
+            for (auto& then : landed) {
+                if (then)
+                    then();
             }
-            if (landed)
-                landed();
         }
 
-        void wake() {
-            g_state->active = Time::steadyNow();
+        void wake(SCursor& cursor) {
+            cursor.active = Time::steadyNow();
             g_state->timer->updateTimeout(ms(1));
         }
 
-        // Glides to `to` (global), then runs `then`. With no position yet it appears there at once.
-        void glideTo(const Vector2D& to, std::function<void()> then) {
-            const auto FROM = g_state->placed ? g_state->pos : to;
-            const auto DIST = FROM.distance(to);
-            g_state->placed  = true;
+        // Glides `name`'s cursor to `to` (global), then runs `then`. With no position yet it appears there at once.
+        void glideTo(const std::string& name, const Vector2D& to, std::function<void()> then) {
+            auto&      cursor = cursorOf(name);
+            const auto FROM   = cursor.placed ? cursor.pos : to;
+            const auto DIST   = FROM.distance(to);
+            cursor.placed     = true;
             if (DIST < 2) {
-                g_state->pos = to;
-                wake();
+                cursor.pos    = to;
+                cursor.landed = Time::steadyNow();
+                wake(cursor);
                 then();
                 return;
             }
             // A smooth start and stop at a peak of PEAK_SPEED take about 1.5 times the time at that speed.
-            const auto SECONDS = std::clamp(1.5 * DIST / PEAK_SPEED, std::chrono::duration<double>(MIN_GLIDE).count(), std::chrono::duration<double>(MAX_GLIDE).count());
+            const auto SECONDS = std::clamp(1.5 * DIST / PEAK_SPEED, secondsOf(MIN_GLIDE), secondsOf(MAX_GLIDE));
             const auto DIR     = (to - FROM) / DIST;
             const auto BEND    = (FROM + to) / 2 + Vector2D{-DIR.y, DIR.x} * (DIST * ARC);
-            g_state->glide     = SGlide{FROM, BEND, to, Time::steadyNow(), SECONDS, std::move(then)};
-            wake();
+            cursor.glide       = SGlide{FROM, BEND, to, Time::steadyNow(), SECONDS, std::move(then)};
+            wake(cursor);
         }
 
-        void moveTo(const Vector2D& to) {
-            g_state->placed = true;
-            g_state->pos    = to;
-            wake();
+        void moveTo(const std::string& name, const Vector2D& to) {
+            auto& cursor  = cursorOf(name);
+            cursor.placed = true;
+            cursor.pos    = to;
+            wake(cursor);
         }
 
-        void press() {
-            g_state->pressed = true;
-            g_state->pulses.emplace_back(g_state->pos, Time::steadyNow());
-            wake();
+        void press(const std::string& name) {
+            auto& cursor   = cursorOf(name);
+            cursor.pressed = true;
+            cursor.pulses.emplace_back(cursor.pos, Time::steadyNow());
+            wake(cursor);
         }
 
-        void release() {
-            g_state->pressed = false;
-            wake();
+        void release(const std::string& name) {
+            auto& cursor   = cursorOf(name);
+            cursor.pressed = false;
+            wake(cursor);
         }
 
         // A glide still under way when the plugin unloads lands at once, so the action waiting on it still runs.
@@ -768,10 +995,14 @@ namespace {
                 return;
             g_state->render.reset();
             dropTimer(g_state->timer);
-            const auto DRAWN = g_state->drawn;
+            std::vector<CBox> drawn;
+            for (const auto& [name, cursor] : g_state->cursors)
+                drawn.push_back(cursor.drawn);
             g_state.reset();
-            if (!DRAWN.empty())
-                g_pHyprRenderer->damageBox(DRAWN);
+            for (const auto& box : drawn) {
+                if (!box.empty())
+                    g_pHyprRenderer->damageBox(box);
+            }
         }
     }
 
@@ -911,7 +1142,7 @@ namespace {
     void enterAt(const Vector2D& pos) {
         g_op->target = pos;
         if (g_op->mode == eMode::SHOWN)
-            agentcursor::moveTo(pos);
+            agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
             hiddenEnter(*g_op, pos);
             return;
@@ -929,7 +1160,7 @@ namespace {
     void moveTo(const Vector2D& pos) {
         g_op->target = pos;
         if (g_op->mode == eMode::SHOWN)
-            agentcursor::moveTo(pos);
+            agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
             hiddenMove(*g_op, pos);
             return;
@@ -952,7 +1183,7 @@ namespace {
         if (direct() ? !hiddenReady(*g_op) : !targetUnderPointer())
             return;
         if (g_op->mode == eMode::SHOWN)
-            agentcursor::press();
+            agentcursor::press(g_op->agent);
         if (direct())
             hiddenButton(*g_op, button, WL_POINTER_BUTTON_STATE_PRESSED);
         else {
@@ -977,7 +1208,7 @@ namespace {
             return;
         g_op->down.erase(IT);
         if (g_op->mode == eMode::SHOWN && g_op->down.empty())
-            agentcursor::release();
+            agentcursor::release(g_op->agent);
         if (direct()) {
             hiddenButton(*g_op, button, WL_POINTER_BUTTON_STATE_RELEASED);
             return;
@@ -1024,7 +1255,7 @@ namespace {
         dropTimer(op.timer);
         op.focusChange.reset();
         if (op.mode == eMode::SHOWN && !op.down.empty())
-            agentcursor::release();
+            agentcursor::release(op.agent);
         // An action that ends early (an error, `end`, an unload) still lets go of every button it holds. A drag and
         // drop started while it held one is its own, since the user's input is held meanwhile: it is cancelled rather
         // than dropped wherever the pointer happened to be.
@@ -1114,7 +1345,8 @@ namespace {
             return startPointer(std::move(op), ticket);
         g_gliding         = true;
         const auto START  = op.start;
-        agentcursor::glideTo(START, [op = std::move(op), ticket]() mutable {
+        const auto AGENT  = op.agent;
+        agentcursor::glideTo(AGENT, START, [op = std::move(op), ticket]() mutable {
             g_gliding = false;
             if (const auto ERROR = startPointer(std::move(op), ticket))
                 complete(ticket, errorReply(*ERROR));
@@ -2168,13 +2400,13 @@ namespace {
         });
     }
 
-    // `path <window> <shown|plain|hidden> <step>...`. A step is mX,Y to move the pointer to global X,Y (the first step,
-    // where it enters the window), pB or rB to press or release button B (272-274), wN to turn the wheel N notches
-    // (negative is up), dMS to wait MS milliseconds, or n to answer the request there while the action goes on, with
-    // its ticket for `end`.
-    constexpr auto PATH_USAGE = "usage: deskpilot path <window> <shown|plain|hidden> <step>...; a step is mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n";
+    // `path [agent=NAME] <window> <shown|plain|hidden> <step>...`, where NAME is whose agent cursor shows it. A step is
+    // mX,Y to move the pointer to global X,Y (the first step, where it enters the window), pB or rB to press or release
+    // button B (272-274), wN to turn the wheel N notches (negative is up), dMS to wait MS milliseconds, or n to answer
+    // the request there while the action goes on, with its ticket for `end`.
+    constexpr auto PATH_USAGE = "usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>...; a step is mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n";
 
-    IPC::Socket1::SResponse pathCommand(const std::vector<std::string>& args) {
+    IPC::Socket1::SResponse pathCommand(const std::vector<std::string>& args, const std::string& agent) {
         if (args.size() < 5)
             return refuse(PATH_USAGE);
         const auto WINDOW = address(args[2]);
@@ -2182,6 +2414,7 @@ namespace {
             return refuse("bad window " + args[2]);
         SOp op;
         op.window = *WINDOW;
+        op.agent  = agent;
         if (args[3] == "shown")
             op.mode = eMode::SHOWN;
         else if (args[3] == "plain")
@@ -2267,15 +2500,16 @@ namespace {
         return enqueue([op = std::move(op)](uint64_t ticket) mutable { return beginPointer(std::move(op), ticket); });
     }
 
-    // `cursor <x> <y>`: the agent cursor glides to global X,Y, in turn with the actions, answered once it lands.
-    IPC::Socket1::SResponse cursorCommand(const std::vector<std::string>& args) {
+    // `cursor [agent=NAME] <x> <y>`: NAME's agent cursor glides to global X,Y, in turn with the actions, answered once
+    // it lands.
+    IPC::Socket1::SResponse cursorCommand(const std::vector<std::string>& args, const std::string& agent) {
         const auto X = args.size() == 4 ? number(args[2]) : std::nullopt, Y = args.size() == 4 ? number(args[3]) : std::nullopt;
         if (!X || !Y)
-            return refuse("usage: deskpilot cursor <x> <y>");
+            return refuse("usage: deskpilot cursor [agent=NAME] <x> <y>");
         const Vector2D POINT{*X, *Y};
-        return enqueue([POINT](uint64_t ticket) -> std::optional<std::string> {
+        return enqueue([POINT, agent](uint64_t ticket) -> std::optional<std::string> {
             g_gliding = true;
-            agentcursor::glideTo(POINT, [ticket, POINT] {
+            agentcursor::glideTo(agent, POINT, [ticket, POINT] {
                 g_gliding = false;
                 complete(ticket, std::format(R"({{"ok":true,{}}})", pointAt(POINT)));
                 startNext();
@@ -2291,6 +2525,14 @@ namespace {
             args.push_back(word);
         // args[0] is "deskpilot".
         const std::string VERB = args.size() >= 2 ? args[1] : "";
+        // `agent=NAME` right after the verb names whose agent cursor a path or cursor request moves.
+        std::string agent;
+        if (args.size() >= 3 && args[2].starts_with("agent=")) {
+            agent = args[2].substr(6);
+            if (agent.empty() || !agentcursor::validName(agent))
+                return refuse(std::format("bad agent name '{}': use up to {} letters, digits, '-', '_' or '.'", agent, agentcursor::NAME_MAX));
+            args.erase(args.begin() + 2);
+        }
         if (VERB == "status")
             return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"version":{},"path":{},"busy":{},"queued":{}}})", jsonString(VERSION), jsonString(ownPath()),
                                                        g_op || g_keyOp || g_gliding ? "true" : "false", g_queue.size()));
@@ -2303,7 +2545,7 @@ namespace {
         if (VERB == "stage")
             return stageCommand(args);
         if (VERB == "path")
-            return pathCommand(args);
+            return pathCommand(args, agent);
         // Ends the path with this ticket now, letting go of what it holds; a path that has ended already is fine.
         if (VERB == "end") {
             const auto TICKET = args.size() == 3 ? number(args[2]) : std::nullopt;
@@ -2318,8 +2560,8 @@ namespace {
         if (VERB == "keys" || VERB == "paste")
             return keysCommand(args);
         if (VERB == "cursor")
-            return cursorCommand(args);
-        return refuse("usage: deskpilot path <window> <shown|plain|hidden> <step>... | cursor <x> <y> | keys <window> <hold-ms> <gap-ms> <txn|none> <key event>... | "
+            return cursorCommand(args, agent);
+        return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <hold-ms> <gap-ms> <txn|none> <key event>... | "
                       "paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | end <ticket> | wait <ticket> | status; a key "
                       "event is +code, -code, pHEX, rHEX or tHEX, and a path step mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
