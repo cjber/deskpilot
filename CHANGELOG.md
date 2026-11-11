@@ -36,6 +36,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **`type` keeps capitals in Wine and other X apps that read Shift from key presses.** A typed character that needs
   Shift or AltGr now presses that modifier's own key around it, as a physical keyboard does, instead of only setting
   the modifier, which Wine ignored.
+- **Typing into a window keeps every key when you switch between other apps meanwhile.** Switching focus left the
+  window's keyboard between keystrokes, and the rest of the text was dropped while the command still reported
+  success; the next keystroke now enters the window again. A chord held with `--hold` also keeps its Ctrl or Shift
+  when you switch windows during it.
 
 ## [0.5.2] - 2026-11-11
 

@@ -306,7 +306,8 @@ namespace {
         bool                               holding = false;
         // The window stays entered between strokes when nothing is held, so the next stroke needs no enter. A leave and
         // enter around each keystroke makes an app such as Chrome redraw itself unfocused and focused every time,
-        // which flickers its title bar. It is left when the sequence ends, or when the user focuses its app.
+        // which flickers its title bar. It is left when the sequence ends or the user focuses its app, and entered again
+        // when a focus change between other apps has left it.
         bool                               lingering = false;
         // A keyboard focus change Hyprland asked for mid-stroke, applied when the stroke ends.
         std::optional<WP<CWLSurfaceResource>> deferredFocus;
@@ -445,16 +446,17 @@ namespace {
     // and a focus change sends every wl_keyboard a leave, the window being typed into included. Mid-stroke the change
     // waits for the stroke to end, as the user's own input does. Hyprland's record of the focused window updates at once.
     //
-    // Each change also sends every client's keyboard a leave. Mid-stroke, a change between other apps' surfaces goes
-    // ahead without the stroke's keyboards getting it (g_shieldKeys); one into the window's own app waits, since that
-    // app's keyboard is in use.
+    // Each change also sends every client's keyboard empty modifiers and a leave. Mid-stroke, a change between other
+    // apps' surfaces goes ahead without the stroke's keyboards getting either (g_shieldKeys), so a held chord keeps its
+    // modifiers; one into the window's own app waits, since that app's keyboard is in use.
     bool g_shieldKeys = false;
 
     void endLinger(SKeyOp& op);
 
     void hkSetKeyboardFocus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
         // Hyprland enters the surface it focuses itself, so a window still entered between strokes is left first.
-        if (g_keyOp && g_keyOp->lingering) {
+        // Mid-stroke the change is shielded or deferred instead, and endStroke ends the linger before a deferred one.
+        if (g_keyOp && g_keyOp->lingering && !g_keyOp->inStroke) {
             const auto TARGET = g_keyOp->surface.lock();
             if (!TARGET || (surface && surface->client() == TARGET->client()))
                 endLinger(*g_keyOp);
@@ -478,6 +480,15 @@ namespace {
         if (g_shieldKeys && g_keyOp && std::ranges::any_of(g_keyOp->keyboards, [self](const auto& keyboard) { return keyboard.get() == self; }))
             return;
         reinterpret_cast<KeyboardLeaveFn>(g_keyboardLeaveHook->m_original)(self);
+    }
+
+    using KeyboardModsFn = void (*)(CWLKeyboardResource*, uint32_t, uint32_t, uint32_t, uint32_t);
+    CFunctionHook* g_keyboardModsHook = nullptr;
+
+    void hkKeyboardSendMods(CWLKeyboardResource* self, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+        if (g_shieldKeys && g_keyOp && std::ranges::any_of(g_keyOp->keyboards, [self](const auto& keyboard) { return keyboard.get() == self; }))
+            return;
+        reinterpret_cast<KeyboardModsFn>(g_keyboardModsHook->m_original)(self, depressed, latched, locked, group);
     }
 
     std::string jsonString(const std::string& s) {
@@ -2150,6 +2161,20 @@ namespace {
         return std::nullopt;
     }
 
+    // CWLKeyboardResource keeps the surface it is entered on private (see SX11Surface).
+    struct SKeyboardSurface {
+        friend constexpr auto member(SKeyboardSurface);
+    };
+    template struct SAccess<&CWLKeyboardResource::m_currentSurface, SKeyboardSurface>;
+
+    // Whether every keyboard of the stroke is still entered on the surface.
+    bool stillEntered(const SKeyOp& op, const SP<CWLSurfaceResource>& surface) {
+        return std::ranges::all_of(op.keyboards, [&](const auto& weak) {
+            const auto KEYBOARD = weak.lock();
+            return !KEYBOARD || ((*KEYBOARD).*member(SKeyboardSurface{})).lock() == surface;
+        });
+    }
+
     template <typename FN>
     void eachKeyboard(SKeyOp& op, FN&& fn) {
         for (const auto& weak : op.keyboards) {
@@ -2221,8 +2246,11 @@ namespace {
         pumpFrames(op.window.lock());
         // The deferred focus change and the held input are Hyprland's and the user's, not the stroke's.
         SInputOwner user{false};
-        if (const auto DEFERRED = std::exchange(op.deferredFocus, std::nullopt))
+        // Hyprland enters the surface it focuses itself, so a window left entered for the next stroke is left first.
+        if (const auto DEFERRED = std::exchange(op.deferredFocus, std::nullopt)) {
+            endLinger(op);
             reinterpret_cast<FocusFn>(g_focusHook->m_original)(g_pSeatManager.get(), DEFERRED->lock());
+        }
         auto held = std::move(op.heldInput);
         op.heldInput.clear();
         for (auto& replay : held)
@@ -2330,8 +2358,10 @@ namespace {
                 // focus, and with it the user's client, is never touched. Only a surface of the same client that has
                 // keyboard focus is left and entered again, since one wl_keyboard has one focused surface.
                 const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+                // A lingering window is used again only while its keyboards are still entered on it: a focus change
+                // between other apps sends every keyboard a leave, and keys to a left keyboard are dropped.
                 if (op.lingering) {
-                    if (op.surface.lock() == SURFACE && !(FOCUS && FOCUS->client() == SURFACE->client())) {
+                    if (op.surface.lock() == SURFACE && !(FOCUS && FOCUS->client() == SURFACE->client()) && stillEntered(op, SURFACE)) {
                         op.inStroke = true;
                         sendMods(op);
                         op.phase = SKeyOp::KEY;
@@ -3141,6 +3171,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_relativeHook      = hook(handle, "CRelativePointerProtocol", "onGetRelativePointer", reinterpret_cast<void*>(&hkGetForPointer<g_relativeHook, eInert::RELATIVE, CRelativePointerProtocol, CZwpRelativePointerManagerV1>));
     g_lockHook          = hook(handle, "CPointerConstraintsProtocol", "onLockPointer", reinterpret_cast<void*>(&hkConstrain<g_lockHook, eInert::LOCKED>));
     g_confineHook       = hook(handle, "CPointerConstraintsProtocol", "onConfinePointer", reinterpret_cast<void*>(&hkConstrain<g_confineHook, eInert::CONFINED>));
+    g_keyboardModsHook  = hook(handle, "CWLKeyboardResource", "sendMods", reinterpret_cast<void*>(&hkKeyboardSendMods));
 
     agentcursor::init();
     startAgentSeat();
