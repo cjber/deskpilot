@@ -1049,7 +1049,13 @@ namespace {
         if (!SURFACE)
             return nullptr;
         const auto HLSURFACE = Desktop::View::CWLSurface::fromResource(SURFACE);
-        return HLSURFACE ? Desktop::View::CWindow::fromView(HLSURFACE->view()) : nullptr;
+        const auto VIEW      = HLSURFACE ? HLSURFACE->view() : nullptr;
+        if (!VIEW)
+            return nullptr;
+        // A menu or tooltip the window opened is its own view, and belongs to the window.
+        if (const auto POPUP = Desktop::View::CPopup::fromView(VIEW))
+            return POPUP->windowOwner();
+        return Desktop::View::CWindow::fromView(VIEW);
     }
 
     // What a pointer at `pos` lands on, asked of Hyprland's hit tester in the order mouseMoveUnified looks: input
@@ -1098,14 +1104,25 @@ namespace {
         return SBlocker{"no window " + AT, "refused"};
     }
 
-    // The target must be what is at the point, fresh from the hit tester, and still hold the seat's pointer focus
-    // (where a press goes) before anything is sent to it.
-    bool targetUnderPointer() {
+    // Whether the target is what shows at the action's point, fresh from the hit tester. A hidden action acts beneath
+    // whatever is on top, so it is always clear; an on-screen one never reaches a window the user sees covered there,
+    // whichever way its input goes.
+    bool clearAt() {
+        if (g_op->mode == eMode::HIDDEN)
+            return true;
         if (const auto BLOCKER = blockerAt(g_op->target, g_op->window)) {
             g_op->error = BLOCKER->why;
             g_op->code  = BLOCKER->code;
             return false;
         }
+        return true;
+    }
+
+    // The target must be clear at the point and still hold the seat's pointer focus (where a press goes) before
+    // anything is sent to it.
+    bool targetUnderPointer() {
+        if (!clearAt())
+            return false;
         const auto UNDER = windowUnderPointer();
         if (UNDER && reinterpret_cast<uintptr_t>(UNDER.get()) == g_op->window)
             return true;
@@ -1177,7 +1194,8 @@ namespace {
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
-            hiddenEnter(*g_op, pos);
+            if (clearAt())
+                hiddenEnter(*g_op, pos);
             return;
         }
         Pointer::mgr()->warpTo(pos);
@@ -1195,7 +1213,8 @@ namespace {
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
-            hiddenMove(*g_op, pos);
+            if (!g_op->down.empty() || clearAt())
+                hiddenMove(*g_op, pos);
             return;
         }
         Pointer::mgr()->warpTo(pos);
@@ -1213,7 +1232,7 @@ namespace {
 
     // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
     void press(uint32_t button) {
-        if (direct() ? !hiddenReady(*g_op) : !targetUnderPointer())
+        if (direct() ? !(clearAt() && hiddenReady(*g_op)) : !targetUnderPointer())
             return;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::press(g_op->agent);
@@ -1258,7 +1277,7 @@ namespace {
     // Negative is up in Wayland.
     void wheel(int sign) {
         if (direct()) {
-            if (hiddenReady(*g_op))
+            if (clearAt() && hiddenReady(*g_op))
                 hiddenWheel(*g_op, sign);
             return;
         }
