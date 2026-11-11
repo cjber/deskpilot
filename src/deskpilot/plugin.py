@@ -346,8 +346,8 @@ class Plugin:
 
 @contextlib.contextmanager
 def load_lock() -> Generator[None]:
-    """Holds off other deskpilot processes sharing the build directory, so only one builds and loads a build at once.
-    The kernel releases the lock when its holder exits, however it exits."""
+    """Holds off other deskpilot loads sharing the build directory, so only one load builds and loads a build at once
+    (a bare `deskpilot plugin build` does not take it). The kernel releases the lock when its holder exits."""
     lock = build_dir() / "load.lock"
     try:
         lock.parent.mkdir(parents=True, exist_ok=True)

@@ -1293,7 +1293,9 @@ namespace {
 
     // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
     void press(uint32_t button) {
-        if (!onElementSurface(*g_op, g_op->target) || (direct() ? !(clearAt() && hiddenReady(*g_op)) : !targetUnderPointer()))
+        if (!onElementSurface(*g_op, g_op->target))
+            return;
+        if (direct() ? !(clearAt() && hiddenReady(*g_op)) : !targetUnderPointer())
             return;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::press(g_op->agent);
