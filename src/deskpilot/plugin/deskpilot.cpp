@@ -92,7 +92,9 @@
 #include <hyprland/src/managers/screenshare/ScreenshareManager.hpp>
 #include <hyprland/src/protocols/CursorShape.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
+#include <hyprland/src/protocols/PointerConstraints.hpp>
 #include <hyprland/src/protocols/PointerGestures.hpp>
+#include <hyprland/src/protocols/RelativePointer.hpp>
 #include <hyprland/src/protocols/XDGShell.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/protocols/core/DataDevice.hpp>
@@ -1287,9 +1289,10 @@ namespace {
     //     enter serial it answers, so a shape for one of the agent pointer's recent enters is dropped.
     //   - A cursor capture session for a pointer Hyprland has no record of would dereference null, so it is refused,
     //     which the protocol reports to the client as a stopped session.
-    //   - Hyprland sends the user's touchpad gestures to every gesture object of the client under their pointer, so a
-    //     client's gesture objects for its agent pointer (GTK makes them for each seat) would get each gesture twice.
-    //     They are taken out of Hyprland's lists and kept, inert, until the client destroys them.
+    //   - Hyprland sends the user's touchpad gestures and relative motion to every gesture and relative pointer object
+    //     of the client under their pointer, and applies a pointer lock or confinement to the user's pointer, whichever
+    //     pointer the client named. So a client asking for one with its agent pointer (GTK makes gesture objects for
+    //     each seat) gets an inert object of the seat library's instead.
     constexpr size_t      AGENT_ENTERS = 64;
     std::deque<uint32_t>  g_agentEnters;
 
@@ -1319,48 +1322,29 @@ namespace {
         return reinterpret_cast<CursorSessionFn>(g_cursorSessionHook->m_original)(self, client, pointer);
     }
 
-    struct SSwipes {
-        friend constexpr auto member(SSwipes);
-    };
-    template struct SAccess<&CPointerGesturesProtocol::m_swipes, SSwipes>;
-    struct SPinches {
-        friend constexpr auto member(SPinches);
-    };
-    template struct SAccess<&CPointerGesturesProtocol::m_pinches, SPinches>;
-    struct SHolds {
-        friend constexpr auto member(SHolds);
-    };
-    template struct SAccess<&CPointerGesturesProtocol::m_holds, SHolds>;
-
-    template <typename T>
-    std::vector<UP<T>> g_agentGestures;
-
-    using GetGestureFn = void (*)(CPointerGesturesProtocol*, CZwpPointerGesturesV1*, uint32_t, wl_resource*);
-
-    template <CFunctionHook*& HOOK, typename LIST>
-    void hkGetGesture(CPointerGesturesProtocol* self, CZwpPointerGesturesV1* manager, uint32_t id, wl_resource* pointer) {
-        auto&      list   = (*self).*member(LIST{});
-        const auto BEFORE = list.size();
-        reinterpret_cast<GetGestureFn>(HOOK->m_original)(self, manager, id, pointer);
-        if (!isAgentPointer(pointer) || list.size() <= BEFORE)
-            return;
-        using T    = std::remove_cvref_t<decltype(*list.back())>;
-        auto& kept = g_agentGestures<T>;
-        std::erase_if(kept, [](const auto& gesture) { return !gesture->good(); });
-        kept.emplace_back(std::move(list.back()));
-        list.pop_back();
+    // A gesture or relative pointer asked for with an agent pointer (Hyprland ignores which pointer it names).
+    template <CFunctionHook*& HOOK, eInert KIND, typename PROTOCOL, typename MANAGER>
+    void hkGetForPointer(PROTOCOL* self, MANAGER* manager, uint32_t id, wl_resource* pointer) {
+        if (isAgentPointer(pointer))
+            return g_agentSeat->inert(KIND, manager->client(), manager->version(), id);
+        reinterpret_cast<void (*)(PROTOCOL*, MANAGER*, uint32_t, wl_resource*)>(HOOK->m_original)(self, manager, id, pointer);
     }
 
-    CFunctionHook* g_swipeHook = nullptr;
-    CFunctionHook* g_pinchHook = nullptr;
-    CFunctionHook* g_holdHook  = nullptr;
-
-    template <typename T>
-    void leaveAllocated(std::vector<UP<T>>& kept) {
-        for (auto& resource : kept)
-            new UP<T>(std::move(resource));
-        kept.clear();
+    // A pointer lock or confinement asked for with an agent pointer (Hyprland applies it to the user's pointer).
+    template <CFunctionHook*& HOOK, eInert KIND>
+    void hkConstrain(CPointerConstraintsProtocol* self, CZwpPointerConstraintsV1* manager, uint32_t id, wl_resource* surface, wl_resource* pointer, wl_resource* region,
+                     zwpPointerConstraintsV1Lifetime lifetime) {
+        if (isAgentPointer(pointer))
+            return g_agentSeat->inert(KIND, manager->client(), manager->version(), id);
+        reinterpret_cast<decltype(&hkConstrain<HOOK, KIND>)>(HOOK->m_original)(self, manager, id, surface, pointer, region, lifetime);
     }
+
+    CFunctionHook* g_swipeHook    = nullptr;
+    CFunctionHook* g_pinchHook    = nullptr;
+    CFunctionHook* g_holdHook     = nullptr;
+    CFunctionHook* g_relativeHook = nullptr;
+    CFunctionHook* g_lockHook     = nullptr;
+    CFunctionHook* g_confineHook  = nullptr;
 
     void startAgentSeat() {
         g_agentLibrary = dlopen(DESKPILOT_SEAT, RTLD_NOW | RTLD_NODELETE);
@@ -1370,11 +1354,8 @@ namespace {
             throw std::runtime_error(std::format("deskpilot: could not open the agent seat {}: {}", DESKPILOT_SEAT, g_agentLibrary ? "no seat" : dlerror()));
     }
 
-    // The seat stays: its library is never unmapped. Gesture objects kept from Hyprland's lists run Hyprland's code only.
+    // The seat, and the inert objects clients made for it, stay: its library is never unmapped.
     void stopAgentSeat() {
-        leaveAllocated(g_agentGestures<CPointerGestureSwipe>);
-        leaveAllocated(g_agentGestures<CPointerGesturePinch>);
-        leaveAllocated(g_agentGestures<CPointerGestureHold>);
         g_agentSeat = nullptr;
         if (g_agentLibrary)
             dlclose(g_agentLibrary);
@@ -1602,16 +1583,15 @@ namespace {
     std::map<wl_client*, std::vector<WP<CXDGPopupResource>>> g_ungrabbed;
 
     void closeUngrabbed(const SP<CWLSurfaceResource>& target) {
-        const auto IT = g_ungrabbed.find(target->client());
-        if (IT == g_ungrabbed.end())
-            return;
-        auto& popups = IT->second;
-        std::erase_if(popups, [](const auto& popup) { return !popup; });
-        if (std::ranges::any_of(popups, [&](const auto& popup) { return popup->m_surface && popup->m_surface->m_surface.lock() == target; }))
-            return;
-        for (const auto& popup : popups | std::views::reverse)
-            popup->done();
-        g_ungrabbed.erase(IT);
+        std::erase_if(g_ungrabbed, [&](auto& entry) {
+            auto& popups = entry.second;
+            std::erase_if(popups, [](const auto& popup) { return !popup; });
+            if (std::ranges::any_of(popups, [&](const auto& popup) { return popup->m_surface && popup->m_surface->m_surface.lock() == target; }))
+                return false;
+            for (const auto& popup : popups | std::views::reverse)
+                popup->done();
+            return true;
+        });
     }
 
     using SeatButtonFn = void (*)(CSeatManager*, uint32_t, uint32_t, wl_pointer_button_state);
@@ -2629,9 +2609,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_seatButtonHook    = hook(handle, "CSeatManager", "sendPointerButton", reinterpret_cast<void*>(&hkSendPointerButton));
     g_shapeHook         = hook(handle, "CCursorShapeProtocol", "onSetShape", reinterpret_cast<void*>(&hkOnSetShape));
     g_cursorSessionHook = hook(handle, "CScreenshareManager", "newCursorSession", reinterpret_cast<void*>(&hkNewCursorSession));
-    g_swipeHook         = hook(handle, "CPointerGesturesProtocol", "onGetSwipeGesture", reinterpret_cast<void*>(&hkGetGesture<g_swipeHook, SSwipes>));
-    g_pinchHook         = hook(handle, "CPointerGesturesProtocol", "onGetPinchGesture", reinterpret_cast<void*>(&hkGetGesture<g_pinchHook, SPinches>));
-    g_holdHook          = hook(handle, "CPointerGesturesProtocol", "onGetHoldGesture", reinterpret_cast<void*>(&hkGetGesture<g_holdHook, SHolds>));
+    g_swipeHook         = hook(handle, "CPointerGesturesProtocol", "onGetSwipeGesture", reinterpret_cast<void*>(&hkGetForPointer<g_swipeHook, eInert::SWIPE, CPointerGesturesProtocol, CZwpPointerGesturesV1>));
+    g_pinchHook         = hook(handle, "CPointerGesturesProtocol", "onGetPinchGesture", reinterpret_cast<void*>(&hkGetForPointer<g_pinchHook, eInert::PINCH, CPointerGesturesProtocol, CZwpPointerGesturesV1>));
+    g_holdHook          = hook(handle, "CPointerGesturesProtocol", "onGetHoldGesture", reinterpret_cast<void*>(&hkGetForPointer<g_holdHook, eInert::HOLD, CPointerGesturesProtocol, CZwpPointerGesturesV1>));
+    g_relativeHook      = hook(handle, "CRelativePointerProtocol", "onGetRelativePointer", reinterpret_cast<void*>(&hkGetForPointer<g_relativeHook, eInert::RELATIVE, CRelativePointerProtocol, CZwpRelativePointerManagerV1>));
+    g_lockHook          = hook(handle, "CPointerConstraintsProtocol", "onLockPointer", reinterpret_cast<void*>(&hkConstrain<g_lockHook, eInert::LOCKED>));
+    g_confineHook       = hook(handle, "CPointerConstraintsProtocol", "onConfinePointer", reinterpret_cast<void*>(&hkConstrain<g_confineHook, eInert::CONFINED>));
 
     agentcursor::init();
     startAgentSeat();

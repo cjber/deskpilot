@@ -10,15 +10,22 @@
 #pragma once
 
 #include <hyprland/protocols/wayland.hpp>
+#include <cstdint>
 #include <hyprutils/memory/WeakPtr.hpp>
 
 #include <vector>
+
+// Objects other protocols make for a wl_pointer, which an agent pointer gets in place of Hyprland's own.
+enum class eInert : uint8_t { SWIPE, PINCH, HOLD, RELATIVE, LOCKED, CONFINED };
 
 struct SAgentSeat {
     // The agent pointers a client holds, in the order it asked for them.
     std::vector<Hyprutils::Memory::CWeakPointer<CWlPointer>> (*pointersOf)(wl_client* client);
     // Whether a wl_pointer resource is an agent pointer.
     bool (*isPointer)(wl_resource* resource);
+    // Makes the client a protocol object it asked for with an agent pointer, which is never sent anything and goes
+    // when the client destroys it.
+    void (*inert)(eInert kind, wl_client* client, uint32_t version, uint32_t id);
 };
 
 // Advertises the seat on its first call and returns it; later calls, from any plugin build, return the same one.

@@ -6,6 +6,9 @@
 
 #include "seat.hpp"
 
+#include <hyprland/protocols/pointer-constraints-unstable-v1.hpp>
+#include <hyprland/protocols/pointer-gestures-unstable-v1.hpp>
+#include <hyprland/protocols/relative-pointer-unstable-v1.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
 
 #include <algorithm>
@@ -53,6 +56,32 @@ namespace {
         g_seats.emplace_back(std::move(seat));
     }
 
+    template <typename T>
+    std::vector<CSharedPointer<T>> g_inert;
+
+    template <typename T>
+    void makeInert(wl_client* client, uint32_t version, uint32_t id) {
+        auto object = makeShared<T>(client, version, id);
+        if (!object->resource()) {
+            wl_client_post_no_memory(client);
+            return;
+        }
+        object->setDestroy([](T* self) { forget(g_inert<T>, self); });
+        object->setOnDestroy([](T* self) { forget(g_inert<T>, self); });
+        g_inert<T>.emplace_back(std::move(object));
+    }
+
+    void inert(eInert kind, wl_client* client, uint32_t version, uint32_t id) {
+        switch (kind) {
+            case eInert::SWIPE: makeInert<CZwpPointerGestureSwipeV1>(client, version, id); break;
+            case eInert::PINCH: makeInert<CZwpPointerGesturePinchV1>(client, version, id); break;
+            case eInert::HOLD: makeInert<CZwpPointerGestureHoldV1>(client, version, id); break;
+            case eInert::RELATIVE: makeInert<CZwpRelativePointerV1>(client, version, id); break;
+            case eInert::LOCKED: makeInert<CZwpLockedPointerV1>(client, version, id); break;
+            case eInert::CONFINED: makeInert<CZwpConfinedPointerV1>(client, version, id); break;
+        }
+    }
+
     std::vector<CWeakPointer<CWlPointer>> pointersOf(wl_client* client) {
         std::vector<CWeakPointer<CWlPointer>> out;
         for (const auto& pointer : g_pointers) {
@@ -68,7 +97,7 @@ namespace {
 }
 
 extern "C" const SAgentSeat* deskpilot_agent_seat(wl_display* display) {
-    static const SAgentSeat SEAT = {.pointersOf = pointersOf, .isPointer = isPointer};
+    static const SAgentSeat SEAT = {.pointersOf = pointersOf, .isPointer = isPointer, .inert = inert};
     static const bool       ADVERTISED = wl_global_create(display, &wl_seat_interface, 9, nullptr, bind) != nullptr;
     return ADVERTISED ? &SEAT : nullptr;
 }

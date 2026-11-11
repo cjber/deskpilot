@@ -9,10 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 - **GTK and Qt apps get a pointer of deskpilot's own.** The plugin adds a second seat, `deskpilot`, with a pointer
   only. An app that binds it takes clicks, scrolls, drags and hovers there, so a hidden action works on a window of
-  the app the user's pointer is on, and nothing of the user's is held. A menu it opens never grabs the user's input,
-  and a click outside it closes it. Apps that bind only the first seat (Chromium, Electron, kitty), XWayland apps,
-  apps started before the plugin first loaded, and keys keep the routes they had.
-- **A menu a hidden click opened closes on a click outside it**, as the user's own would.
+  the app the user's pointer is on, and nothing of the user's is held. Apps that bind only the first seat (Chromium,
+  Electron, kitty), XWayland apps, apps started before the plugin first loaded, and keys keep the routes they had.
+- **A menu deskpilot opens no longer grabs the user's pointer and keyboard**, in any app or mode, and a click
+  outside it, the user's or deskpilot's, closes it as the user's own menus close.
 
 ## [0.5.2] - 2026-11-11
 
