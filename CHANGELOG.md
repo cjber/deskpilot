@@ -30,6 +30,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
   that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
   desktop can be told apart.
+- **The first action after a Hyprland restart no longer fails with "Cannot load a plugin twice!"** when several
+  deskpilot calls start at once. One call loads the plugin while the others wait and then use it, and a call that
+  cannot reach Hyprland says so instead of trying to load the plugin again.
 
 ## [0.5.2] - 2026-11-11
 

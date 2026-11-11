@@ -20,7 +20,15 @@ from deskpilot.hypr import (
     pick_instance,
     run_hyprctl,
 )
-from deskpilot.plugin import REQUEST_BYTES, Plugin, PluginError, parse_reply, request_size, source_hash
+from deskpilot.plugin import (
+    REQUEST_BYTES,
+    Plugin,
+    PluginError,
+    PluginNotLoaded,
+    parse_reply,
+    request_size,
+    source_hash,
+)
 
 
 def win(address="0x1", cls="wow.exe", title="World of Warcraft", x=1440, y=560, w=3440, h=1440):
@@ -469,6 +477,80 @@ def test_a_plugin_change_keeps_the_seat_library_and_a_seat_change_replaces_both(
 
     (tmp_path / "seat.cpp").write_text("changed")
     assert plugin_module.seat_path("c" * 16) != seat
+
+
+COMMIT = "aaaaaaaaaaaaaaaa"
+
+
+def fake_hyprland(tmp_path, monkeypatch, plugin_load="ok"):
+    """A Hyprland whose headers match it, with this source's build already on disk so nothing is compiled. Each status
+    answers the next of `fake.statuses` (the last repeats), and `plugin load` answers `plugin_load` and loads it."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setattr(plugin_module, "headers_commit", lambda: COMMIT)
+    path = plugin_module.build_path(COMMIT)
+    path.parent.mkdir(parents=True)
+    path.touch()
+    mine = json.dumps({"ok": True, "version": source_hash(), "path": str(path)})
+
+    class Fake:
+        def __init__(self):
+            self.calls, self.statuses = [], ["unknown request"]
+
+        def __call__(self, args):
+            self.calls.append(args)
+            if args[:2] == ["-j", "version"]:
+                return json.dumps({"commit": COMMIT})
+            if args[:2] == ["plugin", "load"]:
+                if plugin_load in ("ok", "Cannot load a plugin twice!"):
+                    self.statuses = [mine]
+                return plugin_load
+            if args == ["deskpilot", "status"]:
+                return self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+            if args[:2] == ["deskpilot", "keys"]:
+                return '{"ok":true}' if self.statuses == [mine] else "unknown request"
+            raise AssertionError(args)
+
+    return Fake(), path, mine
+
+
+def test_a_load_another_process_won_is_accepted(tmp_path, monkeypatch):
+    fake, _, _ = fake_hyprland(tmp_path, monkeypatch, "Cannot load a plugin twice!")
+    assert Plugin(fake).keys("0xabc", ["+28", "-28"]) == {"ok": True}
+    assert [args[1] for args in fake.calls if args[0] == "deskpilot" and args[1] == "keys"] == ["keys", "keys"]
+
+
+def test_a_refused_load_with_nothing_loaded_still_fails(tmp_path, monkeypatch):
+    fake, _, _ = fake_hyprland(tmp_path, monkeypatch, "permission is disabled")
+    with pytest.raises(PluginError, match="permission is disabled") as error:
+        Plugin(fake).load()
+    assert error.value.code == "unavailable"
+
+
+def test_a_status_hyprctl_cannot_get_is_not_read_as_not_loaded(tmp_path, monkeypatch):
+    fake, _, _ = fake_hyprland(tmp_path, monkeypatch)
+
+    def run(args):
+        if args == ["deskpilot", "status"]:
+            raise HyprctlError("hyprctl deskpilot status exited 6: Hyprland IPC didn't respond in time")
+        return fake(args)
+
+    with pytest.raises(PluginError, match="exited 6") as error:
+        Plugin(run).load()
+    assert error.value.code == "unavailable"
+    assert not any(args[0] == "plugin" for args in fake.calls)
+
+
+def test_load_rechecks_once_it_holds_the_lock(tmp_path, monkeypatch):
+    fake, path, mine = fake_hyprland(tmp_path, monkeypatch)
+    fake.statuses = ["unknown request", mine]
+    assert Plugin(fake).load() == path
+    assert not any(args[0] == "plugin" for args in fake.calls)
+
+
+def test_an_empty_reply_is_unavailable_not_a_missing_plugin():
+    with pytest.raises(PluginError, match="without answering") as error:
+        parse_reply("")
+    assert not isinstance(error.value, PluginNotLoaded) and error.value.code == "unavailable"
 
 
 def test_plugin_sends_button_codes_and_reads_replies():

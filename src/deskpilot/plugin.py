@@ -8,6 +8,8 @@ upgrade.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +17,7 @@ import re
 import secrets
 import subprocess
 import tempfile
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -88,10 +91,14 @@ def seat_path(commit: str) -> Path:
 
 
 def parse_reply(text: str) -> dict:
-    """The plugin's JSON answer, or a PluginError carrying its refusal. `unknown request` means it is not loaded."""
+    """The plugin's JSON answer, or a PluginError carrying its refusal. `unknown request` means it is not loaded.
+    Hyprland answers every request it reads, so an empty reply means it dropped the connection, not that the plugin is
+    missing."""
     text = text.strip()
-    if text == "unknown request" or not text:
+    if text == "unknown request":
         raise PluginNotLoaded("the deskpilot Hyprland plugin is not loaded: run `deskpilot plugin load`")
+    if not text:
+        raise PluginError("Hyprland closed the connection without answering: try again", "unavailable")
     try:
         reply = json.loads(text)
     except ValueError as error:
@@ -173,10 +180,16 @@ class Plugin:
         )
 
     def loaded(self) -> bool:
+        status = self.loaded_status()
+        return status is not None and status.get("version") == source_hash()
+
+    def loaded_status(self) -> dict | None:
+        """The loaded build's status, or None when Hyprland has no deskpilot plugin. Failing to ask Hyprland raises,
+        so it is never taken for a missing plugin and answered with a blind load."""
         try:
-            return self.status().get("version") == source_hash()
-        except PluginError:
-            return False
+            return self.status()
+        except PluginNotLoaded:
+            return None
 
     def status(self) -> dict:
         return self._send("status")
@@ -246,9 +259,8 @@ class Plugin:
 
     def unload(self) -> None:
         """Unload whatever deskpilot build is loaded. A build too old to report its path names it in the error."""
-        try:
-            status = self.status()
-        except PluginError:
+        status = self.loaded_status()
+        if status is None:
             return
         if not status.get("path"):
             raise PluginError(
@@ -291,14 +303,43 @@ class Plugin:
         return out
 
     def load(self) -> Path:
-        """Build the plugin for the running Hyprland if needed and load it, replacing a loaded build of other source."""
+        """Build the plugin for the running Hyprland if needed and load it, replacing a loaded build of other source.
+        Succeeds whenever this source's build is loaded afterwards, whoever loaded it."""
         if self.loaded():
             return build_path(self.commit())
         path = build_path(self.running_commit())
-        self.unload()
-        if not path.exists():
-            path = self.build()
-        out = self.run(["plugin", "load", str(path)]).strip()
-        if out != "ok":
-            raise PluginError(f"hyprctl plugin load {path}: {out}", "unavailable")
+        with load_lock():
+            # Another deskpilot process may have loaded it while this one waited for the lock.
+            if self.loaded():
+                return path
+            self.unload()
+            if not path.exists():
+                path = self.build()
+            out = self.run(["plugin", "load", str(path)]).strip()
+            if out != "ok":
+                # A loader outside the lock, such as a Hyprland config `plugin =` line, may have loaded this very
+                # build first: the outcome decides, not Hyprland's message.
+                with contextlib.suppress(PluginError):
+                    status = self.loaded_status() or {}
+                    if status.get("version") == source_hash() and status.get("path") == str(path):
+                        return path
+                raise PluginError(f"hyprctl plugin load {path}: {out}", "unavailable")
         return path
+
+
+@contextlib.contextmanager
+def load_lock() -> Generator[None]:
+    """Holds off other deskpilot processes sharing the build directory, so only one builds and loads a build at once.
+    The kernel releases the lock when its holder exits, however it exits."""
+    lock = build_dir() / "load.lock"
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        file = lock.open("a")
+    except OSError as error:
+        raise PluginError(f"cannot open the plugin load lock {lock}: {error}", "unavailable") from error
+    with file:
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX)
+        except OSError as error:
+            raise PluginError(f"cannot lock {lock}: {error}", "unavailable") from error
+        yield
