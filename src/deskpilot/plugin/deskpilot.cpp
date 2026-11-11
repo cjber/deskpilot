@@ -34,6 +34,8 @@
 // HIDDEN drives the window client's own pointer instead and touches neither the seat's pointer nor the user's input
 // unless it holds a button, so the window may be off screen (see the hidden pointer section).
 // `hyprctl deskpilot cursor [agent=NAME] <x> <y>` glides an agent cursor alone.
+// `hyprctl deskpilot agent <name> [owner=PID]` places every window an agent launched on its hidden workspace, and
+// `agent <name> stop` closes them (see agents).
 //
 // `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
 // without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
@@ -75,6 +77,8 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 
 #include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/desktop/rule/Engine.hpp>
+#include <hyprland/src/desktop/rule/windowRule/WindowRule.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/ViewHitTester.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
@@ -130,6 +134,8 @@
 #include <deque>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <filesystem>
+#include <csignal>
 #include <fstream>
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
@@ -2767,6 +2773,182 @@ namespace {
 
     // `cursor [agent=NAME] <x> <y>`: NAME's agent cursor glides to global X,Y, in turn with the actions, answered once
     // it lands.
+    // The apps an agent launched (`deskpilot launch`). Each agent NAME has a window rule that puts every window of a
+    // process whose environment carries HL_EXEC_RULE_TOKEN=deskpilot-agent-NAME (set by `launch`, inherited by the app's
+    // children) on the hidden special:agent-NAME workspace, silently and without taking focus. Hyprland's own exec
+    // rules are not used: they place only the first window and expire a minute after launch, so a later dialog would
+    // open on the user's workspace. A config reload clears every rule, so the plugin registers them again after it.
+    namespace agents {
+        // An agent with no owner process is stopped after this long without a request naming it.
+        constexpr auto IDLE = std::chrono::minutes(30);
+        // How long a stopped agent's apps have to close their windows before their processes are sent SIGTERM.
+        constexpr auto GRACE = std::chrono::seconds(5);
+        constexpr auto CHECK = std::chrono::seconds(30);
+
+        struct SAgent {
+            SP<Desktop::Rule::CWindowRule> rule;
+            // The process whose exit stops the agent; 0 stops it after IDLE instead.
+            pid_t           owner = 0;
+            Time::steady_tp used;
+            // Set once stopping: SIGTERM is due then, and the rule stays until it is sent.
+            SP<CEventLoopTimer> stopping;
+        };
+
+        std::map<std::string, SAgent> g_agents;
+        SP<CEventLoopTimer>           g_reaper;
+        CHyprSignalListener           g_reloaded;
+
+        std::string token(const std::string& name) {
+            return "deskpilot-agent-" + name;
+        }
+
+        std::string workspace(const std::string& name) {
+            return "special:agent-" + name;
+        }
+
+        SP<Desktop::Rule::CWindowRule> makeRule(const std::string& name) {
+            auto rule = Desktop::Rule::CWindowRule::buildFromExecString(
+                std::format("workspace {} silent;no_initial_focus 1;suppress_event activate activatefocus fullscreen maximize", workspace(name)));
+            if (!rule)
+                return nullptr;
+            // The match is a full regex match; a name's only regex character is '.'.
+            std::string pattern;
+            for (const char C : token(name))
+                pattern += C == '.' ? std::string("\\.") : std::string(1, C);
+            (*rule)->registerMatch(Desktop::Rule::RULE_PROP_EXEC_TOKEN, pattern);
+            return *rule;
+        }
+
+        // Every process of this user whose environment carries the agent's token.
+        std::vector<pid_t> processes(const std::string& name) {
+            const std::string     ENTRY = std::format("{}={}", Desktop::Rule::EXEC_RULE_ENV_NAME, token(name));
+            std::vector<pid_t>    found;
+            std::error_code       error;
+            for (const auto& dir : std::filesystem::directory_iterator("/proc", error)) {
+                const auto PID = number(dir.path().filename().string());
+                if (!PID || *PID <= 1 || *PID == getpid())
+                    continue;
+                std::ifstream file(dir.path() / "environ", std::ios::binary);
+                for (std::string entry; std::getline(file, entry, '\0');) {
+                    if (entry == ENTRY) {
+                        found.push_back(static_cast<pid_t>(*PID));
+                        break;
+                    }
+                }
+            }
+            return found;
+        }
+
+        void forget(const std::string& name) {
+            const auto IT = g_agents.find(name);
+            if (IT == g_agents.end())
+                return;
+            dropTimer(IT->second.stopping);
+            if (IT->second.rule)
+                Desktop::Rule::ruleEngine()->unregisterRule(IT->second.rule);
+            g_agents.erase(IT);
+        }
+
+        // Asks each of the agent's windows to close, as the user closing it would, and sends SIGTERM to its processes
+        // left after GRACE. The rule stays until then, so a window opened meanwhile still lands out of view.
+        void stop(const std::string& name) {
+            auto& agent = g_agents.at(name);
+            if (agent.stopping)
+                return;
+            const auto WORKSPACE = workspace(name);
+            for (const auto& window : Desktop::windowState()->windows()) {
+                if (window->mapped() && window->m_workspace && window->m_workspace->addressableName() == WORKSPACE)
+                    window->sendClose();
+            }
+            agent.stopping = makeShared<CEventLoopTimer>(
+                GRACE,
+                [name](SP<CEventLoopTimer>, void*) {
+                    for (const auto PID : processes(name))
+                        kill(PID, SIGTERM);
+                    forget(name);
+                },
+                nullptr);
+            g_pEventLoopManager->addTimer(agent.stopping);
+        }
+
+        void reap(SP<CEventLoopTimer> self, void*) {
+            const auto          NOW = Time::steadyNow();
+            std::vector<std::string> due;
+            for (const auto& [name, agent] : g_agents) {
+                const bool GONE = agent.owner > 0 ? kill(agent.owner, 0) == -1 && errno == ESRCH : NOW - agent.used > IDLE;
+                if (GONE && !agent.stopping)
+                    due.push_back(name);
+            }
+            for (const auto& name : due)
+                stop(name);
+            self->updateTimeout(CHECK);
+        }
+
+        void init() {
+            g_reaper = makeShared<CEventLoopTimer>(CHECK, reap, nullptr);
+            g_pEventLoopManager->addTimer(g_reaper);
+            g_reloaded = Event::bus()->m_events.config.reloaded.listen([] {
+                for (auto& [name, agent] : g_agents) {
+                    if (agent.rule)
+                        Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(agent.rule));
+                }
+            });
+        }
+
+        // The rules are Hyprland's, but a rule left registered would keep placing windows with no plugin to stop them.
+        void shutdown() {
+            g_reloaded.reset();
+            dropTimer(g_reaper);
+            g_reaper.reset();
+            for (auto& [name, agent] : g_agents) {
+                dropTimer(agent.stopping);
+                if (agent.rule)
+                    Desktop::Rule::ruleEngine()->unregisterRule(agent.rule);
+            }
+            g_agents.clear();
+        }
+
+        // `agent NAME [owner=PID]` registers NAME's rule if it has none and marks it in use; an owner, once given, is
+        // kept. `agent NAME stop` stops it. Both answer at once.
+        IPC::Socket1::SResponse command(const std::vector<std::string>& args) {
+            constexpr auto USAGE = "usage: deskpilot agent <name> [owner=PID] | agent <name> stop";
+            if (args.size() < 3 || args.size() > 4)
+                return refuse(USAGE);
+            const std::string& NAME = args[2];
+            if (!agentcursor::validName(NAME))
+                return refuse(std::format("bad agent name '{}': use up to {} letters, digits, '-', '_' or '.'", NAME, agentcursor::NAME_MAX));
+            const auto IT = g_agents.find(NAME);
+            // An agent the plugin no longer knows, as after it was reloaded, is stopped all the same.
+            if (args.size() == 4 && args[3] == "stop") {
+                g_agents[NAME];
+                stop(NAME);
+                return IPC::Socket1::SResponse(okReply());
+            }
+            pid_t owner = 0;
+            if (args.size() == 4) {
+                const auto PID = args[3].starts_with("owner=") ? number(args[3].substr(6)) : std::nullopt;
+                if (!PID || *PID <= 1)
+                    return refuse(USAGE);
+                owner = static_cast<pid_t>(*PID);
+            }
+            if (IT != g_agents.end() && IT->second.stopping)
+                return refuse(std::format("agent {} is stopping; try again in {} seconds", NAME, GRACE.count()), "busy");
+            auto& agent = g_agents[NAME];
+            if (!agent.rule) {
+                agent.rule = makeRule(NAME);
+                if (!agent.rule) {
+                    g_agents.erase(NAME);
+                    return refuse("could not build the window rule for agent " + NAME);
+                }
+                Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(agent.rule));
+            }
+            if (owner)
+                agent.owner = owner;
+            agent.used = Time::steadyNow();
+            return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"workspace":{},"token":{}}})", jsonString(workspace(NAME)), jsonString(token(NAME))));
+        }
+    }
+
     IPC::Socket1::SResponse cursorCommand(const std::vector<std::string>& args, const std::string& agent) {
         const auto X = args.size() == 4 ? number(args[2]) : std::nullopt, Y = args.size() == 4 ? number(args[3]) : std::nullopt;
         if (!X || !Y)
@@ -2826,8 +3008,10 @@ namespace {
             return keysCommand(args);
         if (VERB == "cursor")
             return cursorCommand(args, agent);
+        if (VERB == "agent")
+            return agents::command(args);
         return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <hold-ms> <gap-ms> <txn|none> <key event>... | "
-                      "paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | end <ticket> | wait <ticket> | status; a key "
+                      "paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | agent <name> [owner=PID|stop] | end <ticket> | wait <ticket> | status; a key "
                       "event is +code, -code, pHEX, rHEX or tHEX, and a path step mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
 }
@@ -2887,6 +3071,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     agentcursor::init();
     startAgentSeat();
+    agents::init();
     g_pumpTimer = makeShared<CEventLoopTimer>(std::nullopt, pumpTick, nullptr);
     g_pEventLoopManager->addTimer(g_pumpTimer);
 
@@ -2921,6 +3106,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_tickets.clear();
     restorePaste();
     stopAgentSeat();
+    agents::shutdown();
     agentcursor::shutdown();
     dropTimer(g_pumpTimer);
     g_pumped.clear();

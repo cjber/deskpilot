@@ -7,8 +7,8 @@ screenshot, pick a point, click it. Pass --scale 1 to give window pixels instead
 Clicks, scrolls, drags, hovers, keys and text run inside the compositor through the deskpilot Hyprland plugin
 (`deskpilot plugin load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on
 the user's keymap; a marker the plugin draws shows where the agent acts, one per DESKPILOT_AGENT name. --hidden acts
-on a window wherever it is, on screen or not, with nothing shown. --take-pointer and --take-focus move the user's
-own pointer or focus instead.
+on an app the agent started with `deskpilot launch`, on its own hidden workspace, with nothing shown. --take-pointer
+and --take-focus move the user's own pointer or focus instead.
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ def _view_args(s: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--hidden",
         action="store_true",
-        help="act on the window wherever it is, on screen or not, with no agent cursor and the user's pointer, focus "
-        "and view untouched (not for XWayland windows' pointer input)",
+        help="act on a window this agent started with `deskpilot launch`, on its hidden workspace, with no agent "
+        "cursor and the user's pointer, focus and view untouched (not for XWayland windows' pointer input)",
     )
 
 
@@ -154,7 +154,7 @@ def _wait_command(sub) -> None:
         "--region", type=int, nargs=4, metavar=("X", "Y", "W", "H"), help="with --changed, only this part of the shot"
     )
     s.add_argument(
-        "--hidden", action="store_true", help="with --changed, watch the window wherever it is, on screen or not"
+        "--hidden", action="store_true", help="with --changed, watch a window this agent launched (deskpilot launch)"
     )
 
 
@@ -223,6 +223,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--set", metavar="TEXT", help="the text to copy, or - to read it from stdin")
 
     _wait_command(sub)
+
+    s = sub.add_parser(
+        "launch",
+        help="start an app for this agent (DESKPILOT_AGENT) on its hidden workspace, for --hidden actions; print its "
+        "first window",
+    )
+    s.add_argument("command", nargs=argparse.REMAINDER, help="the app and its arguments")
+    s.add_argument("--timeout", type=float, default=30, help="seconds to wait for its first window")
+    sub.add_parser("show", help="show this agent's hidden workspace on the focused monitor, or hide it again")
+    sub.add_parser("stop", help="close this agent's launched apps")
 
     sub.add_parser("cursor", help="print the cursor's global position")
     sub.add_parser("mcp", help="run the MCP server on stdio")
@@ -348,6 +358,14 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             if args.action == "load":
                 return {"path": str(desk.plugin.load()), **desk.plugin.status()}
             return desk.plugin.status()
+        case "launch":
+            return desk.launch(args.command, args.timeout).to_dict()
+        case "show":
+            desk.show_agent()
+            return "ok"
+        case "stop":
+            desk.stop()
+            return "ok"
         case "cursor":
             x, y = desk.hypr.cursor()
             return {"x": x, "y": y}

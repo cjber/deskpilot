@@ -1,21 +1,23 @@
 """The actions an agent takes, shared by the CLI and the MCP server.
 
 Clicks, scrolls, drags, hovers and keys go through the deskpilot Hyprland plugin, which leaves the user's pointer and
-keyboard focus where they were; the agent cursor the plugin draws shows where they land. `hidden` acts on a window
-wherever it is, on screen or not, with nothing shown and the user's pointer untouched. `take_pointer` instead moves the
-user's own pointer and clicks through the uinput device, and `take_focus` focuses the window before its keys.
+keyboard focus where they were; the agent cursor the plugin draws shows where they land. `hidden` acts on a window the
+agent launched with `launch`, on its own hidden workspace, with nothing shown and the user's pointer untouched; the
+user's own windows are never hidden targets. `take_pointer` instead moves the user's own pointer and clicks through the
+uinput device, and `take_focus` focuses the window before its keys.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from pathlib import Path
 
 from PIL import Image, ImageChops
 
 from . import a11y, clipboard, keys, screen
-from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound
+from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound, find_window
 from .plugin import BUTTON_CODES, Plugin, PluginError
 
 
@@ -66,12 +68,27 @@ HOLD_MS = 52
 HOVER_SHOT_MS = 5000
 
 
+# How long `launch` waits for the app's first window.
+LAUNCH_TIMEOUT = 30.0
+
+
+def owner_from_env() -> int | None:
+    """The process named by DESKPILOT_OWNER_PID, whose exit closes the agent's launched apps."""
+    value = os.environ.get("DESKPILOT_OWNER_PID") or None
+    if value is not None and not (value.isdigit() and int(value) > 1):
+        raise ValueError(f"DESKPILOT_OWNER_PID={value!r}: give a process id")
+    return int(value) if value else None
+
+
 class Desk:
-    def __init__(self, hypr: Hyprland | None = None, input_factory=None, plugin=None):
+    def __init__(self, hypr: Hyprland | None = None, input_factory=None, plugin=None, owner: int | None = None):
         self.hypr = hypr or Hyprland()
         self.plugin = plugin or Plugin()
         self._input_factory = input_factory
         self._input = None
+        # The process whose exit stops this agent's launched apps; without one they stop after 30 minutes unused.
+        self.owner = owner if owner is not None else owner_from_env()
+        self._launched: list[subprocess.Popen] = []
 
     @property
     def input(self):
@@ -99,19 +116,33 @@ class Desk:
         self.hypr.focus(win)
         return win
 
-    def _on_screen(self, win: Window, show: bool, hidden: bool = False) -> Window:
-        """The window to act on. A visible action reaches only what is showing, so a window off screen is an error
-        unless `show`, which focuses it, since that switches the user's workspace or scrolls their layout. A hidden
-        action takes the window wherever it is."""
+    def _workspace(self) -> str:
+        """The agent's hidden workspace, registering the agent with the plugin, which marks it in use."""
+        return self.plugin.register(self.owner)["workspace"]
+
+    def _target(self, query: str, show: bool, hidden: bool) -> Window:
+        """The window to act on. A hidden action reaches only the agent's own launched windows, on its hidden
+        workspace. A visible action reaches only what is showing, so a window off screen is an error unless `show`,
+        which focuses it, since that switches the user's workspace or scrolls their layout."""
         if show and hidden:
             raise ValueError("show brings a window into view and hidden acts out of view: pass one")
-        if win.visible or hidden:
+        if hidden:
+            workspace = self._workspace()
+            mine = [w for w in self.hypr.windows() if w.workspace == workspace]
+            try:
+                return find_window(mine, query)
+            except WindowNotFound:
+                raise WindowNotFound(
+                    f"no window of agent {self.plugin.agent} matches '{query}': hidden acts only on the apps the agent "
+                    "started with `deskpilot launch` (launch over MCP), never on the user's own windows"
+                ) from None
+        win = self.window(query)
+        if win.visible:
             return win
         if not show:
             raise NotVisible(
                 f"{win.cls} ({win.address}) is not on screen: its workspace {win.workspace} is not showing or it is "
-                "scrolled off its monitor. Pass --hidden (hidden over MCP) to act on it where it is, out of view, or "
-                "--show (show) to bring it into view, which focuses it"
+                "scrolled off its monitor. Pass --show (show over MCP) to bring it into view, which focuses it"
             )
         self.hypr.focus(win)
         deadline = time.monotonic() + SHOW_TIMEOUT
@@ -122,6 +153,55 @@ class Desk:
             time.sleep(0.05)
         raise NotVisible(f"{win.cls} ({win.address}) did not come on screen within {SHOW_TIMEOUT}s of focusing it")
 
+    def launch(self, command: list[str], timeout: float = LAUNCH_TIMEOUT) -> Window:
+        """Start an app for this agent and return its first window. It and every window its processes open later are
+        on the agent's hidden workspace, out of the user's view and focus, for hidden actions to drive. An app that
+        hands its window to a copy already running for the user (a single-instance app) opens nothing here."""
+        if not command:
+            raise ValueError("name the app to launch")
+        agent = self.plugin.register(self.owner)
+        workspace = agent["workspace"]
+        # Hyprland reuses a closed window's address, so a window is known by its stable id too.
+        before = {(w.address, w.stable_id) for w in self.hypr.windows()}
+        env = {**os.environ, "HL_EXEC_RULE_TOKEN": agent["token"]}
+        # Hyprland places a window carrying this on the workspace its launcher was started from, ahead of rules.
+        env.pop("HL_INITIAL_WORKSPACE_TOKEN", None)
+        self._launched = [p for p in self._launched if p.poll() is None]
+        try:
+            proc = subprocess.Popen(
+                command,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise ValueError(f"cannot start {command[0]}: {error.strerror}") from error
+        self._launched.append(proc)
+        deadline = time.monotonic() + timeout
+        while True:
+            new = [
+                w for w in self.hypr.windows() if w.workspace == workspace and (w.address, w.stable_id) not in before
+            ]
+            if new:
+                return new[0]
+            if proc.poll() not in (None, 0):
+                raise RuntimeError(f"{command[0]} exited {proc.returncode} before opening a window")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"{command[0]} opened no window within {timeout:g}s")
+            time.sleep(0.1)
+
+    def show_agent(self) -> None:
+        """Show the agent's hidden workspace on the user's focused monitor, or hide it again. Input the user gives
+        there is theirs; the agent's actions go on and keep their refusals."""
+        self.hypr.toggle_special(self._workspace().removeprefix("special:"))
+
+    def stop(self) -> None:
+        """Close the agent's launched windows, as the user closing them would, and end its apps' processes left five
+        seconds later."""
+        self.plugin.stop()
+
     def shot(
         self,
         query: str,
@@ -130,7 +210,7 @@ class Desk:
         show: bool = False,
         hidden: bool = False,
     ) -> screen.Shot:
-        return screen.capture(self._on_screen(self.window(query), show, hidden), out, max_width)
+        return screen.capture(self._target(query, show, hidden), out, max_width)
 
     def point(
         self,
@@ -148,7 +228,7 @@ class Desk:
         centre of that element of the window's accessibility tree, where the app says it is now."""
         if (element is None) == (x is None or y is None):
             raise ValueError("give a point (x and y) or an element, not both or neither")
-        win = self._on_screen(self.window(query), show, hidden)
+        win = self._target(query, show, hidden)
         if element is not None:
             ex, ey, ew, eh = a11y.locate(win, element)
             return win, *screen.to_global(win, ex + ew / 2, ey + eh / 2, 1.0)
@@ -324,7 +404,7 @@ class Desk:
     def elements(self, query: str, show: bool = False, hidden: bool = False, peek: bool = False) -> a11y.Element:
         """The window's accessibility tree, whose element ids click, hover, move and scroll take. A peek leaves the
         latest snapshot, and the ids taken from it, in place."""
-        return a11y.snapshot(self._on_screen(self.window(query), show, hidden), peek=peek)
+        return a11y.snapshot(self._target(query, show, hidden), peek=peek)
 
     def key(self, combo: str, query: str | None = None, take_focus: bool = False, hold: float = 0.0) -> None:
         """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
@@ -360,7 +440,10 @@ class Desk:
             if focused is None:
                 raise WindowNotFound("no window has keyboard focus; name one with a window query")
             return focused
-        return self.focus(query) if take_focus else self.window(query)
+        win = self.focus(query) if take_focus else self.window(query)
+        if self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
+            self._workspace()  # marks the agent in use
+        return win
 
     def wait_for(
         self,
@@ -412,7 +495,7 @@ class Desk:
         """Wait until the window looks different from `shot`, in all of it or in `region` (x, y, width, height in
         that shot's pixels). Returns a shot of the change and the box that changed in its pixels. A pixel counts as
         changed when it differs at all; a window resized since the shot has changed everywhere."""
-        win = self._on_screen(self.window(query), False, hidden)
+        win = self._target(query, False, hidden)
         base = screen.load(shot)
         if win.address != base.address:
             raise screen.StaleShot(f"shot {shot} is of window {base.address}, not {win.address}")
@@ -424,7 +507,7 @@ class Desk:
             before = image.convert("RGB").crop(box)
         deadline = time.monotonic() + timeout
         while True:
-            win = self._on_screen(self.window(query), False, hidden)
+            win = self._target(query, False, hidden)
             now = screen.capture(win, max_width=base.width)
             # A resize, or a move to a monitor of another scale, changes the whole image.
             if (now.width, now.height) != (base.width, base.height):

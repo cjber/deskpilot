@@ -17,12 +17,13 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    a minute once per Hyprland version. `deskpilot plugin status` reports the loaded build.
 2. Run `deskpilot windows` and pick the target by address, class, or part of its class or title. A name that matches
    several windows is an error that lists them: pick one by address rather than guessing. `visible` is false for a
-   window on a hidden workspace or scrolled off screen; acting on it is refused unless you pass `--hidden`, which
-   acts on it where it is without the user seeing anything, or `--show`, which focuses it and moves the user's
-   view, so ask the user before `--show`. `--hidden` works on `shot`, `click`, `scroll`, `drag`, `hover`,
-   `elements` and `wait-for --changed`, for native Wayland windows; an XWayland window is refused, and so is one of the
-   app the user's pointer is on unless that app took deskpilot's own seat (GTK and Qt apps started after the
-   plugin loaded do).
+   window on a hidden workspace or scrolled off screen; acting on it is refused unless you pass `--show`, which
+   focuses it and moves the user's view, so ask the user before `--show`.
+   To work out of the user's sight, set `DESKPILOT_AGENT` to a name and start your own copy of the app with
+   `deskpilot launch CMD...`: it and every window it opens later stay on your hidden workspace, and `--hidden` acts
+   on them (only on them, never the user's windows) on `shot`, `click`, `scroll`, `drag`, `hover`, `elements` and
+   `wait-for --changed`. An XWayland window is refused hidden. `deskpilot stop` closes your apps when you are done;
+   `deskpilot show` lets the user see them. For web pages and browsers use fastbrowse instead.
 3. Run `deskpilot shot WINDOW`, read the image at the `path` it prints, and choose a point in that image. Note its
    `shot` id.
 4. Act with that point as given, passing the id: `deskpilot click WINDOW X Y --shot ID` (`--button right`,
@@ -70,13 +71,14 @@ press into the focused window, which may be the user's own: always pass `--windo
 
 Each error starts with a code: `deskpilot: CODE: message`, or in MCP the result's structured `code`.
 
-- "is not on screen": the window is on a hidden workspace or scrolled off. Pass `--hidden`, or ask the user before
-  passing `--show`.
+- "is not on screen": the window is on a hidden workspace or scrolled off. Ask the user before passing `--show`,
+  or `deskpilot launch` your own copy of the app and act on it with `--hidden`.
+- `not_found` with `--hidden`: hidden acts only on apps you started with `deskpilot launch`.
 - "take a new shot": the window changed size since the shot. Shoot again and pick the point anew.
 - A plugin build failure names the missing headers or compiler.
 - A stale `HYPRLAND_INSTANCE_SIGNATURE` is handled: deskpilot finds the live Hyprland, and stops with a list when
   several are live. Ask the user which one to use.
-- `covered`: another window or layer is over the point; `--hidden` acts on the window beneath it. `gone`: the
+- `covered`: another window or layer is over the point. `gone`: the
   window closed. Take a new `shot`, since the window may have moved, resized or been covered.
 - `stale`: the element id is from a replaced snapshot, or the element's role or name changed. Run `elements`
   again and pick the id anew; pass ids as `SNAPSHOT:e5` so an old one cannot match a renumbered tree. To look

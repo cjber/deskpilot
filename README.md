@@ -29,13 +29,22 @@ Several agents can work on one desktop at once, each with a cursor of its own. S
 tag, in a colour taken from the name and kept apart from the other cursors on screen. Without it, actions share one
 unnamed cursor. Actions still run one at a time; the cursors show whose each one is.
 
-`--hidden` acts on a window wherever it is, on a hidden or special workspace included, fully out of the user's
-view: no workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
+An agent can run apps of its own out of the user's sight. `DESKPILOT_AGENT=NAME deskpilot launch CMD...` starts
+an app on the hidden special workspace `special:agent-NAME` and prints its first window. Every window the app opens,
+then or later, lands there without taking focus, so a dialog never pops up on the user's screen. `deskpilot show`
+toggles that workspace on the focused monitor for the user to watch or step in, and `deskpilot stop` closes the
+agent's apps. They also close when the process named by `DESKPILOT_OWNER_PID` exits (the MCP server names itself),
+or with no owner after 30 minutes unused. For web pages and signed-in browsers use
+[fastbrowse](https://github.com/agent-labs-dev/fastbrowse), which drives Chrome over CDP.
+
+`--hidden` acts on one of the agent's launched windows, never the user's own, fully out of the user's view: no
+workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
 sends pointer input straight to that window's own client, and lets it draw while off screen so a screenshot after the
 action shows the result. Tooltips and menus it opens show in that screenshot and take its clicks, and they never
 grab the user's input. It works for native Wayland windows. An XWayland window (X11 and Wine apps) is refused,
 since X clients read the one X pointer only the user's pointer moves; so is a window of the app the user's pointer is
-on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled.
+on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled. A single-instance
+app that hands its window to a copy the user already runs opens nothing for the agent.
 
 Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
 the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
@@ -101,11 +110,11 @@ taken at. A window resized since that shot is refused, as is a point outside the
 window pixels instead.
 
 An on-screen action is refused as `covered` at a point another window, bar or popup is over, since the user
-would see it land on that instead. `--hidden` acts on the window beneath it.
+would see it land on that instead.
 
 A window on a hidden workspace or scrolled off its monitor is reported as `"visible": false`, and `shot`, `move`,
-`click`, `scroll`, `drag`, `hover` and `elements` refuse it rather than move the user's view. `--hidden` acts on it
-where it is, out of view; `--show` focuses it to bring it on screen first.
+`click`, `scroll`, `drag`, `hover` and `elements` refuse it rather than move the user's view; `--show` focuses it
+to bring it on screen first.
 
 The first action that needs the plugin builds and loads it for the running Hyprland, so it comes back by itself
 after Hyprland restarts or upgrades. `deskpilot plugin load` does the same ahead of time.
@@ -164,10 +173,10 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
 id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`, `key`, `type_text`, `paste_text`,
-`clipboard`, `copy_text`, `wait_for` and `wait_changed`. `click`, `move` and `scroll` take `shot`, `show` and
+`clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
 `take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements` and
-`wait_changed` take `hidden`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
-keeps one input device open for the session.
+`wait_changed` take `hidden`, for windows from `launch`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
+keeps one input device open for the session, and the apps it launched close when it exits.
 
 Every expected failure has a code, one stable word to branch on: `not_found`, `ambiguous`, `not_visible`,
 `offscreen`, `stale`, `covered` (another window is over the point), `gone` (the window closed), `refused`, `busy`,

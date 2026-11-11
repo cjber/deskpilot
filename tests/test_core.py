@@ -206,8 +206,17 @@ class FakeInput:
 
 
 class FakePlugin:
+    agent = "tester"
+
     def __init__(self):
         self.calls = []
+
+    def register(self, owner=None):
+        self.calls.append(("register", owner))
+        return {"ok": True, "workspace": "special:agent-tester", "token": "deskpilot-agent-tester"}
+
+    def stop(self):
+        self.calls.append(("stop",))
 
     def keys(self, *args, **timing):
         self.calls.append(("keys", *args, timing))
@@ -253,18 +262,49 @@ def test_click_goes_through_the_plugin_and_leaves_the_pointer_alone(tmp_path, mo
         desk.scroll("battle", 100, 50, 51)
 
 
-def test_hidden_actions_drive_the_window_s_own_pointer_wherever_it_is(tmp_path, monkeypatch):
+AGENT_CLIENT = {**CLIENT, "address": "0xdef", "workspace": {"name": "special:agent-tester"}}
+
+
+def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkeypatch):
     desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
-    fake.showing = "2"
-    desk.click("battle", 100, 50, hidden=True)
-    assert plugin.calls == [("path", "0xabc", "hidden", ["m2727,1066", "d52", "p272", "r272"])]
+    fake.clients.append(AGENT_CLIENT)
+    desk.click("0xdef", 100, 50, scale=0.5, hidden=True)
+    assert plugin.calls == [("register", None), ("path", "0xdef", "hidden", ["m2727,1066", "d52", "p272", "r272"])]
     assert not any(c[0] == "dispatch" for c in fake.calls), "hidden input must not focus or show anything"
+    with pytest.raises(WindowNotFound, match="deskpilot launch"):
+        desk.click("0xabc", 100, 50, hidden=True)
     with pytest.raises(ValueError):
-        desk.click("battle", 100, 50, hidden=True, show=True)
+        desk.click("0xdef", 100, 50, hidden=True, show=True)
     with pytest.raises(ValueError):
-        desk.click("battle", 100, 50, hidden=True, take_pointer=True)
+        desk.click("0xdef", 100, 50, hidden=True, take_pointer=True)
     with pytest.raises(ValueError):
-        desk.click("battle", 100, 50, hidden=True, take_focus=True)
+        desk.click("0xdef", 100, 50, hidden=True, take_focus=True)
+
+
+def test_launch_tags_the_app_for_the_agent_s_workspace_and_returns_its_window(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    desk.owner = 4242
+    fake.clients.append({**AGENT_CLIENT, "stableId": "1"})
+    monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "the-terminal-s")
+    started = []
+
+    class FakePopen:
+        def __init__(self, command, env, **kwargs):
+            started.append((command, env, kwargs))
+            # Hyprland gives the new window the address of one closed before, with a new stable id.
+            fake.clients[:] = [CLIENT, {**AGENT_CLIENT, "stableId": "2"}]
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    assert desk.launch(["gnome-calculator"]).address == "0xdef"
+    ((command, env, kwargs),) = started
+    assert command == ["gnome-calculator"] and kwargs["start_new_session"]
+    assert env["HL_EXEC_RULE_TOKEN"] == "deskpilot-agent-tester" and "HL_INITIAL_WORKSPACE_TOKEN" not in env
+    assert plugin.calls == [("register", 4242)]
+    desk.stop()
+    assert plugin.calls[-1] == ("stop",)
 
 
 def test_cursor_off_sends_plain_paths(tmp_path, monkeypatch):
