@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import Literal
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.types import CallToolResult, TextContent
 
-from .desk import EXPECTED, Desk, error_code
+from .desk import EXPECTED, Desk, error_code, owner_from_env
 
 mcp = MCPServer("deskpilot")
-desk = Desk()
+# The server is the agent's owner process: its apps close when it exits, unless DESKPILOT_OWNER_PID names another.
+desk = Desk(owner=owner_from_env() or os.getpid())
 
 
 def _tool(**options):
@@ -41,7 +43,8 @@ def _tool(**options):
 @_tool()
 def windows() -> list[dict]:
     """List mapped windows: address, class, title, global position and size, focus, and whether any of it is on
-    screen. A window that is not visible is reached with hidden (out of view) or show (brought into view)."""
+    screen. A window that is not visible is reached with show (brought into view); one the agent launched (see launch)
+    with hidden, out of view."""
     return [w.to_dict() for w in desk.windows()]
 
 
@@ -55,7 +58,7 @@ def focus(window: str) -> dict:
 def shot(window: str, max_width: int = 1400, show: bool = False, hidden: bool = False) -> list:
     """Screenshot a window, returning the image and its shot id. Later move/click/scroll points are pixels in this
     image; pass its id as `shot` to refuse the action if the window has changed size since. A window that is not on
-    screen is an error unless hidden is set, which captures it where it is, or show, which focuses it."""
+    screen is an error unless show is set, which focuses it; hidden captures a window the agent launched (launch)."""
     taken = desk.shot(window, max_width=max_width, show=show, hidden=hidden)
     return [Image(path=taken.path), taken.to_dict()]
 
@@ -77,7 +80,8 @@ def click(
     """Click a point given in pixels of `shot`, or of the window's latest screenshot, or the centre of an element id
     from `elements`. The user's pointer and keyboard focus stay put unless take_pointer is set, or take_focus, which
     focuses the window first and leaves it focused: use it for a menu or dropdown that closes as soon as it opens.
-    hidden clicks the window wherever it is, on screen or not, with no agent cursor shown (not XWayland windows)."""
+    hidden clicks a window the agent launched (see launch) on its hidden workspace, with no agent cursor shown (not
+    XWayland windows)."""
     gx, gy = desk.click(
         window,
         x,
@@ -123,7 +127,7 @@ def scroll(
     hidden: bool = False,
 ) -> dict:
     """Scroll at a point of `shot` or the window's latest screenshot, or at an element; positive dy scrolls up.
-    hidden scrolls the window wherever it is, out of view."""
+    hidden scrolls a window the agent launched, out of view."""
     gx, gy = desk.scroll(
         window, x, y, dy, take_pointer=take_pointer, shot=shot, show=show, element=element, hidden=hidden
     )
@@ -146,7 +150,7 @@ def hover(
     """Rest the pointer on a point (or element) for `wait` seconds, up to 5, without moving the user's pointer, and
     return a screenshot taken while it rests there: tooltips and hover states show in it. With then_click, a point
     in the same pixels, click there next before the pointer leaves, as a menu that opens on hover needs. hidden
-    hovers the window wherever it is, out of view."""
+    hovers a window the agent launched, out of view."""
     result = desk.hover(
         window,
         x,
@@ -179,7 +183,7 @@ def drag(
 ) -> dict:
     """Press at (x1, y1), move to (x2, y2) over duration seconds (up to 5) and release, in pixels of `shot` or the
     window's latest screenshot: sliders, text selection, drawing and drag and drop within the window. The user's
-    pointer stays put. hidden drags in the window wherever it is, out of view; drag and drop is not available there."""
+    pointer stays put. hidden drags in a window the agent launched, out of view; no drag and drop there."""
     gx, gy = desk.drag(window, (x1, y1), (x2, y2), button, duration, shot=shot, show=show, hidden=hidden)
     return {"x": gx, "y": gy}
 
@@ -263,6 +267,22 @@ def wait_changed(
     changed."""
     taken, box = desk.wait_changed(window, shot, timeout, region, hidden)
     return [Image(path=taken.path), {**taken.to_dict(), "changed": list(box)}]
+
+
+@_tool()
+def launch(command: list[str], timeout: float = 30) -> dict:
+    """Start an app, as its command and arguments, on this agent's own hidden workspace and return its first window.
+    It and every window it opens later stay out of the user's view and focus; drive them with hidden. Needs
+    DESKPILOT_AGENT set for the server. The apps close when this server exits. Browsers and web pages are
+    fastbrowse's job, not this."""
+    return desk.launch(command, timeout).to_dict()
+
+
+@_tool()
+def stop() -> str:
+    """Close every app this agent launched, as the user closing its windows would."""
+    desk.stop()
+    return "ok"
 
 
 def serve() -> None:

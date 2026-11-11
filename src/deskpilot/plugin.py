@@ -193,6 +193,23 @@ class Plugin:
         """Glide this agent's cursor to a global point, in turn with the actions, and return once it lands."""
         return self._call("cursor", *self._agent(), str(gx), str(gy))
 
+    def register(self, owner: int | None = None) -> dict:
+        """Have every window this agent launches open on its hidden workspace, and mark the agent in use. `owner` is
+        the process whose exit stops the agent; with none it stops after 30 minutes unused. Returns the workspace and
+        the token `launch` puts in the app's environment."""
+        return self._call("agent", self._named(), *([f"owner={owner}"] if owner else []))
+
+    def stop(self) -> None:
+        """Close this agent's windows, and end its apps' processes left five seconds later."""
+        self._call("agent", self._named(), "stop")
+
+    def _named(self) -> str:
+        if not self.agent:
+            raise ValueError(
+                "name the agent with DESKPILOT_AGENT: an agent's launched apps and its hidden workspace are its own"
+            )
+        return self.agent
+
     def end(self, ticket: int) -> None:
         """End the path with this ticket now, letting go of what it holds. One that has ended already is fine."""
         self._send("end", str(ticket))

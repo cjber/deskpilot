@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **`--hidden` now drives apps the agent launched, never the user's own windows.** `deskpilot launch CMD...` (with
+  `DESKPILOT_AGENT` set) starts an app on the agent's hidden workspace, and every window it opens, then or later,
+  stays there without taking focus. `deskpilot show` lets the user see that workspace, and `deskpilot stop` closes
+  the agent's apps, which also close when the owner process (`DESKPILOT_OWNER_PID`, or the MCP server) exits, or
+  after 30 minutes unused. The MCP server gains `launch` and `stop`. A hidden action on a window the agent did not
+  launch is now refused as `not_found`.
 - **GTK and Qt apps get a pointer of deskpilot's own.** The plugin adds a second seat, `deskpilot`, with a pointer
   only. An app that binds it takes clicks, scrolls, drags and hovers there, so a hidden action works on a window of
   the app the user's pointer is on, and nothing of the user's is held. Apps that bind only the first seat (Chromium,
@@ -15,8 +21,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   outside it, the user's or deskpilot's, closes it as the user's own menus close.
 - **A click into a covered window is refused, not reported as done.** An on-screen click, scroll, drag or hover
   on a native Wayland window at a point another window covered went to the window beneath and reported success,
-  though the user saw nothing happen there. It is now refused as `covered`, as it already was for XWayland windows;
-  `--hidden` acts on the window beneath on purpose.
+  though the user saw nothing happen there. It is now refused as `covered`, as it already was for XWayland windows.
 - **Clicks reach a window's own menus when it is under your pointer.** A click into a dropdown or menu the target
   window had opened was refused as `covered` whenever the action had to go through your pointer.
 - **A missing accessibility registry is reported as `unavailable`.** When no AT-SPI registry was running, `elements`

@@ -44,7 +44,8 @@ window on the hidden `special:dptest` workspace, with a headless output to act o
   other action goes through the plugin, which sends input to the target app's own pointer and keyboard and never
   holds the user's input, except where the target can only be reached through the seat (an XWayland window, or the
   app the user's pointer or keyboard focus is in): there it must restore both and replay input the user made
-  meanwhile. A window that is not on screen is an error unless the action is hidden, never a reason to focus it.
+  meanwhile. A window that is not on screen is an error unless the action is hidden, never a reason to focus it. A hidden
+  action reaches only the windows its agent launched, on `special:agent-NAME`, never the user's own.
 - A point is resolved against a recorded shot. A shot is of one window at one size; any other use is refused.
 - A plugin build loads only into the Hyprland it was built against. Builds are named after the Hyprland commit and
   the plugin source hash, so a changed source or an upgrade rebuilds rather than reusing a stale build.

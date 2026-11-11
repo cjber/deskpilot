@@ -198,6 +198,10 @@ class Hyprland:
     def move_cursor(self, gx: int, gy: int) -> None:
         self._dispatch(f"hl.dsp.cursor.move({{x={gx},y={gy}}})", f"movecursor {gx} {gy}")
 
+    def toggle_special(self, name: str) -> None:
+        """Show the special workspace `name` on the focused monitor, or hide it if it is showing."""
+        self._dispatch(f'hl.dsp.workspace.toggle_special("{name}")', f"togglespecialworkspace {name}")
+
     def focus(self, window: Window) -> None:
         self._dispatch(f'hl.dsp.focus({{window="address:{window.address}"}})', f"focuswindow address:{window.address}")
 
