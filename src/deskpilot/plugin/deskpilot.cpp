@@ -2310,8 +2310,14 @@ namespace {
             sendKey(op, op.down.back(), false);
     }
 
+    // A sequence ended mid-stroke, as when the plugin is unloaded, first lets go of every key the stroke pressed and
+    // leaves its keyboards or gives them back the user's modifiers, whether or not it held the user's input.
     void finishKeys() {
         SInputOwner agent;
+        if (g_keyOp->inStroke && g_keyOp->phase != SKeyOp::AWAIT_RESTORE)
+            restoreStroke(*g_keyOp);
+        if (g_keyOp->inStroke)
+            endStroke(*g_keyOp);
         endLinger(*g_keyOp);
         auto op = std::move(*g_keyOp);
         g_keyOp.reset();
@@ -3379,8 +3385,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
         finish();
     }
     if (g_keyOp) {
-        if (g_keyOp->holding)
-            restoreStroke(*g_keyOp);
         g_keyOp->error = "the deskpilot plugin was unloaded";
         g_keyOp->code  = "unavailable";
         finishKeys();

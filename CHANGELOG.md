@@ -53,6 +53,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - **The first action after a Hyprland restart no longer fails with "Cannot load a plugin twice!"** when several
   deskpilot calls start at once. One call loads the plugin while the others wait and then use it, and a call that
   cannot reach Hyprland says so instead of trying to load the plugin again.
+- **Unloading the plugin while it types no longer leaves a key held down in the window.** The keys the keystroke
+  had pressed are let go first, so the app does not repeat the last one.
 - **`type` keeps capitals in Wine and other X apps that read Shift from key presses.** A typed character that needs
   Shift or AltGr now presses that modifier's own key around it, as a physical keyboard does, instead of only setting
   the modifier, which Wine ignored.
