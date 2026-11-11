@@ -46,14 +46,22 @@ since X clients read the one X pointer only the user's pointer moves; so is a wi
 on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled. A single-instance
 app that hands its window to a copy the user already runs opens nothing for the agent.
 
+Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched windows, go to that window's own
+client and never hold the user's input: keys never use the `deskpilot` seat, so an XWayland window is refused, and so
+is a keystroke while the user's keyboard focus is in the window's app. A hidden `shot`, `hover` or
+`wait-for --changed` of a window that lies outside its monitor's area, such as a column of the agent's workspace that
+a scrolling layout puts off screen, is refused with `not_visible`: Hyprland sends no frame of it. A capture that gets
+no frame in 5 seconds fails with `timeout`.
+
 Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
 the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
 XWayland target gets X focus for each stroke and sees a focus-in and focus-out around it; Hyprland's own focus
 does not move.
 
 Text is typed as written on the user's own keymap, whatever its layout and with Caps Lock on: the plugin finds the
-key that gives each character on the active keyboard's keymap, which every client has, and sets the modifiers it
-needs directly. A character no key on that keymap gives is an error rather than skipped.
+key that gives each character on the active keyboard's keymap, which every client has, and presses that keymap's own
+modifier keys (Shift, AltGr) around it, as a physical keyboard does. A character no key on that keymap gives is an
+error rather than skipped.
 
 `--take-pointer` uses a virtual mouse made with `/dev/uinput` instead, which the compositor treats as real
 hardware. Tools that synthesize input another way, such as `xdotool` (XTest), are ignored by some clients:
@@ -113,8 +121,8 @@ An on-screen action is refused as `covered` at a point another window, bar or po
 would see it land on that instead.
 
 A window on a hidden workspace or scrolled off its monitor is reported as `"visible": false`, and `shot`, `move`,
-`click`, `scroll`, `drag`, `hover` and `elements` refuse it rather than move the user's view; `--show` focuses it
-to bring it on screen first.
+`click`, `scroll`, `drag`, `hover`, `elements`, `key`, `type` and `paste` refuse it rather than move the user's
+view; `--show` focuses it to bring it on screen first.
 
 The first action that needs the plugin builds and loads it for the running Hyprland, so it comes back by itself
 after Hyprland restarts or upgrades. `deskpilot plugin load` does the same ahead of time.
@@ -139,7 +147,11 @@ element's centre where the app reports it at that moment. Each `elements` call p
 `SNAPSHOT:e5` pins an id to that snapshot: it is refused as stale once a newer snapshot replaces it, since every
 snapshot numbers its elements afresh. An element whose role or name changed since is stale too, and one no longer
 showing is offscreen. `elements --peek` reads the tree without replacing the latest snapshot, so a program can check
-what changed before it acts on an id it already holds. GTK and Qt apps expose a tree; Chromium, Electron and
+what changed before it acts on an id it already holds. An item of a GTK 3 popup menu (an open combo box, a menu or
+submenu) is placed on the popup it is in, so its bounds line up with a shot showing the popup and a click lands on it;
+when the popup cannot be told exactly the action is refused (`stale` once it closed, `ambiguous` when several could be
+it) and `elements` reports the item with zero bounds. An element's click is also refused `covered` when another
+surface, such as a submenu over its menu, takes the point. GTK and Qt apps expose a tree; Chromium, Electron and
 Firefox expose one only when started with accessibility on (`--force-renderer-accessibility` for Chromium and
 Electron), and Wine games expose none. An app with no tree is an error saying so, never a guessed one.
 
@@ -155,7 +167,9 @@ compositor, so they never trigger a Hyprland keybind: use `hyprctl dispatch` for
 `paste` hands text to a window as a clipboard only that window sees, then presses its paste chord (`--keys`,
 `ctrl+v` by default; most terminals want `ctrl+shift+v`). It pastes any text, including characters the keymap cannot
 type, and the user's clipboard stays as it is. XWayland windows share one clipboard, so `paste` refuses them: use
-`type`. `clipboard` reads the user's clipboard, and `clipboard --set` replaces it.
+`type`. An app that holds the user's clipboard, because they last copied in it, pastes its own copy instead, so a
+paste into any of its windows is refused with `owns_clipboard`: `type` the text (each newline becomes Return, which
+can submit a form), or ask the user to copy something in another app. `clipboard` reads the user's clipboard, and `clipboard --set` replaces it.
 
 `type` sends keys as fast as the app reads them, about 1 KB a second into Chrome. Games read keys once per frame,
 so type into them with `--delay 0.1` or more: each key is held that long, with the same gap before the next. For
@@ -174,14 +188,15 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
 id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`, `key`, `type_text`, `paste_text`,
 `clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
-`take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements` and
-`wait_changed` take `hidden`, for windows from `launch`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
+`take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements`,
+`key`, `type_text`, `paste_text` and `wait_changed` take `hidden`, for windows from `launch`, and `key`, `type_text` and
+`paste_text` take `show`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
 keeps one input device open for the session, and the apps it launched close when it exits.
 
 Every expected failure has a code, one stable word to branch on: `not_found`, `ambiguous`, `not_visible`,
-`offscreen`, `stale`, `covered` (another window is over the point), `gone` (the window closed), `refused`, `busy`,
-`no_tree`, `unavailable`, `timeout` or `invalid`. The CLI prints `deskpilot: CODE: message`. An MCP tool returns
-an error result whose text is `CODE: message` and whose structured content is `{"code": ..., "message": ...}`.
+`offscreen`, `stale`, `covered` (another window is over the point), `gone` (the window closed), `owns_clipboard`
+(a paste's target app holds the user's clipboard), `refused`, `busy`, `no_tree`, `unavailable`, `timeout` or
+`invalid`. The CLI prints `deskpilot: CODE: message`. An MCP tool returns an error result whose text is `CODE: message` and whose structured content is `{"code": ..., "message": ...}`.
 
 ```sh
 claude mcp add deskpilot -- deskpilot mcp
@@ -190,7 +205,7 @@ claude mcp add deskpilot -- deskpilot mcp
 ## Limits
 
 - `type` can only send characters the active keymap types; a character it lacks (such as `é` on a US layout) is
-  an error rather than skipped. `paste` takes any text, except into XWayland windows.
+  an error rather than skipped. `paste` takes any text, except into XWayland windows and apps that hold the user's clipboard.
 - Hyprland plugins load only into the exact Hyprland they were built against, so `deskpilot plugin load` builds
   one per Hyprland commit and plugin source under `~/.local/share/deskpilot`, and replaces a loaded build of
   other source.

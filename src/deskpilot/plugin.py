@@ -8,6 +8,8 @@ upgrade.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +17,7 @@ import re
 import secrets
 import subprocess
 import tempfile
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,7 +36,8 @@ AGENT_NAME = re.compile(r"[A-Za-z0-9._-]{1,32}")
 
 class PluginError(RuntimeError):
     """The plugin's refusal. `code` is the plugin's word for its kind: covered (another window or layer is over the
-    point), gone (the window or surface went away), busy (its queue is full), unavailable, or refused."""
+    point), gone (the window or surface went away), owns_clipboard (a paste's target app holds the user's clipboard),
+    busy (its queue is full), unavailable, or refused."""
 
     def __init__(self, message: str, code: str = "refused"):
         super().__init__(message)
@@ -88,10 +92,14 @@ def seat_path(commit: str) -> Path:
 
 
 def parse_reply(text: str) -> dict:
-    """The plugin's JSON answer, or a PluginError carrying its refusal. `unknown request` means it is not loaded."""
+    """The plugin's JSON answer, or a PluginError carrying its refusal. `unknown request` means it is not loaded.
+    Hyprland answers every request it reads, so an empty reply means it dropped the connection, not that the plugin is
+    missing."""
     text = text.strip()
-    if text == "unknown request" or not text:
+    if text == "unknown request":
         raise PluginNotLoaded("the deskpilot Hyprland plugin is not loaded: run `deskpilot plugin load`")
+    if not text:
+        raise PluginError("Hyprland closed the connection without answering: try again", "unavailable")
     try:
         reply = json.loads(text)
     except ValueError as error:
@@ -173,10 +181,16 @@ class Plugin:
         )
 
     def loaded(self) -> bool:
+        status = self.loaded_status()
+        return status is not None and status.get("version") == source_hash()
+
+    def loaded_status(self) -> dict | None:
+        """The loaded build's status, or None when Hyprland has no deskpilot plugin. Failing to ask Hyprland raises,
+        so it is never taken for a missing plugin and answered with a blind load."""
         try:
-            return self.status().get("version") == source_hash()
-        except PluginError:
-            return False
+            return self.status()
+        except PluginNotLoaded:
+            return None
 
     def status(self) -> dict:
         return self._send("status")
@@ -186,8 +200,16 @@ class Plugin:
         there first), "plain" (on screen, no cursor) or "hidden" (the window's own pointer, wherever the window is).
         `mX,Y` moves to a global point (the first step enters the window there), `pCODE` and `rCODE` press and
         release a button, `wN` turns the wheel N notches (positive up), `dMS` waits, and `n` answers here with the
-        action's ticket while it goes on, until it ends or `end` ends it."""
+        action's ticket while it goes on, until it ends or `end` ends it. `sX,Y` or `s`, before the first move, is the
+        surface an element is on: the popup whose surface origin is X,Y in window pixels (see `popups`), or the window's
+        own. The first point must hit that surface, or the action is refused `covered`."""
         return self._call("path", *self._agent(), address, mode, *steps)
+
+    def popups(self, address: str) -> list[dict]:
+        """The window's mapped popups as Hyprland places them: each one's `id`, its `parent` (-1 on the window), `x`,`y`
+        its window geometry's position and `sx`,`sy` its surface's origin, both in window pixels, and its `width` and
+        `height`."""
+        return self._call("popups", address)["popups"]
 
     def cursor(self, gx: int, gy: int) -> dict:
         """Glide this agent's cursor to a global point, in turn with the actions, and return once it lands."""
@@ -215,19 +237,27 @@ class Plugin:
         self._send("end", str(ticket))
 
     def keys(
-        self, address: str, words: list[str], hold: float = 0.0, gap: float = 0.0, paste: str | None = None
+        self,
+        address: str,
+        words: list[str],
+        hold: float = 0.0,
+        gap: float = 0.0,
+        paste: str | None = None,
+        mode: str = "plain",
     ) -> dict:
         """Send key events (see keys.py) to a window without focusing it, as one action. Each press is held `hold`
         seconds, and keystrokes (runs of events that end with no key down) are `gap` seconds apart. A sequence too long
         for one request is staged ahead in parts and queued whole by the last, so no other keys land in between. With
-        `paste`, that text is the window's clipboard, and its alone, when the keys (its paste chord) arrive."""
+        `paste`, that text is the window's clipboard, and its alone, when the keys (its paste chord) arrive. `mode`
+        "hidden" never holds the user's input: the plugin refuses an XWayland window and a stroke while the user's
+        keyboard focus is in the window's app."""
         if paste is None:
-            return self._keys(["keys", address], words, hold, gap)
+            return self._keys(["keys", address, mode], words, hold, gap)
         fd, path = tempfile.mkstemp(prefix="deskpilot-paste-", dir=os.environ.get("XDG_RUNTIME_DIR"))
         try:
             with os.fdopen(fd, "wb") as file:
                 file.write(paste.encode())
-            return self._keys(["paste", address, path], words, hold, gap)
+            return self._keys(["paste", address, mode, path], words, hold, gap)
         finally:
             Path(path).unlink(missing_ok=True)
 
@@ -246,9 +276,8 @@ class Plugin:
 
     def unload(self) -> None:
         """Unload whatever deskpilot build is loaded. A build too old to report its path names it in the error."""
-        try:
-            status = self.status()
-        except PluginError:
+        status = self.loaded_status()
+        if status is None:
             return
         if not status.get("path"):
             raise PluginError(
@@ -291,14 +320,43 @@ class Plugin:
         return out
 
     def load(self) -> Path:
-        """Build the plugin for the running Hyprland if needed and load it, replacing a loaded build of other source."""
+        """Build the plugin for the running Hyprland if needed and load it, replacing a loaded build of other source.
+        Succeeds whenever this source's build is loaded afterwards, whoever loaded it."""
         if self.loaded():
             return build_path(self.commit())
         path = build_path(self.running_commit())
-        self.unload()
-        if not path.exists():
-            path = self.build()
-        out = self.run(["plugin", "load", str(path)]).strip()
-        if out != "ok":
-            raise PluginError(f"hyprctl plugin load {path}: {out}", "unavailable")
+        with load_lock():
+            # Another deskpilot process may have loaded it while this one waited for the lock.
+            if self.loaded():
+                return path
+            self.unload()
+            if not path.exists():
+                path = self.build()
+            out = self.run(["plugin", "load", str(path)]).strip()
+            if out != "ok":
+                # A loader outside the lock, such as a Hyprland config `plugin =` line, may have loaded this very
+                # build first: the outcome decides, not Hyprland's message.
+                with contextlib.suppress(PluginError):
+                    status = self.loaded_status() or {}
+                    if status.get("version") == source_hash() and status.get("path") == str(path):
+                        return path
+                raise PluginError(f"hyprctl plugin load {path}: {out}", "unavailable")
         return path
+
+
+@contextlib.contextmanager
+def load_lock() -> Generator[None]:
+    """Holds off other deskpilot loads sharing the build directory, so only one load builds and loads a build at once
+    (a bare `deskpilot plugin build` does not take it). The kernel releases the lock when its holder exits."""
+    lock = build_dir() / "load.lock"
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        file = lock.open("a")
+    except OSError as error:
+        raise PluginError(f"cannot open the plugin load lock {lock}: {error}", "unavailable") from error
+    with file:
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX)
+        except OSError as error:
+            raise PluginError(f"cannot lock {lock}: {error}", "unavailable") from error
+        yield

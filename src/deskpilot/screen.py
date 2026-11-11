@@ -27,8 +27,17 @@ DEFAULT_MAX_WIDTH = 1400
 KEEP = 20
 
 
+# How long grim may wait for the compositor's frame of a window. A frame comes within a few monitor refreshes, so one
+# that has not come by then never will, as for a window whose monitor is off.
+GRIM_TIMEOUT = 5
+
+
 class StaleShot(ValueError):
     code = "stale"
+
+
+class NoFrame(TimeoutError):
+    code = "timeout"
 
 
 def state_dir() -> Path:
@@ -74,7 +83,12 @@ class Shot:
 
 def _grim(window: Window, path: Path) -> None:
     cmd = ["grim", "-T", window.stable_id] if window.stable_id else ["grim", "-s", "1", "-g", _geometry(window)]
-    result = subprocess.run([*cmd, str(path)], capture_output=True, text=True, check=False, timeout=20)
+    try:
+        result = subprocess.run([*cmd, str(path)], capture_output=True, text=True, check=False, timeout=GRIM_TIMEOUT)
+    except subprocess.TimeoutExpired as error:
+        raise NoFrame(
+            f"grim got no frame of {window.cls} ({window.address}) from the compositor within {GRIM_TIMEOUT}s"
+        ) from error
     if result.returncode != 0:
         detail = result.stderr.strip() or f"exit status {result.returncode}"
         raise RuntimeError(f"grim could not capture {window.cls} ({window.address}): {detail}")
@@ -142,3 +156,9 @@ def to_global(window: Window, x: float, y: float, scale: float) -> tuple[int, in
             f"({x}, {y}) at scale {scale} is outside {window.cls} ({window.width}x{window.height} window pixels)"
         )
     return window.x + round(wx), window.y + round(wy)
+
+
+def window_to_global(window: Window, x: float, y: float) -> tuple[int, int]:
+    """A point in window pixels as a global compositor position, wherever it is. Only for a point on a popup, which may
+    reach past the window and is checked against the popup instead of the window."""
+    return window.x + round(x), window.y + round(y)

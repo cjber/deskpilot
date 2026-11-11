@@ -4,6 +4,10 @@
 // is mX,Y to move to global X,Y (the first step enters there), pBUTTON or rBUTTON to press or release, wNOTCHES to turn
 // the wheel, dMS to wait, or n to answer the caller at once while the rest goes on. A path must release every button it
 // presses. Clicks, scrolls, drags and hovers are all paths. `hyprctl deskpilot end <ticket>` ends a running one early.
+// An element action starts with sX,Y or s, the surface its element is on: the popup whose surface origin is X,Y relative
+// to the window (see `popups`), or the window's own surface. Its first point must hit that surface when entered and at
+// each press or wheel notch there, in the window's hit test, or the action is refused as covered: a submenu over its
+// menu, or a menu over the toplevel, would otherwise take the click.
 //
 // A window whose app bound the agent seat (see "agent seat") takes every path through that seat's pointer, in any mode,
 // and nothing of the user's is held. Otherwise SHOWN and PLAIN run on the user's own seat, so every client receives
@@ -37,15 +41,17 @@
 // `hyprctl deskpilot agent <name> [owner=PID]` places every window an agent launched on its hidden workspace, and
 // `agent <name> stop` closes them (see agents).
 //
-// `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
-// without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
-// key that gives character U+HEX unmodified (a chord's ctrl+a), or `tHEX` to type U+HEX. Characters are resolved on the
-// active keyboard's keymap, the one every client has, when the action starts: a typed character's key is pressed with
-// the modifiers it needs set directly, over the user's locks (Caps Lock) and layout, so text arrives as written on any
-// layout. The events run as strokes: a stroke ends when a release leaves no key down. Each
-// stroke goes straight to the window client's own wl_keyboard resources: enter with no keys pressed, modifiers, the
-// keys and leave. The seat's keyboard focus never moves, so the user's focused client sees no leave, enter or
-// modifiers, and Hyprland's window focus never changes. Each press is held <hold-ms> before the next event, and
+// `hyprctl deskpilot keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys
+// in <window> without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or
+// release the key that gives character U+HEX unmodified (a chord's ctrl+a), or `tHEX` to type U+HEX. Characters are resolved on the
+// active keyboard's keymap, the one every client has, when the action starts: a typed character's key is pressed
+// between presses of the keymap's own keys for the modifiers it needs (Shift, AltGr), as a physical keyboard does, since
+// an X client such as Wine reads Shift only from a key press. Locks it needs off (Caps Lock under French é) are set
+// directly for its keystroke, since pressing a lock key would toggle it. So text arrives as written on any layout. The
+// events run as strokes: a stroke ends when a release leaves no key down. Each stroke goes straight to the window
+// client's own wl_keyboard resources: enter with no keys pressed, modifiers, the keys and leave. The seat's keyboard
+// focus never moves, so the user's focused client sees no leave, enter or modifiers, and Hyprland's window focus never
+// changes. Each press is held <hold-ms> before the next event, and
 // strokes are <gap-ms> apart. Modifiers come from an xkb state on the keyboard's own keymap, fed with these keys.
 //
 //   - Each stroke waits until the window's client has read everything sent before it, so a fast sequence cannot fill
@@ -60,14 +66,23 @@
 //     makes meanwhile waits for the stroke to end. A step that does not happen in time ends the sequence with an
 //     error.
 //
-// `hyprctl deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <event>...` sends the same key events (the
-// window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
+// HIDDEN keys never hold the user's input: an XWayland window is refused, and so is each stroke, before anything is
+// sent, while the user's keyboard focus is in the window's app, since the keys would take it from there.
+//
+// `hyprctl deskpilot paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <event>...` sends the same key
+// events (the window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
 // The seat's selection never changes, so the user's clipboard and every other client's stay as they are. After
 // PASTE_WAIT, or at the next paste, the client gets the clipboard it would otherwise have: the user's if it has
-// keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard.
+// keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard. So is a
+// window whose client owns the user's clipboard, with code owns_clipboard: such a client (Chrome, GTK, Qt, Firefox)
+// ignores the offer and pastes its own copy, which is the user's clipboard, until its source is cancelled, and
+// cancelling it would destroy the user's clipboard.
 //
 // A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
 // <event>...`, and the `keys` or `paste` request naming <txn> queues all of it as one action.
+//
+// `hyprctl deskpilot popups <window>` lists the window's mapped popups, with each one's parent, position and surface
+// origin relative to the window and size, as Hyprland places them.
 //
 // Actions run one at a time in the order they arrive; up to MAX_QUEUED wait behind the running one and any more are
 // refused. Each request is answered when its own action has finished, or after REPLY_WAIT with
@@ -144,6 +159,7 @@
 #include <map>
 #include <ranges>
 #include <optional>
+#include <ranges>
 #include <sstream>
 #include <unistd.h>
 #include <string>
@@ -168,21 +184,21 @@ namespace {
     using FocusFn    = void (*)(CSeatManager*, SP<CWLSurfaceResource>);
     using ms         = std::chrono::milliseconds;
 
-    // The modifiers a typed character's key needs: held ones, and the locks it needs (the user's, or none when a lock
-    // such as Caps Lock would change the character).
+    // The modifiers a typed character's key needs: held ones, which their own keys' presses set, and the locks it
+    // needs (the user's, or none when a lock such as Caps Lock would change the character), which are set directly.
     struct SMods {
         xkb_mod_mask_t depressed = 0;
         xkb_mod_mask_t locked    = 0;
     };
 
     // One key event. A character is named by its code point until its action starts, when it is resolved to the key
-    // that produces it on the active keymap. A typed character carries the modifiers it needs: they are set for its
-    // press and the user's restored after its release, with no modifier key pressed.
+    // that produces it on the active keymap, between the presses and releases of its modifier keys. A typed
+    // character's key carries the locks it needs: they are set for its press and the user's restored after its release.
     struct SKeyEvent {
         enum eKind { CODE, KEY_OF, TYPED } kind = CODE;
-        uint32_t             code  = 0; // an evdev key code, or the code point until resolved
-        bool                 press = false;
-        std::optional<SMods> mods;
+        uint32_t                      code  = 0; // an evdev key code, or the code point until resolved
+        bool                          press = false;
+        std::optional<xkb_mod_mask_t> locks;
     };
     using KeyEvents = std::vector<SKeyEvent>;
 
@@ -246,6 +262,9 @@ namespace {
         size_t                             next = 0;
         std::vector<uint32_t>              down; // buttons this action holds down, released when it ends however it ends
         bool                               answered = false; // a path's `n` step has answered its caller already
+        // From an `s` step: the surface the first point must hit, the window's own (an empty inner value) or the popup
+        // whose surface origin relative to the window is this. Unset, any surface of the window takes it.
+        std::optional<std::optional<Vector2D>> onSurface;
         // The input goes to the window client's own pointer (see "hidden pointer" below), leaving the user's pointer,
         // focus and input alone. Otherwise the seat's pointer is moved onto the window and the user's input is held:
         // for an XWayland window, which reads the one X pointer, and for a window of the app the user's pointer is on.
@@ -287,6 +306,7 @@ namespace {
         PHLWINDOWREF                       window;
         WP<CWLSurfaceResource>             surface;
         bool                               x11 = false;
+        bool                               hidden = false; // never holds the user's input: refused where it would
         uint32_t                           xid = 0;
         KeyEvents                          events;
         size_t                             next = 0;
@@ -303,7 +323,8 @@ namespace {
         bool                               holding = false;
         // The window stays entered between strokes when nothing is held, so the next stroke needs no enter. A leave and
         // enter around each keystroke makes an app such as Chrome redraw itself unfocused and focused every time,
-        // which flickers its title bar. It is left when the sequence ends, or when the user focuses its app.
+        // which flickers its title bar. It is left when the sequence ends or the user focuses its app, and entered again
+        // when a focus change between other apps has left it.
         bool                               lingering = false;
         // A keyboard focus change Hyprland asked for mid-stroke, applied when the stroke ends.
         std::optional<WP<CWLSurfaceResource>> deferredFocus;
@@ -332,9 +353,16 @@ namespace {
         std::optional<std::string> result;
         std::optional<SWaiter>     waiter;
     };
+    // Why a queued action could not start, and its code (see SOp::code).
+    struct SRefusal {
+        std::string why;
+        std::string code = "refused";
+        SRefusal(std::string why_, std::string code_ = "refused") : why(std::move(why_)), code(std::move(code_)) {}
+        SRefusal(const char* why_) : why(why_) {}
+    };
     // Starts a queued action. It returns an error when the action cannot start, and otherwise runs it to completion,
     // which ends in complete() with its ticket.
-    using Start = std::function<std::optional<std::string>(uint64_t ticket)>;
+    using Start = std::function<std::optional<SRefusal>(uint64_t ticket)>;
     struct SQueued {
         uint64_t ticket = 0;
         Start    start;
@@ -442,16 +470,23 @@ namespace {
     // and a focus change sends every wl_keyboard a leave, the window being typed into included. Mid-stroke the change
     // waits for the stroke to end, as the user's own input does. Hyprland's record of the focused window updates at once.
     //
-    // Each change also sends every client's keyboard a leave. Mid-stroke, a change between other apps' surfaces goes
-    // ahead without the stroke's keyboards getting it (g_shieldKeys); one into the window's own app waits, since that
-    // app's keyboard is in use.
+    // Each change also sends every client's keyboard empty modifiers and a leave. Mid-stroke, a change between other
+    // apps' surfaces goes ahead without the stroke's keyboards getting either (g_shieldKeys), so a held chord keeps its
+    // modifiers; one into the window's own app waits, since that app's keyboard is in use. Hidden keys never hold the
+    // user's input, so a change into their window's app ends the sequence there instead, and goes ahead at once.
     bool g_shieldKeys = false;
 
-    void endLinger(SKeyOp& op);
+    constexpr auto HIDDEN_KEYS_INTERRUPTED = "the user's keyboard focus moved into this window's app mid-stroke, and hidden keys never hold it: the "
+                                             "stroke's keys were let go and the rest not sent";
+
+    void              endLinger(SKeyOp& op);
+    std::optional<ms> restoreStroke(SKeyOp& op);
+    std::optional<ms> endStroke(SKeyOp& op);
 
     void hkSetKeyboardFocus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
         // Hyprland enters the surface it focuses itself, so a window still entered between strokes is left first.
-        if (g_keyOp && g_keyOp->lingering) {
+        // Mid-stroke the change is shielded or deferred instead, and endStroke ends the linger before a deferred one.
+        if (g_keyOp && g_keyOp->lingering && !g_keyOp->inStroke) {
             const auto TARGET = g_keyOp->surface.lock();
             if (!TARGET || (surface && surface->client() == TARGET->client()))
                 endLinger(*g_keyOp);
@@ -459,10 +494,16 @@ namespace {
         if (g_keyOp && g_keyOp->inStroke) {
             const auto TARGET = g_keyOp->surface.lock();
             if (g_keyOp->holding || (surface && TARGET && surface->client() == TARGET->client())) {
-                g_keyOp->deferredFocus = surface;
-                return;
-            }
-            g_shieldKeys = true;
+                if (!g_keyOp->hidden) {
+                    g_keyOp->deferredFocus = surface;
+                    return;
+                }
+                SInputOwner agent;
+                g_keyOp->error = HIDDEN_KEYS_INTERRUPTED;
+                restoreStroke(*g_keyOp);
+                g_keyOp->timer->updateTimeout(ms(1));
+            } else
+                g_shieldKeys = true;
         }
         reinterpret_cast<FocusFn>(g_focusHook->m_original)(self, surface);
         g_shieldKeys = false;
@@ -475,6 +516,15 @@ namespace {
         if (g_shieldKeys && g_keyOp && std::ranges::any_of(g_keyOp->keyboards, [self](const auto& keyboard) { return keyboard.get() == self; }))
             return;
         reinterpret_cast<KeyboardLeaveFn>(g_keyboardLeaveHook->m_original)(self);
+    }
+
+    using KeyboardModsFn = void (*)(CWLKeyboardResource*, uint32_t, uint32_t, uint32_t, uint32_t);
+    CFunctionHook* g_keyboardModsHook = nullptr;
+
+    void hkKeyboardSendMods(CWLKeyboardResource* self, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+        if (g_shieldKeys && g_keyOp && std::ranges::any_of(g_keyOp->keyboards, [self](const auto& keyboard) { return keyboard.get() == self; }))
+            return;
+        reinterpret_cast<KeyboardModsFn>(g_keyboardModsHook->m_original)(self, depressed, latched, locked, group);
     }
 
     std::string jsonString(const std::string& s) {
@@ -583,7 +633,7 @@ namespace {
             auto queued = std::move(g_queue.front());
             g_queue.pop_front();
             if (const auto ERROR = queued.start(queued.ticket))
-                complete(queued.ticket, errorReply(*ERROR));
+                complete(queued.ticket, errorReply(ERROR->why, ERROR->code));
         }
     }
 
@@ -1179,6 +1229,7 @@ namespace {
     // Defined with the private members they need, below.
     void dndMotion(const Vector2D& pos);
     void dndDrop();
+    bool onElementSurface(SOp& op, const Vector2D& pos);
     void hiddenEnter(SOp& op, const Vector2D& pos);
     void hiddenMove(SOp& op, const Vector2D& pos);
     bool hiddenReady(SOp& op);
@@ -1197,6 +1248,8 @@ namespace {
     // window covering the point never sees the motion of an action refused at it.
     void enterAt(const Vector2D& pos) {
         g_op->target = pos;
+        if (!onElementSurface(*g_op, pos))
+            return;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
@@ -1216,6 +1269,8 @@ namespace {
     // the way Hyprland takes one.
     void moveTo(const Vector2D& pos) {
         g_op->target = pos;
+        // The element's surface is that of the first point alone.
+        g_op->onSurface.reset();
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
@@ -1238,6 +1293,8 @@ namespace {
 
     // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
     void press(uint32_t button) {
+        if (!onElementSurface(*g_op, g_op->target))
+            return;
         if (direct() ? !(clearAt() && hiddenReady(*g_op)) : !targetUnderPointer())
             return;
         if (g_op->mode == eMode::SHOWN)
@@ -1282,6 +1339,8 @@ namespace {
     // One wheel notch as onMouseWheel sends it with a scroll factor of 1: delta 15, one discrete step, value120 of 120.
     // Negative is up in Wayland.
     void wheel(int sign) {
+        if (!onElementSurface(*g_op, g_op->target))
+            return;
         if (direct()) {
             if (clearAt() && hiddenReady(*g_op))
                 hiddenWheel(*g_op, sign);
@@ -1758,6 +1817,31 @@ namespace {
         return true;
     }
 
+    // Whether `pos` hits the surface the action's element is on (SOp::onSurface), asked as the window's own hit test
+    // (windowSurfaceAt) asks, on screen or hidden: its popups first, by their geometry, then the window's surface tree.
+    bool onElementSurface(SOp& op, const Vector2D& pos) {
+        if (!op.onSurface)
+            return true;
+        const auto WINDOW = windowOf(op);
+        if (!WINDOW || !WINDOW->mapped()) {
+            op.error = "the window closed";
+            op.code  = "gone";
+            return false;
+        }
+        const auto HEAD   = WINDOW->backend().isX11() ? nullptr : WINDOW->popupHead();
+        const auto POPUP  = HEAD ? HEAD->at(pos) : nullptr;
+        const auto HIT    = POPUP ? std::optional<Vector2D>{POPUP->coordsRelativeToParent()} : std::nullopt;
+        const auto& WANT  = *op.onSurface;
+        if (HIT == WANT)
+            return true;
+        const auto WHERE = [](const std::optional<Vector2D>& origin) {
+            return origin ? std::format("the popup with its surface at {},{} in the window", origin->x, origin->y) : std::string("the window's own surface");
+        };
+        op.error = std::format("{} is at {},{}, over {}, which the element is on", WHERE(HIT), pos.x, pos.y, WHERE(WANT));
+        op.code  = "covered";
+        return false;
+    }
+
     // The window's surface at `pos` and the point on it.
     bool hiddenSurfaceAt(SOp& op, const Vector2D& pos, SP<CWLSurfaceResource>& surface, Vector2D& local) {
         const auto WINDOW = windowOf(op);
@@ -2109,7 +2193,8 @@ namespace {
     };
 
     // How long a window keeps the pasted text as its clipboard. A client may read the text as soon as it is offered,
-    // as Chrome does to cache it, and paste that copy when the chord arrives; another reads it at the chord. Nothing
+    // as Chrome does to cache it, and paste that copy when the chord arrives; another reads it at the chord. A client
+    // that owns the user's clipboard reads neither and pastes its own copy, so it is refused (ownsSelection). Nothing
     // tells when a client is done with it, and taking it back after the first read left Chrome with an empty
     // clipboard by the time its chord arrived, so the offer lasts this long.
     constexpr auto PASTE_WAIT = std::chrono::seconds(10);
@@ -2131,20 +2216,52 @@ namespace {
         ((*PROTO::data).*member(SSendSelection{}))(DEVICE, FOCUSED ? g_pSeatManager->m_selection.currentSelection.lock() : nullptr);
     }
 
-    // Offers `text` as the clipboard of `window`'s client alone, until PASTE_WAIT passes or the next paste.
-    std::optional<std::string> offerPaste(const PHLWINDOW& window, std::string text) {
+    // Whether `client` may own the seat's selection, the user's clipboard: its source is one of the client's own
+    // wl_data_sources, or one whose data device is gone, so its client is unknown.
+    bool ownsSelection(wl_client* client) {
+        const auto SOURCE = dynamicPointerCast<CWLDataSourceResource>(g_pSeatManager->m_selection.currentSelection);
+        if (!SOURCE)
+            return false;
+        const auto DEVICE = SOURCE->m_device.lock();
+        return !DEVICE || DEVICE->client() == client;
+    }
+
+    constexpr auto OWNS_CLIPBOARD = "this window's app holds the user's clipboard, so it would paste that instead of the text, and taking the "
+                                    "clipboard from it would lose the user's copy: type the text instead (type sends each newline as Return, "
+                                    "which can submit a form), or ask the user to copy something in another app first";
+
+    // Offers `text` as the clipboard of `window`'s client alone, until PASTE_WAIT passes or the next paste. The check
+    // that the client does not own the user's clipboard runs here, as the action starts, since the user may copy while
+    // it waits; a copy in the app between this and the chord, a few milliseconds, still pastes the user's clipboard.
+    std::optional<SRefusal> offerPaste(const PHLWINDOW& window, std::string text) {
         if (!window || !window->mapped())
             return "the window closed before its text was offered";
         const auto SURFACE = window->wlSurface()->resource();
         const auto DEVICE  = SURFACE ? ((*PROTO::data).*member(SDeviceForClient{}))(SURFACE->client()) : nullptr;
         if (!DEVICE || DEVICE->type() != DATA_SOURCE_TYPE_WAYLAND)
             return "the window's client has no Wayland clipboard to paste from";
+        if (ownsSelection(SURFACE->client()))
+            return SRefusal{OWNS_CLIPBOARD, "owns_clipboard"};
         restorePaste();
         g_paste.emplace(SPaste{.source = makeShared<CPasteSource>(std::move(text)), .device = DEVICE, .surface = SURFACE});
         g_paste->timer = makeShared<CEventLoopTimer>(PASTE_WAIT, [](SP<CEventLoopTimer>, void*) { restorePaste(); }, nullptr);
         g_pEventLoopManager->addTimer(g_paste->timer);
         ((*PROTO::data).*member(SSendSelection{}))(DEVICE, g_paste->source);
         return std::nullopt;
+    }
+
+    // CWLKeyboardResource keeps the surface it is entered on private (see SX11Surface).
+    struct SKeyboardSurface {
+        friend constexpr auto member(SKeyboardSurface);
+    };
+    template struct SAccess<&CWLKeyboardResource::m_currentSurface, SKeyboardSurface>;
+
+    // Whether every keyboard of the stroke is still entered on the surface.
+    bool stillEntered(const SKeyOp& op, const SP<CWLSurfaceResource>& surface) {
+        return std::ranges::all_of(op.keyboards, [&](const auto& weak) {
+            const auto KEYBOARD = weak.lock();
+            return !KEYBOARD || ((*KEYBOARD).*member(SKeyboardSurface{})).lock() == surface;
+        });
     }
 
     template <typename FN>
@@ -2170,9 +2287,10 @@ namespace {
         eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendMods(MODS.depressed, MODS.latched, MODS.locked, MODS.group); });
     }
 
-    // The modifiers a typed character needs, in the user's layout, as if their keys were held.
-    void setMods(SKeyOp& op, SMods mods) {
-        xkb_state_update_mask(op.xkb, mods.depressed, 0, mods.locked, 0, 0, xkb_state_serialize_layout(op.xkb, XKB_STATE_LAYOUT_LOCKED));
+    // The locks a typed character needs, over the modifiers its pressed modifier keys hold, in the user's layout.
+    void setLocks(SKeyOp& op, xkb_mod_mask_t locks) {
+        xkb_state_update_mask(op.xkb, xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_DEPRESSED), xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_LATCHED), locks, 0, 0,
+                              xkb_state_serialize_layout(op.xkb, XKB_STATE_LAYOUT_LOCKED));
         sendMods(op);
     }
 
@@ -2194,8 +2312,14 @@ namespace {
             sendKey(op, op.down.back(), false);
     }
 
+    // A sequence ended mid-stroke, as when the plugin is unloaded, first lets go of every key the stroke pressed and
+    // leaves its keyboards or gives them back the user's modifiers, whether or not it held the user's input.
     void finishKeys() {
         SInputOwner agent;
+        if (g_keyOp->inStroke && g_keyOp->phase != SKeyOp::AWAIT_RESTORE)
+            restoreStroke(*g_keyOp);
+        if (g_keyOp->inStroke)
+            endStroke(*g_keyOp);
         endLinger(*g_keyOp);
         auto op = std::move(*g_keyOp);
         g_keyOp.reset();
@@ -2217,8 +2341,11 @@ namespace {
         pumpFrames(op.window.lock());
         // The deferred focus change and the held input are Hyprland's and the user's, not the stroke's.
         SInputOwner user{false};
-        if (const auto DEFERRED = std::exchange(op.deferredFocus, std::nullopt))
+        // Hyprland enters the surface it focuses itself, so a window left entered for the next stroke is left first.
+        if (const auto DEFERRED = std::exchange(op.deferredFocus, std::nullopt)) {
+            endLinger(op);
             reinterpret_cast<FocusFn>(g_focusHook->m_original)(g_pSeatManager.get(), DEFERRED->lock());
+        }
         auto held = std::move(op.heldInput);
         op.heldInput.clear();
         for (auto& replay : held)
@@ -2254,6 +2381,7 @@ namespace {
             return endStroke(op);
         }
         eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
+        op.lingering = false;
         if (const auto SIBLING = op.sibling.lock()) {
             wl_array keys;
             wl_array_init(&keys);
@@ -2292,6 +2420,14 @@ namespace {
         return std::nullopt;
     }
 
+    constexpr auto HIDDEN_KEYS_FOCUSED = "the user's keyboard focus is in this window's app, and hidden keys would take it from there";
+
+    // Whether hidden keys would take the user's keyboard focus: it is on the window or on another surface of its app.
+    bool userKeyboardIn(const SP<CWLSurfaceResource>& surface) {
+        const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+        return surface && FOCUS && FOCUS->client() == surface->client();
+    }
+
     // One step of a key sequence: how long to wait before the next, or nothing to go on in this event-loop turn.
     std::optional<ms> keyStep(SKeyOp& op) {
         const bool EXPIRED = std::chrono::steady_clock::now() > op.deadline;
@@ -2326,14 +2462,21 @@ namespace {
                 // focus, and with it the user's client, is never touched. Only a surface of the same client that has
                 // keyboard focus is left and entered again, since one wl_keyboard has one focused surface.
                 const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+                // A lingering window is used again only while its keyboards are still entered on it: a focus change
+                // between other apps sends every keyboard a leave, and keys to a left keyboard are dropped.
                 if (op.lingering) {
-                    if (op.surface.lock() == SURFACE && !(FOCUS && FOCUS->client() == SURFACE->client())) {
+                    if (op.surface.lock() == SURFACE && !(FOCUS && FOCUS->client() == SURFACE->client()) && stillEntered(op, SURFACE)) {
                         op.inStroke = true;
                         sendMods(op);
                         op.phase = SKeyOp::KEY;
                         return std::nullopt;
                     }
                     endLinger(op);
+                }
+                if (op.hidden && userKeyboardIn(SURFACE)) {
+                    op.error = op.next ? std::format("{}; the keys before this stroke were sent", HIDDEN_KEYS_FOCUSED) : HIDDEN_KEYS_FOCUSED;
+                    op.phase = SKeyOp::DONE;
+                    return std::nullopt;
                 }
                 op.surface       = SURFACE;
                 op.keyboards     = keyboardsOf(SURFACE->client());
@@ -2395,11 +2538,11 @@ namespace {
                     return restoreStroke(op);
                 }
                 const auto EVENT = op.events[op.next];
-                if (EVENT.mods && EVENT.press)
-                    setMods(op, *EVENT.mods);
+                if (EVENT.locks && EVENT.press)
+                    setLocks(op, *EVENT.locks);
                 sendKey(op, EVENT.code, EVENT.press);
-                if (EVENT.mods && !EVENT.press)
-                    setMods(op, {.locked = op.locked});
+                if (EVENT.locks && !EVENT.press)
+                    setLocks(op, op.locked);
                 if (!(op.x11 && op.entered))
                     return afterKey(op);
                 op.phase    = SKeyOp::AWAIT_KEY;
@@ -2501,26 +2644,82 @@ namespace {
         return std::nullopt;
     }
 
+    // The keys that hold the modifiers `mask` on `keymap` in layout `group`: for each modifier in it, the lowest key
+    // whose press alone holds that modifier and no other, and which latches and locks nothing. Nothing if no key holds
+    // one of them.
+    std::optional<std::vector<uint32_t>> modifierKeys(xkb_keymap* keymap, xkb_mod_mask_t mask, xkb_layout_index_t group) {
+        std::vector<uint32_t> keys;
+        auto*                 state = xkb_state_new(keymap);
+        if (!state)
+            return std::nullopt;
+        const auto LAST = std::min<xkb_keycode_t>(xkb_keymap_max_keycode(keymap), 255);
+        for (xkb_mod_mask_t left = mask; left;) {
+            const xkb_mod_mask_t BIT = left & -left;
+            left &= left - 1;
+            std::optional<uint32_t> key;
+            for (xkb_keycode_t keycode = std::max<xkb_keycode_t>(xkb_keymap_min_keycode(keymap), 9); keycode <= LAST && !key; ++keycode) {
+                xkb_state_update_mask(state, 0, 0, 0, 0, 0, group);
+                xkb_state_update_key(state, keycode, XKB_KEY_DOWN);
+                const bool HOLDS = xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED) == BIT && !xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED) &&
+                    !xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED);
+                // A latch key holds its modifier while down like any other and latches it only on release.
+                xkb_state_update_key(state, keycode, XKB_KEY_UP);
+                if (HOLDS && !xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED) && !xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED))
+                    key = keycode - 8;
+            }
+            if (!key) {
+                xkb_state_unref(state);
+                return std::nullopt;
+            }
+            keys.push_back(*key);
+        }
+        xkb_state_unref(state);
+        return keys;
+    }
+
     // Characters become the keys that type them on the keymap clients have now, the active keyboard's, so the text
-    // arrives as written whatever the user's layout and Caps Lock. A character no key gives is refused, not skipped.
+    // arrives as written whatever the user's layout and Caps Lock. A typed character's key is pressed between its
+    // modifier keys' presses and releases, carrying the locks it needs. A character no key gives is refused, not skipped.
     std::optional<std::string> resolveKeys(KeyEvents& events, const SP<IKeyboard>& keyboard) {
-        std::map<std::pair<uint32_t, bool>, std::pair<uint32_t, SMods>> found;
-        for (auto& event : events) {
-            if (event.kind == SKeyEvent::CODE)
+        struct SResolved {
+            uint32_t              code = 0;
+            SMods                 mods;
+            std::vector<uint32_t> modifiers;
+        };
+        std::map<std::pair<uint32_t, bool>, SResolved> found;
+        KeyEvents                                      out;
+        for (const auto& event : events) {
+            if (event.kind == SKeyEvent::CODE) {
+                out.push_back(event);
                 continue;
+            }
             const bool BARE = event.kind == SKeyEvent::KEY_OF;
             auto       it   = found.find({event.code, BARE});
             if (it == found.end()) {
                 const auto KEY = keyFor(keyboard->m_xkbKeymap, keysymOf(event.code), keyboard->m_modifiersState.locked, keyboard->m_modifiersState.group, BARE);
                 if (!KEY)
                     return std::format("no key on the active keymap gives U+{:04X}{}", event.code, BARE ? " without modifiers" : "");
-                it = found.emplace(std::pair{event.code, BARE}, *KEY).first;
+                const auto MODIFIERS = modifierKeys(keyboard->m_xkbKeymap, KEY->second.depressed, keyboard->m_modifiersState.group);
+                if (!MODIFIERS)
+                    return std::format("no key on the active keymap holds the modifiers U+{:04X} needs", event.code);
+                it = found.emplace(std::pair{event.code, BARE}, SResolved{.code = KEY->first, .mods = KEY->second, .modifiers = *MODIFIERS}).first;
             }
-            event.code = it->second.first;
-            event.kind = SKeyEvent::CODE;
-            if (!BARE)
-                event.mods = it->second.second;
+            const auto& KEY = it->second;
+            if (BARE) {
+                out.push_back({.code = KEY.code, .press = event.press, .locks = std::nullopt});
+                continue;
+            }
+            if (event.press) {
+                for (const auto MODIFIER : KEY.modifiers)
+                    out.push_back({.code = MODIFIER, .press = true, .locks = std::nullopt});
+                out.push_back({.code = KEY.code, .press = true, .locks = KEY.mods.locked});
+                continue;
+            }
+            out.push_back({.code = KEY.code, .press = false, .locks = KEY.mods.locked});
+            for (const auto MODIFIER : KEY.modifiers | std::views::reverse)
+                out.push_back({.code = MODIFIER, .press = false, .locks = std::nullopt});
         }
+        events = std::move(out);
         return std::nullopt;
     }
 
@@ -2621,17 +2820,19 @@ namespace {
         return std::nullopt;
     }
 
-    // `keys <window> <hold> <gap> <txn|none> <event>...`, or `paste <window> <file> ...` with the same words after the
-    // file, which offers the file's text as the window's clipboard just before the keys (its paste chord) are sent.
+    // `keys <window> <plain|hidden> <hold> <gap> <txn|none> <event>...`, or `paste <window> <plain|hidden> <file> ...`
+    // with the same words after the file, which offers the file's text as the window's clipboard just before the keys
+    // (its paste chord) are sent.
     IPC::Socket1::SResponse keysCommand(const std::vector<std::string>& args) {
         const bool   PASTE = args[1] == "paste";
-        const size_t AT    = PASTE ? 4 : 3; // where <hold-ms> is
-        if (args.size() < AT + 3)
-            return refuse(PASTE ? "usage: deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>..." :
-                                  "usage: deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <key event>...");
+        const size_t AT    = PASTE ? 5 : 4; // where <hold-ms> is
+        if (args.size() < AT + 3 || (args[3] != "plain" && args[3] != "hidden"))
+            return refuse(PASTE ? "usage: deskpilot paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>..." :
+                                  "usage: deskpilot keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>...");
+        const bool                 HIDDEN = args[3] == "hidden";
         std::optional<std::string> text;
         if (PASTE) {
-            if (const auto ERROR = readPaste(args[3], text.emplace()))
+            if (const auto ERROR = readPaste(args[4], text.emplace()))
                 return refuse(*ERROR);
         }
         const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
@@ -2656,10 +2857,16 @@ namespace {
             return refuse("no mapped window " + args[2]);
         if (PASTE && WINDOW->backend().isX11())
             return refuse("an XWayland window reads the clipboard every X client shares, so a paste would replace the user's clipboard: type the text instead");
+        if (HIDDEN && WINDOW->backend().isX11())
+            return refuse("an XWayland window reads keys from the X server, which only the user's keyboard focus reaches: act on it on screen instead");
         op.window = WINDOW;
+        op.hidden = HIDDEN;
         op.hold   = ms(static_cast<int>(*HOLD));
         op.gap    = ms(static_cast<int>(*GAP));
-        return enqueue([op = std::move(op), text = std::move(text)](uint64_t ticket) mutable -> std::optional<std::string> {
+        return enqueue([op = std::move(op), text = std::move(text)](uint64_t ticket) mutable -> std::optional<SRefusal> {
+            // A hidden paste is refused before the window's client is offered the text, as its keys would be.
+            if (const auto WINDOW = op.window.lock(); op.hidden && WINDOW && userKeyboardIn(WINDOW->wlSurface()->resource()))
+                return HIDDEN_KEYS_FOCUSED;
             if (text) {
                 if (const auto ERROR = offerPaste(op.window.lock(), std::move(*text)))
                     return ERROR;
@@ -2674,8 +2881,9 @@ namespace {
     // `path [agent=NAME] <window> <shown|plain|hidden> <step>...`, where NAME is whose agent cursor shows it. A step is
     // mX,Y to move the pointer to global X,Y (the first step, where it enters the window), pB or rB to press or release
     // button B (272-274), wN to turn the wheel N notches (negative is up), dMS to wait MS milliseconds, or n to answer
-    // the request there while the action goes on, with its ticket for `end`.
-    constexpr auto PATH_USAGE = "usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>...; a step is mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n";
+    // the request there while the action goes on, with its ticket for `end`. sX,Y or s, before the first move, names
+    // the surface the first point must hit (SOp::onSurface).
+    constexpr auto PATH_USAGE = "usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>...; a step is sX,Y or s (first), mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n";
 
     IPC::Socket1::SResponse pathCommand(const std::vector<std::string>& args, const std::string& agent) {
         if (args.size() < 5)
@@ -2702,13 +2910,30 @@ namespace {
             const std::string& WORD = args[i];
             const auto         BAD  = "bad path step '" + WORD + "'";
             const std::string  REST = WORD.substr(1);
-            if (WORD[0] == 'm') {
+            const auto         XY   = [&REST]() -> std::optional<Vector2D> {
                 const auto COMMA = REST.find(',');
                 const auto X     = COMMA == std::string::npos ? std::nullopt : number(REST.substr(0, COMMA));
                 const auto Y     = COMMA == std::string::npos ? std::nullopt : number(REST.substr(COMMA + 1));
-                if (!X || !Y)
+                return X && Y ? std::optional<Vector2D>{Vector2D{*X, *Y}} : std::nullopt;
+            };
+            if (WORD[0] == 's') {
+                if (moves > 0 || op.onSurface)
+                    return refuse(BAD + ": the surface comes once, before the first move");
+                if (REST.empty()) {
+                    op.onSurface.emplace();
+                    continue;
+                }
+                const auto ORIGIN = XY();
+                if (!ORIGIN)
                     return refuse(BAD);
-                const Vector2D POINT{*X, *Y};
+                op.onSurface.emplace(*ORIGIN);
+                continue;
+            }
+            if (WORD[0] == 'm') {
+                const auto XYPOINT = XY();
+                if (!XYPOINT)
+                    return refuse(BAD);
+                const Vector2D POINT = *XYPOINT;
                 if (moves++ == 0) {
                     op.start = op.target = POINT;
                     op.steps.push_back({[POINT] { enterAt(POINT); }, MOVE_GAP});
@@ -2763,6 +2988,8 @@ namespace {
             }
             return refuse(WORD == "n" ? "a path answers once" : BAD);
         }
+        if (moves == 0)
+            return refuse("a path starts with a move, mX,Y");
         if (!down.empty())
             return refuse("the path leaves a button down: release every button it presses");
         if (moves > MAX_MOVES || presses > MAX_PRESSES || notches > MAX_NOTCHES || dwell > MAX_DWELL)
@@ -2967,7 +3194,7 @@ namespace {
         if (!X || !Y)
             return refuse("usage: deskpilot cursor [agent=NAME] <x> <y>");
         const Vector2D POINT{*X, *Y};
-        return enqueue([POINT, agent](uint64_t ticket) -> std::optional<std::string> {
+        return enqueue([POINT, agent](uint64_t ticket) -> std::optional<SRefusal> {
             g_gliding = true;
             agentcursor::glideTo(agent, POINT, [ticket, POINT] {
                 g_gliding = false;
@@ -2976,6 +3203,59 @@ namespace {
             });
             return std::nullopt;
         });
+    }
+
+    // ---- popups ----
+    //
+    // `popups <window>`: the window's mapped popups (menus, tooltips) in Hyprland's popup tree, breadth first. Each has an
+    // id, its parent's id (-1 for a popup of the window itself), x,y its window geometry's position and sx,sy its
+    // surface's origin, both relative to the window's position, and its geometry's size. GTK 3 reports a popup element
+    // relative to its popup's surface and the popup's position as GDK placed it, so deskpilot needs both, exactly as
+    // the window's hit test places the popup (coordsRelativeToParent). A popup keeps its parent and backend private.
+    struct SPopupParent {
+        friend constexpr auto member(SPopupParent);
+    };
+    template struct SAccess<&Desktop::View::CPopup::m_parent, SPopupParent>;
+    struct SPopupBackend {
+        friend constexpr auto member(SPopupBackend);
+    };
+    template struct SAccess<&Desktop::View::CPopup::m_backend, SPopupBackend>;
+
+    IPC::Socket1::SResponse popupsCommand(const std::vector<std::string>& args) {
+        if (args.size() != 3)
+            return refuse("usage: deskpilot popups <window>");
+        const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
+        if (!WINDOW || !WINDOW->mapped())
+            return refuse("no mapped window " + args[2], "gone");
+        std::vector<SP<Desktop::View::CPopup>> popups;
+        if (const auto HEAD = WINDOW->backend().isX11() ? nullptr : WINDOW->popupHead())
+            HEAD->breadthfirst(
+                [&popups](SP<Desktop::View::CPopup> popup, void*) {
+                    // The head is a placeholder for the window itself, with no backend.
+                    if (popup && popup.get()->*member(SPopupBackend{}) && popup->mapped() && popup->wlSurface() && popup->wlSurface()->resource())
+                        popups.push_back(popup);
+                },
+                nullptr);
+        std::string out = R"({"ok":true,"popups":[)";
+        bool        first = true;
+        for (size_t id = 0; id < popups.size(); ++id) {
+            const auto& POPUP   = popups[id];
+            const auto  PARENT  = (POPUP.get()->*member(SPopupParent{})).lock();
+            const auto  IT      = std::ranges::find(popups, PARENT);
+            long        parent  = -1;
+            if (IT != popups.end())
+                parent = IT - popups.begin();
+            else if (!PARENT || PARENT.get()->*member(SPopupBackend{}))
+                continue; // a popup of a popup that is not mapped does not show
+            const auto& BACKEND = POPUP.get()->*member(SPopupBackend{});
+            const auto  ORIGIN  = POPUP->coordsRelativeToParent();
+            const auto  BOX     = BACKEND->surfaceGeometry();
+            const auto  SIZE    = BOX.size() == Vector2D{} ? POPUP->size() : BOX.size();
+            out += std::format(R"({}{{"id":{},"parent":{},"x":{},"y":{},"sx":{},"sy":{},"width":{},"height":{}}})", first ? "" : ",", id, parent, ORIGIN.x + BOX.x,
+                               ORIGIN.y + BOX.y, ORIGIN.x, ORIGIN.y, SIZE.x, SIZE.y);
+            first = false;
+        }
+        return IPC::Socket1::SResponse(out + "]}");
     }
 
     IPC::Socket1::SResponse onCommand(const IPC::Socket1::SRequest& req) {
@@ -3023,9 +3303,11 @@ namespace {
             return cursorCommand(args, agent);
         if (VERB == "agent")
             return agents::command(args);
-        return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <hold-ms> <gap-ms> <txn|none> <key event>... | "
-                      "paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | agent <name> [owner=PID|stop] | end <ticket> | wait <ticket> | status; a key "
-                      "event is +code, -code, pHEX, rHEX or tHEX, and a path step mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
+        if (VERB == "popups")
+            return popupsCommand(args);
+        return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>... | "
+                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|stop] | "
+                      "end <ticket> | wait <ticket> | status; a key event is +code, -code, pHEX, rHEX or tHEX, and a path step sX,Y or s (first), mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
 }
 
@@ -3081,6 +3363,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_relativeHook      = hook(handle, "CRelativePointerProtocol", "onGetRelativePointer", reinterpret_cast<void*>(&hkGetForPointer<g_relativeHook, eInert::RELATIVE, CRelativePointerProtocol, CZwpRelativePointerManagerV1>));
     g_lockHook          = hook(handle, "CPointerConstraintsProtocol", "onLockPointer", reinterpret_cast<void*>(&hkConstrain<g_lockHook, eInert::LOCKED>));
     g_confineHook       = hook(handle, "CPointerConstraintsProtocol", "onConfinePointer", reinterpret_cast<void*>(&hkConstrain<g_confineHook, eInert::CONFINED>));
+    g_keyboardModsHook  = hook(handle, "CWLKeyboardResource", "sendMods", reinterpret_cast<void*>(&hkKeyboardSendMods));
 
     agentcursor::init();
     startAgentSeat();
@@ -3104,8 +3387,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
         finish();
     }
     if (g_keyOp) {
-        if (g_keyOp->holding)
-            restoreStroke(*g_keyOp);
         g_keyOp->error = "the deskpilot plugin was unloaded";
         g_keyOp->code  = "unavailable";
         finishKeys();

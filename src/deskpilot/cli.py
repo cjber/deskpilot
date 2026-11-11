@@ -6,9 +6,10 @@ screenshot, pick a point, click it. Pass --scale 1 to give window pixels instead
 
 Clicks, scrolls, drags, hovers, keys and text run inside the compositor through the deskpilot Hyprland plugin
 (`deskpilot plugin load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on
-the user's keymap; a marker the plugin draws shows where the agent acts, one per DESKPILOT_AGENT name. --hidden acts
-on an app the agent started with `deskpilot launch`, on its own hidden workspace, with nothing shown. --take-pointer
-and --take-focus move the user's own pointer or focus instead.
+the user's keymap; a marker the plugin draws shows where the agent acts, one per DESKPILOT_AGENT name. A window that
+is not on screen is refused unless --show brings it into view. --hidden acts on an app the agent started with
+`deskpilot launch`, on its own hidden workspace, with nothing shown; hidden keys need --window. --take-pointer and
+--take-focus move the user's own pointer or focus instead.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def _view_args(s: argparse.ArgumentParser) -> None:
         "--hidden",
         action="store_true",
         help="act on a window this agent started with `deskpilot launch`, on its hidden workspace, with no agent "
-        "cursor and the user's pointer, focus and view untouched (not for XWayland windows' pointer input)",
+        "cursor and the user's pointer, focus and view untouched (not for XWayland windows' pointer input or keys)",
     )
 
 
@@ -199,6 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--window", help="press it in this window; without it the keys go to the focused window")
     s.add_argument("--take-focus", action="store_true", help=focus_help)
     s.add_argument("--hold", type=float, default=0.0, help="seconds to hold each key down (up to 10)")
+    _view_args(s)
 
     s = sub.add_parser("type", help="type text as written, on the user's keymap")
     s.add_argument("text")
@@ -210,6 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="seconds each key is held and between keys, none by default; games want 0.1 or more",
     )
+    _view_args(s)
 
     s = sub.add_parser(
         "paste", help="paste text into a window through a clipboard only it sees; any text, whatever the keymap types"
@@ -218,6 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--window", help="paste into this window; without it the text goes to the focused window")
     s.add_argument("--take-focus", action="store_true", help=focus_help)
     s.add_argument("--keys", default="ctrl+v", help="the app's paste chord, e.g. ctrl+shift+v in a terminal")
+    _view_args(s)
 
     s = sub.add_parser("clipboard", help="print the user's clipboard text, or replace it with --set")
     s.add_argument("--set", metavar="TEXT", help="the text to copy, or - to read it from stdin")
@@ -329,13 +333,13 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 return tree
             return [f"snapshot {tree['snapshot']}", *_tree(tree)] if "snapshot" in tree else _tree(tree)
         case "key":
-            desk.key(args.combo, args.window, args.take_focus, args.hold)
+            desk.key(args.combo, args.window, args.take_focus, args.hold, show=args.show, hidden=args.hidden)
             return "ok"
         case "type":
-            desk.type(args.text, args.window, args.delay, args.take_focus)
+            desk.type(args.text, args.window, args.delay, args.take_focus, show=args.show, hidden=args.hidden)
             return "ok"
         case "paste":
-            desk.paste(_text(args.text), args.window, args.take_focus, args.keys)
+            desk.paste(_text(args.text), args.window, args.take_focus, args.keys, show=args.show, hidden=args.hidden)
             return "ok"
         case "clipboard":
             if args.set is None:

@@ -6,10 +6,10 @@ from dataclasses import asdict, replace
 import pytest
 from PIL import Image
 
-from deskpilot import clipboard, keys, screen
+from deskpilot import a11y, clipboard, keys, screen
 from deskpilot import desk as desk_module
 from deskpilot import plugin as plugin_module
-from deskpilot.desk import Desk, NotVisible
+from deskpilot.desk import Desk, NotVisible, error_code
 from deskpilot.hypr import (
     AmbiguousWindow,
     HyprctlError,
@@ -20,7 +20,15 @@ from deskpilot.hypr import (
     pick_instance,
     run_hyprctl,
 )
-from deskpilot.plugin import REQUEST_BYTES, Plugin, PluginError, parse_reply, request_size, source_hash
+from deskpilot.plugin import (
+    REQUEST_BYTES,
+    Plugin,
+    PluginError,
+    PluginNotLoaded,
+    parse_reply,
+    request_size,
+    source_hash,
+)
 
 
 def win(address="0x1", cls="wow.exe", title="World of Warcraft", x=1440, y=560, w=3440, h=1440):
@@ -41,6 +49,7 @@ class FakeHyprctl:
             return json.dumps(
                 [
                     {
+                        "id": 1,
                         "name": "DP-1",
                         "x": 1440,
                         "y": 560,
@@ -151,6 +160,33 @@ def test_a_shot_is_refused_for_another_window_or_a_resized_one(tmp_path, monkeyp
         screen.load("nope")
 
 
+def test_a_capture_that_gets_no_frame_is_a_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+
+    def run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(screen.subprocess, "run", run)
+    with pytest.raises(TimeoutError, match="no frame") as error:
+        screen.capture(replace(win(), stable_id="18000377"))
+    assert error_code(error.value) == "timeout"
+
+
+def test_a_hidden_shot_of_a_window_outside_its_monitor_is_refused_before_grim(tmp_path, monkeypatch):
+    desk, fake, _, _ = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
+    shot = []
+    monkeypatch.setattr(screen, "capture", lambda win, out, max_width: shot.append(win.address))
+    fake.clients = [AGENT_CLIENT]
+    desk.shot("0xdef", hidden=True)
+    assert shot == ["0xdef"], "a window on a hidden workspace still lies in its monitor's area"
+    # A scrolling layout puts a later column of the agent's workspace off its monitor.
+    fake.clients = [{**AGENT_CLIENT, "at": [-1500, 966]}]
+    with pytest.raises(NotVisible, match="outside its monitor's area") as error:
+        desk.shot("0xdef", hidden=True)
+    assert error_code(error.value) == "not_visible" and shot == ["0xdef"]
+
+
 def test_old_shots_are_pruned(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     fake_grim(monkeypatch, (10, 10))
@@ -211,6 +247,7 @@ class FakePlugin:
 
     def __init__(self):
         self.calls = []
+        self.mapped: list[dict] = []  # the window's popups
 
     def register(self, owner=None):
         self.calls.append(("register", owner))
@@ -231,6 +268,10 @@ class FakePlugin:
 
     def end(self, ticket):
         self.calls.append(("end", ticket))
+
+    def popups(self, address):
+        self.calls.append(("popups", address))
+        return self.mapped
 
 
 def make_desk(tmp_path, monkeypatch):
@@ -264,6 +305,14 @@ def test_click_goes_through_the_plugin_and_leaves_the_pointer_alone(tmp_path, mo
 
 
 AGENT_CLIENT = {**CLIENT, "address": "0xdef", "workspace": {"name": "special:agent-tester"}}
+
+
+def launched_desk(tmp_path, monkeypatch):
+    """A desk whose one window the agent launched, for hidden actions."""
+    desk, fake, inp, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients = [AGENT_CLIENT]
+    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
+    return desk, fake, inp, plugin
 
 
 def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkeypatch):
@@ -341,9 +390,9 @@ def test_keys_go_to_the_window_without_focusing_it(tmp_path, monkeypatch):
     desk.key("ctrl+a", "battle")
     desk.type("Hi", "battle", delay=0.05)
     assert plugin.calls == [
-        ("keys", "0xabc", ["+29", "p61", "r61", "-29"], {"hold": 0.0}),
+        ("keys", "0xabc", ["+29", "p61", "r61", "-29"], {"hold": 0.0, "mode": "plain"}),
         # The whole text is one action, timed inside the plugin, so no other caller's keys land between characters.
-        ("keys", "0xabc", ["t48", "t69"], {"hold": 0.05, "gap": 0.05}),
+        ("keys", "0xabc", ["t48", "t69"], {"hold": 0.05, "gap": 0.05, "mode": "plain"}),
     ]
     assert not any(c[0] == "dispatch" and "focus" in c[1] for c in fake.calls)
     assert inp.events == []
@@ -361,7 +410,7 @@ def test_click_with_take_focus_focuses_the_window_before_the_plugin_clicks(tmp_p
 def test_keys_without_a_window_go_to_the_focused_one_and_take_focus_focuses_first(tmp_path, monkeypatch):
     desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
     desk.key("Return")
-    assert plugin.calls[-1] == ("keys", "0xabc", ["+28", "-28"], {"hold": 0.0})
+    assert plugin.calls[-1] == ("keys", "0xabc", ["+28", "-28"], {"hold": 0.0, "mode": "plain"})
     desk.type("x", "battle", take_focus=True)
     assert ["dispatch", 'hl.dsp.focus({window="address:0xabc"})'] in fake.calls
     assert plugin.calls[-1][:3] == ("keys", "0xabc", ["t78"])
@@ -370,7 +419,60 @@ def test_keys_without_a_window_go_to_the_focused_one_and_take_focus_focuses_firs
 def test_plugin_formats_key_events():
     calls = []
     Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", ["+29", "t61"], hold=0.03, gap=0.1)
-    assert calls == [["deskpilot", "keys", "0xabc", "30", "100", "none", "+29", "t61"]]
+    assert calls == [["deskpilot", "keys", "0xabc", "plain", "30", "100", "none", "+29", "t61"]]
+
+
+def test_plugin_puts_the_key_mode_after_the_window():
+    calls = []
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", ["+28", "-28"], mode="hidden")
+    assert calls == [["deskpilot", "keys", "0xabc", "hidden", "0", "0", "none", "+28", "-28"]]
+
+
+def test_hidden_keys_name_the_mode_and_never_focus(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients.append(AGENT_CLIENT)
+    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
+    desk.key("Return", "0xdef", hidden=True)
+    desk.type("x", "0xdef", hidden=True)
+    desk.paste("hi", "0xdef", hidden=True)
+    sent = [c for c in plugin.calls if c[0] == "keys"]
+    assert [(c[1], c[-1]["mode"]) for c in sent] == [("0xdef", "hidden")] * 3
+    assert not any(c[0] == "dispatch" for c in fake.calls), "hidden keys must not focus or show anything"
+
+
+def test_hidden_keys_to_a_window_the_agent_did_not_launch_are_not_found(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.showing = "2"
+    for send in (desk.key, desk.type, desk.paste):
+        with pytest.raises(WindowNotFound, match="deskpilot launch") as error:
+            send("a", "battle", hidden=True)
+        assert error_code(error.value) == "not_found"
+    assert not any(c[0] == "keys" for c in plugin.calls)
+
+
+def test_keys_to_an_off_screen_window_are_refused_unless_shown(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.showing = "2"
+    for send in (desk.key, desk.type, desk.paste):
+        with pytest.raises(NotVisible):
+            send("a", "battle")
+    assert plugin.calls == [] and not any(c[0] == "dispatch" for c in fake.calls)
+    desk.key("a", "battle", show=True)
+    assert ["dispatch", 'hl.dsp.focus({window="address:0xabc"})'] in fake.calls
+    assert plugin.calls[-1][-1]["mode"] == "plain"
+
+
+def test_hidden_or_shown_keys_need_a_window_and_no_take_focus(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        desk.key("Return", hidden=True)
+    with pytest.raises(ValueError):
+        desk.type("x", "battle", take_focus=True, hidden=True)
+    with pytest.raises(ValueError, match="show"):
+        desk.key("Return", show=True)
+    with pytest.raises(ValueError, match="show"):
+        desk.paste("x", "battle", take_focus=True, show=True)
+    assert plugin.calls == [] and not any(c[0] == "dispatch" for c in fake.calls)
 
 
 def test_paste_sends_its_text_in_a_file_the_request_names_and_removes_it(tmp_path, monkeypatch):
@@ -378,28 +480,44 @@ def test_paste_sends_its_text_in_a_file_the_request_names_and_removes_it(tmp_pat
     seen = []
 
     def run(args):
-        seen.append((args, pathlib.Path(args[3]).read_text()))
+        seen.append((args, pathlib.Path(args[4]).read_text()))
         return '{"ok":true}'
 
     Plugin(run).keys("0xabc", ["p76"], paste="naïve 日本 ✓")
     ((args, text),) = seen
-    assert args[:3] == ["deskpilot", "paste", "0xabc"] and args[4:] == ["0", "0", "none", "p76"]
-    assert text == "naïve 日本 ✓" and not pathlib.Path(args[3]).exists()
+    assert args[:4] == ["deskpilot", "paste", "0xabc", "plain"] and args[5:] == ["0", "0", "none", "p76"]
+    assert text == "naïve 日本 ✓" and not pathlib.Path(args[4]).exists()
+
+
+def test_a_paste_into_the_app_that_owns_the_clipboard_is_refused_with_its_own_code(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    files = []
+
+    def run(args):
+        if args[1] == "paste":
+            files.append(pathlib.Path(args[4]))
+            return '{"ok":true,"pending":3}'
+        return '{"ok":false,"error":"this window\'s app holds the user\'s clipboard","code":"owns_clipboard"}'
+
+    with pytest.raises(PluginError, match="holds the user's clipboard") as error:
+        Plugin(run).keys("0xabc", ["p76"], paste="text")
+    assert error_code(error.value) == "owns_clipboard"
+    assert not files[0].exists()
 
 
 def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
     calls = []
     events = [word for _ in range(5000) for word in ("+30", "-30")]
-    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", events)
+    Plugin(lambda args: calls.append(args) or '{"ok":true}').keys("0xabc", events, mode="hidden")
     *stages, last = calls
     assert stages and all(c[:2] == ["deskpilot", "stage"] for c in stages)
     txn = stages[0][2]
-    assert all(c[2] == txn for c in stages) and last[:6] == ["deskpilot", "keys", "0xabc", "0", "0", txn]
-    sent = [w for c in stages for w in c[3:]] + last[6:]
+    assert all(c[2] == txn for c in stages) and last[:7] == ["deskpilot", "keys", "0xabc", "hidden", "0", "0", txn]
+    sent = [w for c in stages for w in c[3:]] + last[7:]
     assert sent == events
     assert all(request_size(c[1:]) <= REQUEST_BYTES for c in calls)
     # The fewest requests: every one but the first staged is full, and the keys request takes all that fit after it.
-    assert len(calls) == -(-request_size(["keys", "0xabc", "0", "0", txn, *sent]) // REQUEST_BYTES)
+    assert len(calls) == -(-request_size(["keys", "0xabc", "hidden", "0", "0", txn, *sent]) // REQUEST_BYTES)
 
 
 def test_plugin_waits_on_a_queued_action_until_it_finishes():
@@ -469,6 +587,80 @@ def test_a_plugin_change_keeps_the_seat_library_and_a_seat_change_replaces_both(
 
     (tmp_path / "seat.cpp").write_text("changed")
     assert plugin_module.seat_path("c" * 16) != seat
+
+
+COMMIT = "aaaaaaaaaaaaaaaa"
+
+
+def fake_hyprland(tmp_path, monkeypatch, plugin_load="ok"):
+    """A Hyprland whose headers match it, with this source's build already on disk so nothing is compiled. Each status
+    answers the next of `fake.statuses` (the last repeats), and `plugin load` answers `plugin_load` and loads it."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    monkeypatch.setattr(plugin_module, "headers_commit", lambda: COMMIT)
+    path = plugin_module.build_path(COMMIT)
+    path.parent.mkdir(parents=True)
+    path.touch()
+    mine = json.dumps({"ok": True, "version": source_hash(), "path": str(path)})
+
+    class Fake:
+        def __init__(self):
+            self.calls, self.statuses = [], ["unknown request"]
+
+        def __call__(self, args):
+            self.calls.append(args)
+            if args[:2] == ["-j", "version"]:
+                return json.dumps({"commit": COMMIT})
+            if args[:2] == ["plugin", "load"]:
+                if plugin_load in ("ok", "Cannot load a plugin twice!"):
+                    self.statuses = [mine]
+                return plugin_load
+            if args == ["deskpilot", "status"]:
+                return self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+            if args[:2] == ["deskpilot", "keys"]:
+                return '{"ok":true}' if self.statuses == [mine] else "unknown request"
+            raise AssertionError(args)
+
+    return Fake(), path, mine
+
+
+def test_a_load_another_process_won_is_accepted(tmp_path, monkeypatch):
+    fake, _, _ = fake_hyprland(tmp_path, monkeypatch, "Cannot load a plugin twice!")
+    assert Plugin(fake).keys("0xabc", ["+28", "-28"]) == {"ok": True}
+    assert [args[1] for args in fake.calls if args[0] == "deskpilot" and args[1] == "keys"] == ["keys", "keys"]
+
+
+def test_a_refused_load_with_nothing_loaded_still_fails(tmp_path, monkeypatch):
+    fake, _, _ = fake_hyprland(tmp_path, monkeypatch, "permission is disabled")
+    with pytest.raises(PluginError, match="permission is disabled") as error:
+        Plugin(fake).load()
+    assert error.value.code == "unavailable"
+
+
+def test_a_status_hyprctl_cannot_get_is_not_read_as_not_loaded(tmp_path, monkeypatch):
+    fake, _, _ = fake_hyprland(tmp_path, monkeypatch)
+
+    def run(args):
+        if args == ["deskpilot", "status"]:
+            raise HyprctlError("hyprctl deskpilot status exited 6: Hyprland IPC didn't respond in time")
+        return fake(args)
+
+    with pytest.raises(PluginError, match="exited 6") as error:
+        Plugin(run).load()
+    assert error.value.code == "unavailable"
+    assert not any(args[0] == "plugin" for args in fake.calls)
+
+
+def test_load_rechecks_once_it_holds_the_lock(tmp_path, monkeypatch):
+    fake, path, mine = fake_hyprland(tmp_path, monkeypatch)
+    fake.statuses = ["unknown request", mine]
+    assert Plugin(fake).load() == path
+    assert not any(args[0] == "plugin" for args in fake.calls)
+
+
+def test_an_empty_reply_is_unavailable_not_a_missing_plugin():
+    with pytest.raises(PluginError, match="without answering") as error:
+        parse_reply("")
+    assert not isinstance(error.value, PluginNotLoaded) and error.value.code == "unavailable"
 
 
 def test_plugin_sends_button_codes_and_reads_replies():
@@ -549,6 +741,13 @@ def test_a_column_scrolled_off_every_monitor_is_not_visible():
     off, partly = Hyprland(fake).windows()
     assert not off.visible
     assert partly.visible, "1000 + 1266 reaches past the monitor's left edge at 1440"
+    assert not off.on_monitor and partly.on_monitor
+
+
+def test_a_window_on_another_monitors_area_is_not_on_its_own():
+    """Hyprland copies a window's frame only on a commit of its own monitor, so lying on another one is not enough."""
+    fake = FakeHyprctl([{**CLIENT, "monitor": 2}])
+    assert not Hyprland(fake).windows()[0].on_monitor
 
 
 def test_a_rotated_or_scaled_monitor_covers_its_logical_area():
@@ -617,6 +816,8 @@ def test_mcp_tools_report_why_an_action_was_refused(tmp_path, monkeypatch):
     assert "is not on screen" in refusal("click", {"window": "battle", "x": 1, "y": 1})["message"]
     assert refusal("click", {"window": "nosuchwindow", "x": 1, "y": 1})["code"] == "not_found"
     assert refusal("scroll", {"window": "battle", "dy": 0, "x": 1, "y": 1, "hidden": True})["code"] == "invalid"
+    assert refusal("key", {"combo": "Return", "window": "battle"})["code"] == "not_visible"
+    assert refusal("type_text", {"text": "x", "hidden": True})["code"] == "invalid"
 
 
 def test_clipboard_reads_plain_text_and_not_another_text_type(monkeypatch):
@@ -699,9 +900,10 @@ def test_hover_then_click_clicks_before_the_pointer_leaves(tmp_path, monkeypatch
 
 
 def test_an_element_is_targeted_at_its_live_centre(tmp_path, monkeypatch):
-    desk, *_ = make_desk(tmp_path, monkeypatch)
-    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: (10, 20, 30, 40))
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: a11y.Located(10, 20, 30, 40))
     assert desk.click("battle", None, None, element="e3") == (2527 + 25, 966 + 40)
+    assert plugin.calls[-1][-1][0] == "m2552,1006"
     with pytest.raises(ValueError, match="not both"):
         desk.click("battle", 1, 2, element="e3")
     with pytest.raises(ValueError, match="neither"):
@@ -711,6 +913,67 @@ def test_an_element_is_targeted_at_its_live_centre(tmp_path, monkeypatch):
 def test_key_hold_is_bounded(tmp_path, monkeypatch):
     desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
     desk.key("Right", "battle", hold=2)
-    assert plugin.calls[-1] == ("keys", "0xabc", ["+106", "-106"], {"hold": 2})
+    assert plugin.calls[-1] == ("keys", "0xabc", ["+106", "-106"], {"hold": 2, "mode": "plain"})
     with pytest.raises(ValueError):
         desk.key("Right", "battle", hold=11)
+
+
+def popup(id, parent, x, y, sx, sy, width=100, height=200):
+    return {"id": id, "parent": parent, "x": x, "y": y, "sx": sx, "sy": sy, "width": width, "height": height}
+
+
+def test_a_gtk3_element_is_clicked_on_the_surface_it_is_on(tmp_path, monkeypatch):
+    desk, _, _, plugin = launched_desk(tmp_path, monkeypatch)
+    located = a11y.Located(10, 20, 30, 40, known=True)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: located)
+    desk.click("0xdef", None, None, element="e3", hidden=True)
+    assert plugin.calls[-1] == ("path", "0xdef", "hidden", ["s", "m2552,1006", "d52", "p272", "r272"])
+
+    # A menu item: its centre (46,19) on the menu's surface at 14,183.
+    plugin.mapped = [popup(0, -1, 20, 188, 14, 183)]
+    located = a11y.Located(6, 9, 80, 20, ((20, 188),), True)
+    assert desk.click("0xdef", None, None, element="e4", hidden=True) == (2527 + 60, 966 + 202)
+    assert plugin.calls[-2:] == [
+        ("popups", "0xdef"),
+        ("path", "0xdef", "hidden", ["s14,183", "m2587,1168", "d52", "p272", "r272"]),
+    ]
+
+    # A submenu item is on the menu's single child, wherever GTK places that, even past the window's edge.
+    plugin.mapped = [popup(0, -1, 20, 188, 14, 183), popup(1, 0, 162, 640, 156, 635)]
+    located = a11y.Located(6, 30, 80, 20, ((20, 188), (162, 124)), True)
+    desk.scroll("0xdef", None, None, 2, element="e6", hidden=True)
+    assert plugin.calls[-1][-1][:2] == ["s156,635", f"m{2527 + 156 + 46},{966 + 635 + 40}"]
+
+
+def test_a_window_element_is_refused_while_a_popup_is_at_the_window_origin(tmp_path, monkeypatch):
+    desk, _, _, plugin = launched_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: a11y.Located(10, 20, 30, 40, known=True))
+    plugin.mapped = [popup(0, -1, 0, 0, -6, -5)]
+    with pytest.raises(a11y.A11yError) as error:
+        desk.click("0xdef", None, None, element="e3", hidden=True)
+    assert error_code(error.value) == "ambiguous"
+    assert not any(call[0] == "path" for call in plugin.calls)
+
+
+def test_a_popup_element_that_cannot_be_placed_is_refused(tmp_path, monkeypatch):
+    desk, _, _, plugin = launched_desk(tmp_path, monkeypatch)
+    located = a11y.Located(6, 9, 80, 20, ((20, 188),), True)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: located)
+    for mapped, code in (
+        ([], "stale"),
+        ([popup(0, -1, 20, 188, 14, 183), popup(1, -1, 20, 188, 14, 183)], "ambiguous"),
+        ([popup(0, -1, 20, 188, 14, 183, height=10)], "offscreen"),
+    ):
+        plugin.mapped = mapped
+        with pytest.raises(a11y.A11yError) as error:
+            desk.click("0xdef", None, None, element="e4", hidden=True)
+        assert error_code(error.value) == code
+    assert not any(call[0] == "path" for call in plugin.calls)
+
+
+def test_the_mcp_server_reports_the_package_version():
+    from importlib.metadata import version
+
+    from deskpilot import mcp_server
+
+    assert mcp_server.mcp.version == version("deskpilot") != ""

@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the agent's apps, which also close when the owner process (`DESKPILOT_OWNER_PID`, or the MCP server) exits, or
   after 30 minutes unused. The MCP server gains `launch` and `stop`. A hidden action on a window the agent did not
   launch is now refused as `not_found`.
+- **The MCP server reports its version** to clients on initialize, rather than an empty string.
 - **GTK and Qt apps get a pointer of deskpilot's own.** The plugin adds a second seat, `deskpilot`, with a pointer
   only. An app that binds it takes clicks, scrolls, drags and hovers there, so a hidden action works on a window of
   the app the user's pointer is on, and nothing of the user's is held. Apps that bind only the first seat (Chromium,
@@ -30,6 +31,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
   that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
   desktop can be told apart.
+- **`click --element` on an item of a GTK 3 popup menu clicks the item,** such as a country in an open combo box or
+  an entry of a submenu, instead of the window behind it at the item's popup-relative position. `elements` reports
+  such items in window pixels, so they line up with the shot, and gives zero bounds to one whose popup cannot be told
+  apart. An element action is refused `stale` or `ambiguous` when its popup cannot be identified exactly, and
+  `covered` when another surface takes the point. `move`, `scroll` and `hover` with `--element` do the same.
+- **`paste` into an app that holds your clipboard is refused with `owns_clipboard`** instead of pasting your
+  clipboard. Apps such as Chrome paste their own copy while they own the clipboard, so a paste into Chrome after you
+  copied in Chrome inserted your text, not the given one. Type the text instead, or copy something in another app.
+- **`key`, `type` and `paste` take `--hidden` and `--show`, as `hidden` and `show` over MCP.** `--hidden` sends the
+  keys to a named window the agent launched, on its hidden workspace, without focusing it or holding the user's
+  input; an XWayland window, or a window of the app the user's keyboard focus is in, is refused with `refused`, and
+  so is the rest of the text when the user focuses that app while it is typed. `--show` needs a named window and no
+  `--take-focus`.
+- **Keys to a window that is not on screen are now refused with `not_visible`,** as clicks already were. Add
+  `--show` to bring it into view first; scripts that sent keys to an off-screen window without a flag need it, or
+  the app started with `deskpilot launch` and `--hidden`.
+- **A hidden `shot`, `hover` or `wait-for --changed` of a window outside its monitor's area is refused with
+  `not_visible`** instead of hanging, since Hyprland sends no frame of it; a column of the agent's workspace that a
+  scrolling layout puts off screen is one. Any capture that gets no frame now fails after 5 seconds with code
+  `timeout` rather than a traceback.
+- **The first action after a Hyprland restart no longer fails with "Cannot load a plugin twice!"** when several
+  deskpilot calls start at once. One call loads the plugin while the others wait and then use it, and a call that
+  cannot reach Hyprland says so instead of trying to load the plugin again.
+- **Unloading the plugin while it types no longer leaves a key held down in the window.** The keys the keystroke
+  had pressed are let go first, so the app does not repeat the last one.
+- **`type` keeps capitals in Wine and other X apps that read Shift from key presses.** A typed character that needs
+  Shift or AltGr now presses that modifier's own key around it, as a physical keyboard does, instead of only setting
+  the modifier, which Wine ignored.
+- **Typing into a window keeps every key when you switch between other apps meanwhile.** Switching focus left the
+  window's keyboard between keystrokes, and the rest of the text was dropped while the command still reported
+  success; the next keystroke now enters the window again. A chord held with `--hold` also keeps its Ctrl or Shift
+  when you switch windows during it.
 
 ## [0.5.2] - 2026-11-11
 

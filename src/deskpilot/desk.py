@@ -40,8 +40,8 @@ EXPECTED = (
 
 def error_code(error: BaseException) -> str:
     """The kind of an expected failure, one stable word a program branches on rather than reading the message:
-    not_found, ambiguous, not_visible, offscreen, stale, covered, gone, refused, busy, no_tree, unavailable, timeout or
-    invalid."""
+    not_found, ambiguous, not_visible, offscreen, stale, covered, gone, owns_clipboard, refused, busy, no_tree,
+    unavailable, timeout or invalid."""
     code = getattr(error, "code", None)
     if isinstance(code, str):
         return code
@@ -225,7 +225,19 @@ class Desk:
         show: bool = False,
         hidden: bool = False,
     ) -> screen.Shot:
-        return screen.capture(self._target(query, show, hidden), out, max_width)
+        return screen.capture(self._shootable(self._target(query, show, hidden)), out, max_width)
+
+    @staticmethod
+    def _shootable(win: Window) -> Window:
+        """The window, if a shot of it can get a frame. Hyprland copies a window's frame only while the window lies
+        partly in its monitor's area, so a hidden shot of a scrolling layout's off-screen column is refused here
+        rather than left to time out."""
+        if not win.on_monitor:
+            raise NotVisible(
+                f"{win.cls} ({win.address}) lies outside its monitor's area, where Hyprland sends no frame of it, so "
+                "it cannot be shot even hidden. Pass --show (show) to bring it into view, which focuses it"
+            )
+        return win
 
     def point(
         self,
@@ -241,12 +253,27 @@ class Desk:
         """Resolve a point to a global position. The point is in pixels of `shot`, or of the window's latest shot,
         or at `scale` (1 for window pixels); with no shot at all it is in window pixels. With `element` it is the
         centre of that element of the window's accessibility tree, where the app says it is now."""
+        win, gx, gy, _ = self._aim(query, x, y, scale, shot, show, element, hidden)
+        return win, gx, gy
+
+    def _aim(
+        self,
+        query: str,
+        x: float | None,
+        y: float | None,
+        scale: float | None,
+        shot: str | None,
+        show: bool,
+        element: str | None,
+        hidden: bool,
+    ) -> tuple[Window, int, int, list[str]]:
+        """`point`, and the path steps that go before the first move: for an element, the surface it is on, which the
+        plugin checks the point hits."""
         if (element is None) == (x is None or y is None):
             raise ValueError("give a point (x and y) or an element, not both or neither")
         win = self._target(query, show, hidden)
         if element is not None:
-            ex, ey, ew, eh = a11y.locate(win, element)
-            return win, *screen.to_global(win, ex + ew / 2, ey + eh / 2, 1.0)
+            return win, *self._element_point(win, element)
         assert x is not None and y is not None
         if scale is None:
             taken = screen.load(shot) if shot else screen.latest(win.address)
@@ -254,14 +281,36 @@ class Desk:
                 taken.check(win)
             scale = taken.scale if taken else 1.0
         gx, gy = screen.to_global(win, x, y, scale)
-        return win, gx, gy
+        return win, gx, gy, []
+
+    def _popups(self, win: Window) -> list[a11y.Popup]:
+        """The window's mapped popups, as the plugin reports them."""
+        return [a11y.Popup(**popup) for popup in self.plugin.popups(win.address)]
+
+    def _element_point(self, win: Window, element: str) -> tuple[int, int, list[str]]:
+        """An element's centre as a global position, and its surface step. A GTK 3 popup element is placed through
+        its popup's surface, and its centre must lie in the popup."""
+        at = a11y.locate(win, element)
+        cx, cy = at.x + at.width / 2, at.y + at.height / 2
+        popup = a11y.resolve(self._popups(win), at.keys) if at.known else None
+        if popup is None:
+            gx, gy = screen.to_global(win, cx, cy, 1.0)
+            return gx, gy, ["s"] if at.known else []
+        px, py = popup.sx + cx, popup.sy + cy
+        if not (popup.x <= px < popup.x + popup.width and popup.y <= py < popup.y + popup.height):
+            raise a11y.A11yError(
+                f"Element {element}'s centre is outside its popup; scroll it into view or take a new snapshot.",
+                "offscreen",
+            )
+        return *screen.window_to_global(win, px, py), [f"s{popup.sx},{popup.sy}"]
 
     @staticmethod
-    def _mode(hidden: bool) -> str:
-        """How the plugin reaches the window: hidden, or on screen with the agent cursor unless DESKPILOT_CURSOR=off."""
+    def _mode(hidden: bool, cursor: bool = True) -> str:
+        """How the plugin reaches the window: hidden, or on screen with the agent cursor unless DESKPILOT_CURSOR=off
+        or the action has none, as keys have not."""
         if hidden:
             return "hidden"
-        return "plain" if os.environ.get("DESKPILOT_CURSOR") == "off" else "shown"
+        return "plain" if not cursor or os.environ.get("DESKPILOT_CURSOR") == "off" else "shown"
 
     def _path(self, win: Window, steps: list[str], hidden: bool) -> dict:
         return self.plugin.path(win.address, self._mode(hidden), steps)
@@ -316,13 +365,13 @@ class Desk:
             )
         if take_focus:
             self.focus(query)
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
+        win, gx, gy, surface = self._aim(query, x, y, scale, shot, show, element, hidden)
         if take_pointer:
             self._take_pointer(win, gx, gy)
             self.input.click(button, count)
         else:
             code = BUTTON_CODES[button]
-            self._path(win, [f"m{gx},{gy}", f"d{HOLD_MS}", *[f"p{code}", f"r{code}"] * count], hidden)
+            self._path(win, [*surface, f"m{gx},{gy}", f"d{HOLD_MS}", *[f"p{code}", f"r{code}"] * count], hidden)
         return gx, gy
 
     def scroll(
@@ -344,12 +393,12 @@ class Desk:
             raise ValueError("a hidden scroll leaves the user's pointer alone: drop take_pointer")
         if dy == 0 or abs(dy) > 50:
             raise ValueError("scroll 1 to 50 notches, positive up")
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
+        win, gx, gy, surface = self._aim(query, x, y, scale, shot, show, element, hidden)
         if take_pointer:
             self._take_pointer(win, gx, gy)
             self.input.scroll(dy=dy)
         else:
-            self._path(win, [f"m{gx},{gy}", f"d{HOLD_MS}", f"w{dy}"], hidden)
+            self._path(win, [*surface, f"m{gx},{gy}", f"d{HOLD_MS}", f"w{dy}"], hidden)
         return gx, gy
 
     def drag(
@@ -402,14 +451,15 @@ class Desk:
         pixels, it clicks there next instead, before the pointer leaves, and returns that point."""
         if not 0 <= wait <= 5:
             raise ValueError("a hover waits 0 to 5 seconds")
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
+        win, gx, gy, surface = self._aim(query, x, y, scale, shot, show, element, hidden)
         if then_click is not None:
             _, cx, cy = self.point(query, *then_click, scale, shot, show, hidden=hidden)
             code = BUTTON_CODES[button]
-            steps = [f"m{gx},{gy}", f"d{round(wait * 1000)}", f"m{cx},{cy}", f"p{code}", f"r{code}"]
+            steps = [*surface, f"m{gx},{gy}", f"d{round(wait * 1000)}", f"m{cx},{cy}", f"p{code}", f"r{code}"]
             self._path(win, steps, hidden)
             return cx, cy
-        reply = self._path(win, [f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"], hidden)
+        self._shootable(win)
+        reply = self._path(win, [*surface, f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"], hidden)
         try:
             time.sleep(wait)
             return screen.capture(win, max_width=max_width)
@@ -419,27 +469,58 @@ class Desk:
     def elements(self, query: str, show: bool = False, hidden: bool = False, peek: bool = False) -> a11y.Element:
         """The window's accessibility tree, whose element ids click, hover, move and scroll take. A peek leaves the
         latest snapshot, and the ids taken from it, in place."""
-        return a11y.snapshot(self._target(query, show, hidden), peek=peek)
+        win = self._target(query, show, hidden)
+        return a11y.snapshot(win, peek=peek, popups=lambda: self._popups(win))
 
-    def key(self, combo: str, query: str | None = None, take_focus: bool = False, hold: float = 0.0) -> None:
+    def key(
+        self,
+        combo: str,
+        query: str | None = None,
+        take_focus: bool = False,
+        hold: float = 0.0,
+        *,
+        show: bool = False,
+        hidden: bool = False,
+    ) -> None:
         """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
         keys go to the focused window. Each key is held `hold` seconds, up to 10, for an app that acts while a key is
         down (auto-repeat, a game's movement)."""
         if not 0 <= hold <= 10:
             raise ValueError("a key is held 0 to 10 seconds")
-        self.plugin.keys(self._key_target(query, take_focus).address, keys.chord_words(combo), hold=hold)
+        target = self._key_target(query, take_focus, show, hidden)
+        self.plugin.keys(target.address, keys.chord_words(combo), hold=hold, mode=self._mode(hidden, cursor=False))
 
-    def type(self, text: str, query: str | None = None, delay: float = 0.0, take_focus: bool = False) -> None:
+    def type(
+        self,
+        text: str,
+        query: str | None = None,
+        delay: float = 0.0,
+        take_focus: bool = False,
+        *,
+        show: bool = False,
+        hidden: bool = False,
+    ) -> None:
         """Type text as written, on the user's own keymap. Each key is held `delay` seconds, and the next follows
         `delay` seconds later."""
-        target = self._key_target(query, take_focus)
-        self.plugin.keys(target.address, keys.text_words(text), hold=delay, gap=delay)
+        target = self._key_target(query, take_focus, show, hidden)
+        self.plugin.keys(
+            target.address, keys.text_words(text), hold=delay, gap=delay, mode=self._mode(hidden, cursor=False)
+        )
 
-    def paste(self, text: str, query: str | None = None, take_focus: bool = False, combo: str = "ctrl+v") -> None:
+    def paste(
+        self,
+        text: str,
+        query: str | None = None,
+        take_focus: bool = False,
+        combo: str = "ctrl+v",
+        *,
+        show: bool = False,
+        hidden: bool = False,
+    ) -> None:
         """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `combo` (the app's
         paste chord, ctrl+shift+v in most terminals) is pressed there. Any text pastes, whatever the keymap types."""
-        target = self._key_target(query, take_focus)
-        self.plugin.keys(target.address, keys.chord_words(combo), paste=text)
+        target = self._key_target(query, take_focus, show, hidden)
+        self.plugin.keys(target.address, keys.chord_words(combo), paste=text, mode=self._mode(hidden, cursor=False))
 
     def clipboard(self) -> str:
         """The user's clipboard text."""
@@ -449,15 +530,28 @@ class Desk:
         """Replace the user's clipboard with text."""
         clipboard.write(text)
 
-    def _key_target(self, query: str | None, take_focus: bool) -> Window:
+    def _key_target(self, query: str | None, take_focus: bool, show: bool = False, hidden: bool = False) -> Window:
+        """The window keys go to, resolved as for every other action: a named one must be on screen unless `show`
+        brings it there, and hidden keys reach only the agent's launched windows. Hidden keys need a named window, since
+        the focused one has the user's keyboard, and so does show, since the focused window is in view already and
+        take_focus brings one there itself."""
+        if hidden and (query is None or take_focus):
+            raise ValueError(
+                "hidden keys go to a named window and leave the user's focus alone: name a window and drop take_focus"
+            )
+        if show and (query is None or take_focus):
+            raise ValueError(
+                "show brings a named window into view: name a window and drop take_focus, which does it too"
+            )
         if query is None:
             focused = next((w for w in self.hypr.windows() if w.focused), None)
             if focused is None:
                 raise WindowNotFound("no window has keyboard focus; name one with a window query")
             return focused
-        win = self.focus(query) if take_focus else self.window(query)
-        if self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
-            self._register()  # marks the agent in use
+        win = self.focus(query) if take_focus else self._target(query, show, hidden)
+        # A hidden target registered the agent already; keys to its window shown on screen mark it in use too.
+        if not hidden and self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
+            self._register()
         return win
 
     def wait_for(
@@ -523,7 +617,7 @@ class Desk:
         deadline = time.monotonic() + timeout
         while True:
             win = self._target(query, False, hidden)
-            now = screen.capture(win, max_width=base.width)
+            now = screen.capture(self._shootable(win), max_width=base.width)
             # A resize, or a move to a monitor of another scale, changes the whole image.
             if (now.width, now.height) != (base.width, base.height):
                 return now, (0, 0, now.width, now.height)
