@@ -40,12 +40,14 @@
 // `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
 // without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
 // key that gives character U+HEX unmodified (a chord's ctrl+a), or `tHEX` to type U+HEX. Characters are resolved on the
-// active keyboard's keymap, the one every client has, when the action starts: a typed character's key is pressed with
-// the modifiers it needs set directly, over the user's locks (Caps Lock) and layout, so text arrives as written on any
-// layout. The events run as strokes: a stroke ends when a release leaves no key down. Each
-// stroke goes straight to the window client's own wl_keyboard resources: enter with no keys pressed, modifiers, the
-// keys and leave. The seat's keyboard focus never moves, so the user's focused client sees no leave, enter or
-// modifiers, and Hyprland's window focus never changes. Each press is held <hold-ms> before the next event, and
+// active keyboard's keymap, the one every client has, when the action starts: a typed character's key is pressed
+// between presses of the keymap's own keys for the modifiers it needs (Shift, AltGr), as a physical keyboard does, since
+// an X client such as Wine reads Shift only from a key press. Locks it needs off (Caps Lock under French é) are set
+// directly for its keystroke, since pressing a lock key would toggle it. So text arrives as written on any layout. The
+// events run as strokes: a stroke ends when a release leaves no key down. Each stroke goes straight to the window
+// client's own wl_keyboard resources: enter with no keys pressed, modifiers, the keys and leave. The seat's keyboard
+// focus never moves, so the user's focused client sees no leave, enter or modifiers, and Hyprland's window focus never
+// changes. Each press is held <hold-ms> before the next event, and
 // strokes are <gap-ms> apart. Modifiers come from an xkb state on the keyboard's own keymap, fed with these keys.
 //
 //   - Each stroke waits until the window's client has read everything sent before it, so a fast sequence cannot fill
@@ -144,6 +146,7 @@
 #include <map>
 #include <ranges>
 #include <optional>
+#include <ranges>
 #include <sstream>
 #include <unistd.h>
 #include <string>
@@ -168,21 +171,21 @@ namespace {
     using FocusFn    = void (*)(CSeatManager*, SP<CWLSurfaceResource>);
     using ms         = std::chrono::milliseconds;
 
-    // The modifiers a typed character's key needs: held ones, and the locks it needs (the user's, or none when a lock
-    // such as Caps Lock would change the character).
+    // The modifiers a typed character's key needs: held ones, which their own keys' presses set, and the locks it
+    // needs (the user's, or none when a lock such as Caps Lock would change the character), which are set directly.
     struct SMods {
         xkb_mod_mask_t depressed = 0;
         xkb_mod_mask_t locked    = 0;
     };
 
     // One key event. A character is named by its code point until its action starts, when it is resolved to the key
-    // that produces it on the active keymap. A typed character carries the modifiers it needs: they are set for its
-    // press and the user's restored after its release, with no modifier key pressed.
+    // that produces it on the active keymap, between the presses and releases of its modifier keys. A typed
+    // character's key carries the locks it needs: they are set for its press and the user's restored after its release.
     struct SKeyEvent {
         enum eKind { CODE, KEY_OF, TYPED } kind = CODE;
-        uint32_t             code  = 0; // an evdev key code, or the code point until resolved
-        bool                 press = false;
-        std::optional<SMods> mods;
+        uint32_t                      code  = 0; // an evdev key code, or the code point until resolved
+        bool                          press = false;
+        std::optional<xkb_mod_mask_t> locks;
     };
     using KeyEvents = std::vector<SKeyEvent>;
 
@@ -2170,9 +2173,10 @@ namespace {
         eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendMods(MODS.depressed, MODS.latched, MODS.locked, MODS.group); });
     }
 
-    // The modifiers a typed character needs, in the user's layout, as if their keys were held.
-    void setMods(SKeyOp& op, SMods mods) {
-        xkb_state_update_mask(op.xkb, mods.depressed, 0, mods.locked, 0, 0, xkb_state_serialize_layout(op.xkb, XKB_STATE_LAYOUT_LOCKED));
+    // The locks a typed character needs, over the modifiers its pressed modifier keys hold, in the user's layout.
+    void setLocks(SKeyOp& op, xkb_mod_mask_t locks) {
+        xkb_state_update_mask(op.xkb, xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_DEPRESSED), xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_LATCHED), locks, 0, 0,
+                              xkb_state_serialize_layout(op.xkb, XKB_STATE_LAYOUT_LOCKED));
         sendMods(op);
     }
 
@@ -2395,11 +2399,11 @@ namespace {
                     return restoreStroke(op);
                 }
                 const auto EVENT = op.events[op.next];
-                if (EVENT.mods && EVENT.press)
-                    setMods(op, *EVENT.mods);
+                if (EVENT.locks && EVENT.press)
+                    setLocks(op, *EVENT.locks);
                 sendKey(op, EVENT.code, EVENT.press);
-                if (EVENT.mods && !EVENT.press)
-                    setMods(op, {.locked = op.locked});
+                if (EVENT.locks && !EVENT.press)
+                    setLocks(op, op.locked);
                 if (!(op.x11 && op.entered))
                     return afterKey(op);
                 op.phase    = SKeyOp::AWAIT_KEY;
@@ -2501,26 +2505,82 @@ namespace {
         return std::nullopt;
     }
 
+    // The keys that hold the modifiers `mask` on `keymap` in layout `group`: for each modifier in it, the lowest key
+    // whose press alone holds that modifier and no other, and which latches and locks nothing. Nothing if no key holds
+    // one of them.
+    std::optional<std::vector<uint32_t>> modifierKeys(xkb_keymap* keymap, xkb_mod_mask_t mask, xkb_layout_index_t group) {
+        std::vector<uint32_t> keys;
+        auto*                 state = xkb_state_new(keymap);
+        if (!state)
+            return std::nullopt;
+        const auto LAST = std::min<xkb_keycode_t>(xkb_keymap_max_keycode(keymap), 255);
+        for (xkb_mod_mask_t left = mask; left;) {
+            const xkb_mod_mask_t BIT = left & -left;
+            left &= left - 1;
+            std::optional<uint32_t> key;
+            for (xkb_keycode_t keycode = std::max<xkb_keycode_t>(xkb_keymap_min_keycode(keymap), 9); keycode <= LAST && !key; ++keycode) {
+                xkb_state_update_mask(state, 0, 0, 0, 0, 0, group);
+                xkb_state_update_key(state, keycode, XKB_KEY_DOWN);
+                const bool HOLDS = xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED) == BIT && !xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED) &&
+                    !xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED);
+                // A latch key holds its modifier while down like any other and latches it only on release.
+                xkb_state_update_key(state, keycode, XKB_KEY_UP);
+                if (HOLDS && !xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED) && !xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED))
+                    key = keycode - 8;
+            }
+            if (!key) {
+                xkb_state_unref(state);
+                return std::nullopt;
+            }
+            keys.push_back(*key);
+        }
+        xkb_state_unref(state);
+        return keys;
+    }
+
     // Characters become the keys that type them on the keymap clients have now, the active keyboard's, so the text
-    // arrives as written whatever the user's layout and Caps Lock. A character no key gives is refused, not skipped.
+    // arrives as written whatever the user's layout and Caps Lock. A typed character's key is pressed between its
+    // modifier keys' presses and releases, carrying the locks it needs. A character no key gives is refused, not skipped.
     std::optional<std::string> resolveKeys(KeyEvents& events, const SP<IKeyboard>& keyboard) {
-        std::map<std::pair<uint32_t, bool>, std::pair<uint32_t, SMods>> found;
-        for (auto& event : events) {
-            if (event.kind == SKeyEvent::CODE)
+        struct SResolved {
+            uint32_t              code = 0;
+            SMods                 mods;
+            std::vector<uint32_t> modifiers;
+        };
+        std::map<std::pair<uint32_t, bool>, SResolved> found;
+        KeyEvents                                      out;
+        for (const auto& event : events) {
+            if (event.kind == SKeyEvent::CODE) {
+                out.push_back(event);
                 continue;
+            }
             const bool BARE = event.kind == SKeyEvent::KEY_OF;
             auto       it   = found.find({event.code, BARE});
             if (it == found.end()) {
                 const auto KEY = keyFor(keyboard->m_xkbKeymap, keysymOf(event.code), keyboard->m_modifiersState.locked, keyboard->m_modifiersState.group, BARE);
                 if (!KEY)
                     return std::format("no key on the active keymap gives U+{:04X}{}", event.code, BARE ? " without modifiers" : "");
-                it = found.emplace(std::pair{event.code, BARE}, *KEY).first;
+                const auto MODIFIERS = modifierKeys(keyboard->m_xkbKeymap, KEY->second.depressed, keyboard->m_modifiersState.group);
+                if (!MODIFIERS)
+                    return std::format("no key on the active keymap holds the modifiers U+{:04X} needs", event.code);
+                it = found.emplace(std::pair{event.code, BARE}, SResolved{.code = KEY->first, .mods = KEY->second, .modifiers = *MODIFIERS}).first;
             }
-            event.code = it->second.first;
-            event.kind = SKeyEvent::CODE;
-            if (!BARE)
-                event.mods = it->second.second;
+            const auto& KEY = it->second;
+            if (BARE) {
+                out.push_back({.code = KEY.code, .press = event.press, .locks = std::nullopt});
+                continue;
+            }
+            if (event.press) {
+                for (const auto MODIFIER : KEY.modifiers)
+                    out.push_back({.code = MODIFIER, .press = true, .locks = std::nullopt});
+                out.push_back({.code = KEY.code, .press = true, .locks = KEY.mods.locked});
+                continue;
+            }
+            out.push_back({.code = KEY.code, .press = false, .locks = KEY.mods.locked});
+            for (const auto MODIFIER : KEY.modifiers | std::views::reverse)
+                out.push_back({.code = MODIFIER, .press = false, .locks = std::nullopt});
         }
+        events = std::move(out);
         return std::nullopt;
     }
 

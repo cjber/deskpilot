@@ -52,8 +52,9 @@ XWayland target gets X focus for each stroke and sees a focus-in and focus-out a
 does not move.
 
 Text is typed as written on the user's own keymap, whatever its layout and with Caps Lock on: the plugin finds the
-key that gives each character on the active keyboard's keymap, which every client has, and sets the modifiers it
-needs directly. A character no key on that keymap gives is an error rather than skipped.
+key that gives each character on the active keyboard's keymap, which every client has, and presses that keymap's own
+modifier keys (Shift, AltGr) around it, as a physical keyboard does. A character no key on that keymap gives is an
+error rather than skipped.
 
 `--take-pointer` uses a virtual mouse made with `/dev/uinput` instead, which the compositor treats as real
 hardware. Tools that synthesize input another way, such as `xdotool` (XTest), are ignored by some clients:
