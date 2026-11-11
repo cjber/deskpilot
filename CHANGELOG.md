@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-11
+
 - **A click no longer lets the app take the user's focus afterwards.** An app such as Chrome asks to be activated
   after each click, using the click's input serial, and its request arrived after the click had ended. Input
   deskpilot sends now carries serials Hyprland does not record, so it earns no activation or pointer warp.
