@@ -5,7 +5,8 @@ description: Click, scroll and type in desktop app windows on Hyprland with the 
 
 # deskpilot
 
-Run `deskpilot --help` for the command list, and put `--json` before the command for JSON output. Over MCP the same
+When other agents may be driving the same desktop, set `DESKPILOT_AGENT` to a short name for yourself (such as
+`CLAUDE-1`), so the user sees which cursor is yours. Run `deskpilot --help` for the command list, and put `--json` before the command for JSON output. Over MCP the same
 actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `hover`, `drag`, `elements`, `key`,
 `type_text`, `paste_text`, `clipboard`, `copy_text`, `wait_for` and `wait_changed`.
 

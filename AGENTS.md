@@ -15,7 +15,11 @@ claude plugin validate --strict .   # if the Claude Code CLI is installed
 ```
 
 CI also runs actionlint, zizmor and gitleaks. The plugin is not built in CI: it needs the exact Hyprland it loads
-into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` on a real session.
+into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` on a real session. To check one
+without touching the user's screen, `python3 scripts/nested.py start` runs a throwaway Hyprland inside theirs, its
+window on the hidden `special:dptest` workspace, with a headless output to act on and capture
+(`HYPRLAND_INSTANCE_SIGNATURE=<signature>` for deskpilot, `WAYLAND_DISPLAY=<wayland> grim -o DPTEST` to see it);
+`python3 scripts/nested.py stop <signature>` ends it.
 
 ## Layout
 
@@ -31,6 +35,7 @@ into, so check a change to `plugin/deskpilot.cpp` with `deskpilot plugin load` o
 - `src/deskpilot/uinput.py`: the virtual mouse behind `--take-pointer`
 - `src/deskpilot/keys.py`: key names, chords and text as the plugin's key events
 - `src/deskpilot/clipboard.py`: the user's clipboard through wl-clipboard
+- `scripts/nested.py`: a throwaway nested Hyprland for live checks of the plugin off the user's screen
 - `src/deskpilot/a11y.py`: the target app's AT-SPI accessibility tree over D-Bus, and element ids for actions
 
 ## Rules

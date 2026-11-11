@@ -6,8 +6,9 @@ screenshot, pick a point, click it. Pass --scale 1 to give window pixels instead
 
 Clicks, scrolls, drags, hovers, keys and text run inside the compositor through the deskpilot Hyprland plugin
 (`deskpilot plugin load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on
-the user's keymap; an arrow the plugin draws shows where the agent acts. --hidden acts on a window wherever it is, on
-screen or not, with nothing shown. --take-pointer and --take-focus move the user's own pointer or focus instead.
+the user's keymap; a marker the plugin draws shows where the agent acts, one per DESKPILOT_AGENT name. --hidden acts
+on a window wherever it is, on screen or not, with nothing shown. --take-pointer and --take-focus move the user's
+own pointer or focus instead.
 """
 
 from __future__ import annotations

@@ -11,10 +11,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .hypr import HyprctlError, Runner, run_hyprctl
@@ -26,6 +27,8 @@ BUTTON_CODES = {"left": 272, "right": 273, "middle": 274}
 # kernel queues a Unix stream write of up to 32 KiB of page fragments (UNIX_SKB_FRAGS_SZ) as one buffer; a longer key
 # sequence is staged in parts that size.
 REQUEST_BYTES = 32 * 1024
+# What the plugin takes as an agent's name: it is shown on the agent's cursor and travels as one word of a request.
+AGENT_NAME = re.compile(r"[A-Za-z0-9._-]{1,32}")
 
 
 class PluginError(RuntimeError):
@@ -113,9 +116,22 @@ def fitting(words: list[str], head: list[str]) -> int:
     return len(words)
 
 
+def agent_from_env() -> str | None:
+    """The agent named by DESKPILOT_AGENT, whose cursor shows its actions; None (unset or empty) for the unnamed one."""
+    name = os.environ.get("DESKPILOT_AGENT") or None
+    if name is not None and not AGENT_NAME.fullmatch(name):
+        raise ValueError(f"DESKPILOT_AGENT={name!r}: use up to 32 letters, digits, '-', '_' or '.'")
+    return name
+
+
 @dataclass
 class Plugin:
     run: Runner = run_hyprctl
+    # Whose agent cursor shows this caller's actions. Each name has a cursor of its own, in a colour of its own.
+    agent: str | None = field(default_factory=agent_from_env)
+
+    def _agent(self) -> list[str]:
+        return [f"agent={self.agent}"] if self.agent else []
 
     def _send(self, *args: str) -> dict:
         try:
@@ -171,11 +187,11 @@ class Plugin:
         `mX,Y` moves to a global point (the first step enters the window there), `pCODE` and `rCODE` press and
         release a button, `wN` turns the wheel N notches (positive up), `dMS` waits, and `n` answers here with the
         action's ticket while it goes on, until it ends or `end` ends it."""
-        return self._call("path", address, mode, *steps)
+        return self._call("path", *self._agent(), address, mode, *steps)
 
     def cursor(self, gx: int, gy: int) -> dict:
-        """Glide the agent cursor to a global point, in turn with the actions, and return once it lands."""
-        return self._call("cursor", str(gx), str(gy))
+        """Glide this agent's cursor to a global point, in turn with the actions, and return once it lands."""
+        return self._call("cursor", *self._agent(), str(gx), str(gy))
 
     def end(self, ticket: int) -> None:
         """End the path with this ticket now, letting go of what it holds. One that has ended already is fine."""

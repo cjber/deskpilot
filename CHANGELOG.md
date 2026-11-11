@@ -13,6 +13,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   Electron, kitty), XWayland apps, apps started before the plugin first loaded, and keys keep the routes they had.
 - **A menu deskpilot opens no longer grabs the user's pointer and keyboard**, in any app or mode, and a click
   outside it, the user's or deskpilot's, closes it as the user's own menus close.
+- **A new agent cursor, one per agent.** The sharp arrow is now a flight-path marker, a ring with wings centred on
+  the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
+  that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
+  desktop can be told apart.
 
 ## [0.5.2] - 2026-11-11
 
