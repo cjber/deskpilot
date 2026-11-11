@@ -410,6 +410,20 @@ def test_load_after_an_upgrade_refuses_and_keeps_the_loaded_build(monkeypatch):
     assert not any(args[0] == "plugin" for args in calls)
 
 
+def test_a_plugin_change_keeps_the_seat_library_and_a_seat_change_replaces_both(monkeypatch, tmp_path):
+    for name in ("deskpilot.cpp", "seat.cpp", "seat.hpp", "Makefile"):
+        (tmp_path / name).write_text(name)
+    monkeypatch.setattr(plugin_module, "SOURCE", tmp_path)
+    plugin_build, seat = plugin_module.build_path("c" * 16), plugin_module.seat_path("c" * 16)
+
+    (tmp_path / "deskpilot.cpp").write_text("changed")
+    assert plugin_module.build_path("c" * 16) != plugin_build
+    assert plugin_module.seat_path("c" * 16) == seat
+
+    (tmp_path / "seat.cpp").write_text("changed")
+    assert plugin_module.seat_path("c" * 16) != seat
+
+
 def test_plugin_sends_button_codes_and_reads_replies():
     calls = []
 

@@ -20,8 +20,9 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    window on a hidden workspace or scrolled off screen; acting on it is refused unless you pass `--hidden`, which
    acts on it where it is without the user seeing anything, or `--show`, which focuses it and moves the user's
    view, so ask the user before `--show`. `--hidden` works on `shot`, `click`, `scroll`, `drag`, `hover`,
-   `elements` and `wait-for --changed`, for native Wayland windows; an XWayland window, or one of the app the
-   user's pointer is on, is refused.
+   `elements` and `wait-for --changed`, for native Wayland windows; an XWayland window is refused, and so is one of the
+   app the user's pointer is on unless that app took deskpilot's own seat (GTK and Qt apps started after the
+   plugin loaded do).
 3. Run `deskpilot shot WINDOW`, read the image at the `path` it prints, and choose a point in that image. Note its
    `shot` id.
 4. Act with that point as given, passing the id: `deskpilot click WINDOW X Y --shot ID` (`--button right`,

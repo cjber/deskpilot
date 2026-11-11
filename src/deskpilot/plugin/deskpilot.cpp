@@ -5,7 +5,9 @@
 // the wheel, dMS to wait, or n to answer the caller at once while the rest goes on. A path must release every button it
 // presses. Clicks, scrolls, drags and hovers are all paths. `hyprctl deskpilot end <ticket>` ends a running one early.
 //
-// SHOWN and PLAIN run on the user's own seat, so every client receives them, XWayland and Wine included:
+// A window whose app bound the agent seat (see "agent seat") takes every path through that seat's pointer, in any mode,
+// and nothing of the user's is held. Otherwise SHOWN and PLAIN run on the user's own seat, so every client receives
+// them, XWayland and Wine included:
 //
 //   1. The user's pointer input is held through hooks on CInputManager's mouse and tablet handlers (onMouseMoved,
 //      onMouseWarp, onMouseButton, onMouseWheel, onTabletAxis, onTabletProximity, onTabletTip and onTabletButton),
@@ -88,7 +90,12 @@
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/ipc/s1/S1.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/managers/screenshare/ScreenshareManager.hpp>
+#include <hyprland/src/protocols/CursorShape.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
+#include <hyprland/src/protocols/PointerConstraints.hpp>
+#include <hyprland/src/protocols/PointerGestures.hpp>
+#include <hyprland/src/protocols/RelativePointer.hpp>
 #include <hyprland/src/protocols/XDGShell.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/protocols/core/DataDevice.hpp>
@@ -109,6 +116,8 @@
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
 
+#include "seat.hpp"
+
 #include <cairo/cairo.h>
 #include <xcb/xcb.h>
 #include <xkbcommon/xkbcommon.h>
@@ -127,6 +136,7 @@
 #include <format>
 #include <functional>
 #include <map>
+#include <ranges>
 #include <optional>
 #include <sstream>
 #include <unistd.h>
@@ -136,6 +146,10 @@
 // The hash of this source, set by the Makefile, so `deskpilot plugin load` can tell a stale build from the current one.
 #ifndef DESKPILOT_SOURCE
 #define DESKPILOT_SOURCE "unknown"
+#endif
+// The agent seat library this build opens (see seat.hpp), set by the Makefile.
+#ifndef DESKPILOT_SEAT
+#define DESKPILOT_SEAT "deskpilot-seat.so"
 #endif
 constexpr const char* VERSION = DESKPILOT_SOURCE;
 
@@ -230,10 +244,14 @@ namespace {
         // focus and input alone. Otherwise the seat's pointer is moved onto the window and the user's input is held:
         // for an XWayland window, which reads the one X pointer, and for a window of the app the user's pointer is on.
         bool                               direct = false;
-        // HIDDEN: the surface the client's pointer is on and the client's wl_pointer resources, entered there.
+        // The window's client bound the agent seat, so the input goes to its agent pointer (see "agent seat").
+        bool                               agentSeat = false;
+        // A direct action: the surface its pointer is on and the pointers entered there, the client's own wl_pointer
+        // resources or its agent pointers.
         WP<CWLSurfaceResource>             surface;
         Vector2D                           local;
         std::vector<WP<CWLPointerResource>> pointers;
+        std::vector<WP<CWlPointer>>        agents;
         CHyprSignalListener                focusChange;
         SP<CEventLoopTimer>                timer;
         uint64_t                           ticket = 0;
@@ -389,7 +407,13 @@ namespace {
         SInputOwner& operator=(const SInputOwner&) = delete;
     };
 
+    // Whether the latest input event each client got was deskpilot's. A client keeps its entry after it disconnects; a
+    // new client at its address overwrites it with its first event.
+    std::map<wl_client*, bool> g_agentLast;
+
     uint32_t hkNextSerial(CSeatManager* self, SP<CWLSeatResource> seat, bool enter) {
+        if (seat)
+            g_agentLast[seat->client()] = g_agentInput;
         if (g_agentInput && seat)
             return wl_display_next_serial(g_pCompositor->m_wlDisplay);
         return reinterpret_cast<NextSerialFn>(g_serialHook->m_original)(self, seat, enter);
@@ -1157,6 +1181,7 @@ namespace {
     void hiddenLeave(SOp& op);
     void pumpFrames(const PHLWINDOW& window);
     PHLWINDOW windowOf(const SOp& op);
+    std::vector<WP<CWlPointer>> agentPointersOf(wl_client* client);
 
     bool direct() {
         return g_op->direct;
@@ -1267,11 +1292,17 @@ namespace {
         return std::format(R"("x":{},"y":{})", pos.x, pos.y);
     }
 
+    // Where the action's pointer is and how its input got there: the agent seat, the client's own pointer, or the
+    // user's seat.
+    std::string outcome(const SOp& op) {
+        return std::format(R"({},"route":"{}")", pointAt(op.target), op.agentSeat ? "agent" : op.direct ? "client" : "seat");
+    }
+
     // A path's `n` step: the caller is answered now, while the action goes on.
     void answerEarly() {
         if (!g_op->error.empty())
             return;
-        complete(g_op->ticket, std::format(R"({{"ok":true,"ticket":{},{}}})", g_op->ticket, pointAt(g_op->target)));
+        complete(g_op->ticket, std::format(R"({{"ok":true,"ticket":{},{}}})", g_op->ticket, outcome(*g_op)));
         g_op->answered = true;
     }
 
@@ -1319,7 +1350,7 @@ namespace {
         replayHeld(op.heldInput);
 
         if (!op.answered)
-            complete(op.ticket, op.error.empty() ? std::format(R"({{"ok":true,{}}})", pointAt(op.target)) : errorReply(op.error, op.code));
+            complete(op.ticket, op.error.empty() ? std::format(R"({{"ok":true,{}}})", outcome(op)) : errorReply(op.error, op.code));
         startNext();
     }
 
@@ -1345,11 +1376,14 @@ namespace {
         if (PROTO::data->dndActive())
             return "a drag and drop is in progress: try again when it ends";
         op.ticket = ticket;
-        // A window of the app the user's pointer is on cannot take it directly: one wl_pointer is on one surface.
+        // A window whose app bound the agent seat takes its agent pointer. Otherwise a window of the app the user's
+        // pointer is on cannot take the app's own pointer: one wl_pointer is on one surface.
         const auto WINDOW = windowOf(op);
         const auto USER   = g_pSeatManager->m_state.pointerFocus.lock();
         const auto MINE   = WINDOW && WINDOW->wlSurface() && WINDOW->wlSurface()->resource() ? WINDOW->wlSurface()->resource()->client() : nullptr;
-        op.direct         = op.mode == eMode::HIDDEN || (WINDOW && !WINDOW->backend().isX11() && (!USER || USER->client() != MINE));
+        const bool NATIVE = WINDOW && !WINDOW->backend().isX11();
+        op.agentSeat      = NATIVE && MINE && !agentPointersOf(MINE).empty();
+        op.direct         = op.mode == eMode::HIDDEN || op.agentSeat || (NATIVE && (!USER || USER->client() != MINE));
         if (!op.direct) {
             op.saved        = g_pInputManager->getMouseCoordsInternal();
             op.focusWindow  = Desktop::focusState()->window();
@@ -1478,6 +1512,170 @@ namespace {
         return out;
     }
 
+    // ---- agent seat ----
+    //
+    // A wl_seat named "deskpilot", with a pointer and nothing else, which seat.cpp advertises (see seat.hpp for why it
+    // lives in its own library). A client that binds every seat (GTK and Qt do) gets a second pointer, the action's
+    // alone: a window of that client takes each pointer action through it, in every mode, so the user's pointer can be
+    // anywhere, the same app included, and nothing of theirs is held. Clients that bind one seat (Chromium, Electron,
+    // kitty), X clients, and apps started before the plugin first loaded (GTK 4 binds only the seats it finds when it
+    // starts) keep the other routes.
+    //
+    //   - A move, resize, pointer warp or activation that names the agent seat is ignored, as Hyprland finds no record of
+    //     it, and its events carry serials Hyprland never records, so they earn nothing, as for hkNextSerial.
+    //   - A popup it opens asks for its grab on the client's first seat (GTK 4 always grabs with the default seat), so
+    //     the grab is told from the user's by the client's latest input (hkAddOrStartGrab).
+    void*             g_agentLibrary = nullptr;
+    const SAgentSeat* g_agentSeat    = nullptr;
+
+    uint32_t agentSerial(wl_client* client) {
+        g_agentLast[client] = true;
+        return wl_display_next_serial(g_pCompositor->m_wlDisplay);
+    }
+
+    std::vector<WP<CWlPointer>> agentPointersOf(wl_client* client) {
+        return g_agentSeat->pointersOf(client);
+    }
+
+    bool isAgentPointer(wl_resource* resource) {
+        return g_agentSeat->isPointer(resource);
+    }
+
+    // Other protocols take a client's wl_pointer and either ignore which one it is or look up Hyprland's record of it.
+    //
+    //   - A cursor shape a client sets for its agent pointer would be the user's cursor whenever their pointer is on
+    //     that client, since Hyprland takes any shape from the client under the user's pointer. The client names the
+    //     enter serial it answers, so a shape for one of the agent pointer's recent enters is dropped.
+    //   - A cursor capture session for a pointer Hyprland has no record of would dereference null, so it is refused,
+    //     which the protocol reports to the client as a stopped session.
+    //   - Hyprland sends the user's touchpad gestures and relative motion to every gesture and relative pointer object
+    //     of the client under their pointer, and applies a pointer lock or confinement to the user's pointer, whichever
+    //     pointer the client named. So a client asking for one with its agent pointer (GTK makes gesture objects for
+    //     each seat) gets an inert object of the seat library's instead.
+    constexpr size_t      AGENT_ENTERS = 64;
+    std::deque<uint32_t>  g_agentEnters;
+
+    uint32_t agentEnterSerial(wl_client* client) {
+        const auto SERIAL = agentSerial(client);
+        g_agentEnters.push_back(SERIAL);
+        if (g_agentEnters.size() > AGENT_ENTERS)
+            g_agentEnters.pop_front();
+        return SERIAL;
+    }
+
+    using SetShapeFn            = void (*)(CCursorShapeProtocol*, CWpCursorShapeDeviceV1*, uint32_t, wpCursorShapeDeviceV1Shape);
+    CFunctionHook* g_shapeHook = nullptr;
+
+    void hkOnSetShape(CCursorShapeProtocol* self, CWpCursorShapeDeviceV1* device, uint32_t serial, wpCursorShapeDeviceV1Shape shape) {
+        if (std::ranges::contains(g_agentEnters, serial))
+            return;
+        reinterpret_cast<SetShapeFn>(g_shapeHook->m_original)(self, device, serial, shape);
+    }
+
+    using CursorSessionFn               = UP<Screenshare::CCursorshareSession> (*)(Screenshare::CScreenshareManager*, wl_client*, WP<CWLPointerResource>);
+    CFunctionHook* g_cursorSessionHook = nullptr;
+
+    UP<Screenshare::CCursorshareSession> hkNewCursorSession(Screenshare::CScreenshareManager* self, wl_client* client, WP<CWLPointerResource> pointer) {
+        if (!pointer)
+            return nullptr;
+        return reinterpret_cast<CursorSessionFn>(g_cursorSessionHook->m_original)(self, client, pointer);
+    }
+
+    // A gesture or relative pointer asked for with an agent pointer (Hyprland ignores which pointer it names).
+    template <CFunctionHook*& HOOK, eInert KIND, typename PROTOCOL, typename MANAGER>
+    void hkGetForPointer(PROTOCOL* self, MANAGER* manager, uint32_t id, wl_resource* pointer) {
+        if (isAgentPointer(pointer))
+            return g_agentSeat->inert(KIND, manager->client(), manager->version(), id);
+        reinterpret_cast<void (*)(PROTOCOL*, MANAGER*, uint32_t, wl_resource*)>(HOOK->m_original)(self, manager, id, pointer);
+    }
+
+    // A pointer lock or confinement asked for with an agent pointer (Hyprland applies it to the user's pointer).
+    template <CFunctionHook*& HOOK, eInert KIND>
+    void hkConstrain(CPointerConstraintsProtocol* self, CZwpPointerConstraintsV1* manager, uint32_t id, wl_resource* surface, wl_resource* pointer, wl_resource* region,
+                     zwpPointerConstraintsV1Lifetime lifetime) {
+        if (isAgentPointer(pointer))
+            return g_agentSeat->inert(KIND, manager->client(), manager->version(), id);
+        reinterpret_cast<decltype(&hkConstrain<HOOK, KIND>)>(HOOK->m_original)(self, manager, id, surface, pointer, region, lifetime);
+    }
+
+    CFunctionHook* g_swipeHook    = nullptr;
+    CFunctionHook* g_pinchHook    = nullptr;
+    CFunctionHook* g_holdHook     = nullptr;
+    CFunctionHook* g_relativeHook = nullptr;
+    CFunctionHook* g_lockHook     = nullptr;
+    CFunctionHook* g_confineHook  = nullptr;
+
+    void startAgentSeat() {
+        g_agentLibrary = dlopen(DESKPILOT_SEAT, RTLD_NOW | RTLD_NODELETE);
+        const auto START = g_agentLibrary ? reinterpret_cast<decltype(&deskpilot_agent_seat)>(dlsym(g_agentLibrary, "deskpilot_agent_seat")) : nullptr;
+        g_agentSeat      = START ? START(g_pCompositor->m_wlDisplay) : nullptr;
+        if (!g_agentSeat)
+            throw std::runtime_error(std::format("deskpilot: could not open the agent seat {}: {}", DESKPILOT_SEAT, g_agentLibrary ? "no seat" : dlerror()));
+    }
+
+    // The seat, and the inert objects clients made for it, stay: its library is never unmapped.
+    void stopAgentSeat() {
+        g_agentSeat = nullptr;
+        if (g_agentLibrary)
+            dlclose(g_agentLibrary);
+        g_agentLibrary = nullptr;
+    }
+
+    // What an action sends a pointer, for the client's own pointers and agent pointers alike.
+    void sendEnter(CWLPointerResource& pointer, const SP<CWLSurfaceResource>& surface, const Vector2D& local) {
+        pointer.sendEnter(surface, local);
+    }
+    void sendEnter(CWlPointer& pointer, const SP<CWLSurfaceResource>& surface, const Vector2D& local) {
+        pointer.sendEnterRaw(agentEnterSerial(pointer.client()), surface->getResource()->resource(), wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+    }
+    void sendLeave(CWLPointerResource& pointer, const SP<CWLSurfaceResource>&) {
+        pointer.sendLeave();
+    }
+    void sendLeave(CWlPointer& pointer, const SP<CWLSurfaceResource>& surface) {
+        if (surface)
+            pointer.sendLeaveRaw(agentSerial(pointer.client()), surface->getResource()->resource());
+    }
+    void sendMotion(CWLPointerResource& pointer, const Vector2D& local) {
+        pointer.sendMotion(now(), local);
+    }
+    void sendMotion(CWlPointer& pointer, const Vector2D& local) {
+        pointer.sendMotion(now(), wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+    }
+    void sendButton(CWLPointerResource& pointer, uint32_t button, wl_pointer_button_state state) {
+        pointer.sendButton(now(), button, state);
+    }
+    void sendButton(CWlPointer& pointer, uint32_t button, wl_pointer_button_state state) {
+        pointer.sendButton(agentSerial(pointer.client()), now(), button, state);
+    }
+    void sendFrame(CWLPointerResource& pointer) {
+        pointer.sendFrame();
+    }
+    void sendFrame(CWlPointer& pointer) {
+        if (pointer.version() >= 5)
+            pointer.sendFrame();
+    }
+    // What CSeatManager::sendPointerAxis sends one pointer for a wheel notch.
+    void sendNotch(CWLPointerResource& pointer, int sign) {
+        pointer.sendAxis(now(), WL_POINTER_AXIS_VERTICAL_SCROLL, 15.0 * sign);
+        pointer.sendAxisSource(WL_POINTER_AXIS_SOURCE_WHEEL);
+        pointer.sendAxisRelativeDirection(WL_POINTER_AXIS_VERTICAL_SCROLL, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+        if (pointer.version() >= 8)
+            pointer.sendAxisValue120(WL_POINTER_AXIS_VERTICAL_SCROLL, 120 * sign);
+        else
+            pointer.sendAxisDiscrete(WL_POINTER_AXIS_VERTICAL_SCROLL, sign);
+    }
+    void sendNotch(CWlPointer& pointer, int sign) {
+        pointer.sendAxis(now(), WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_double(15.0 * sign));
+        if (pointer.version() >= 5)
+            pointer.sendAxisSource(WL_POINTER_AXIS_SOURCE_WHEEL);
+        if (pointer.version() >= 9)
+            pointer.sendAxisRelativeDirection(WL_POINTER_AXIS_VERTICAL_SCROLL, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
+        if (pointer.version() >= 8)
+            pointer.sendAxisValue120(WL_POINTER_AXIS_VERTICAL_SCROLL, 120 * sign);
+        else if (pointer.version() >= 5)
+            pointer.sendAxisDiscrete(WL_POINTER_AXIS_VERTICAL_SCROLL, sign);
+    }
+
     // ---- hidden pointer ----
     //
     // A hidden action drives the window client's own pointer: the client's wl_pointer resources are entered on the
@@ -1507,16 +1705,29 @@ namespace {
         return Desktop::viewState()->query().selector(std::format("address:0x{:x}", op.window)).runWindow();
     }
 
+    // Runs `fn` on each pointer the action has entered, whichever kind they are.
+    template <typename FN>
+    void eachPointer(SOp& op, FN&& fn) {
+        for (const auto& pointer : op.pointers) {
+            if (const auto LIVE = pointer.lock())
+                fn(*LIVE);
+        }
+        for (const auto& pointer : op.agents) {
+            if (const auto LIVE = pointer.lock())
+                fn(*LIVE);
+        }
+    }
+
     void enterPointers(SOp& op) {
         // Also run when the user's pointer moves, outside the action's own steps.
         SInputOwner agent;
         const auto  SURFACE = op.surface.lock();
-        for (const auto& pointer : op.pointers) {
-            if (!pointer || !SURFACE)
-                continue;
-            pointer->sendEnter(SURFACE, op.local);
-            pointer->sendFrame();
-        }
+        if (!SURFACE)
+            return;
+        eachPointer(op, [&](auto& pointer) {
+            sendEnter(pointer, SURFACE, op.local);
+            sendFrame(pointer);
+        });
     }
 
     // Whether the action's pointer may send now: still entered on the window, with the user's pointer elsewhere.
@@ -1529,7 +1740,7 @@ namespace {
             op.code  = "gone";
             return false;
         }
-        if (const auto USER = g_pSeatManager->m_state.pointerFocus.lock(); USER && USER->client() == SURFACE->client()) {
+        if (const auto USER = g_pSeatManager->m_state.pointerFocus.lock(); !op.agentSeat && USER && USER->client() == SURFACE->client()) {
             op.error = "the user's pointer is on another window of this app, and hidden input would take it from there";
             return false;
         }
@@ -1569,30 +1780,36 @@ namespace {
         op.surface = surface;
         if (!hiddenReady(op))
             return;
-        for (const auto& pointer : (*PROTO::seat).*member(SSeatPointers{})) {
-            if (pointer && pointer->m_owner && pointer->m_owner->client() == surface->client())
-                op.pointers.emplace_back(pointer);
+        if (op.agentSeat)
+            op.agents = agentPointersOf(surface->client());
+        else {
+            for (const auto& pointer : (*PROTO::seat).*member(SSeatPointers{})) {
+                if (pointer && pointer->m_owner && pointer->m_owner->client() == surface->client())
+                    op.pointers.emplace_back(pointer);
+            }
         }
-        if (op.pointers.empty()) {
+        if (op.pointers.empty() && op.agents.empty()) {
             op.error = describe(WINDOW) + " has no pointer to send input to";
             return;
         }
-        op.focusChange = g_pSeatManager->m_events.pointerFocusChange.listen([] {
-            if (!g_op || !g_op->direct || !g_op->error.empty())
-                return;
-            // A drag and drop the press started takes the seat's pointer focus; finish() cancels it.
-            if (!g_op->down.empty() && PROTO::data->dndActive()) {
-                g_op->error = "the press started a drag and drop, which a hidden action cannot carry: it was cancelled";
-                return;
-            }
-            if (hiddenReady(*g_op))
-                enterPointers(*g_op);
-        });
+        // The agent pointer is the action's alone: the seat's pointer focus never moves it.
+        if (!op.agentSeat)
+            op.focusChange = g_pSeatManager->m_events.pointerFocusChange.listen([] {
+                if (!g_op || !g_op->direct || !g_op->error.empty())
+                    return;
+                // A drag and drop the press started takes the seat's pointer focus; finish() cancels it.
+                if (!g_op->down.empty() && PROTO::data->dndActive()) {
+                    g_op->error = "the press started a drag and drop, which a hidden action cannot carry: it was cancelled";
+                    return;
+                }
+                if (hiddenReady(*g_op))
+                    enterPointers(*g_op);
+            });
         enterPointers(op);
-        for (const auto& pointer : op.pointers) {
-            pointer->sendMotion(now(), op.local);
-            pointer->sendFrame();
-        }
+        eachPointer(op, [&](auto& pointer) {
+            sendMotion(pointer, op.local);
+            sendFrame(pointer);
+        });
         pumpFrames(WINDOW);
     }
 
@@ -1606,63 +1823,74 @@ namespace {
             if (!hiddenSurfaceAt(op, pos, surface, local))
                 return;
             op.local = local;
-            if (surface != op.surface.lock()) {
-                for (const auto& pointer : op.pointers) {
-                    if (pointer)
-                        pointer->sendLeave();
-                }
+            if (const auto LEFT = op.surface.lock(); surface != LEFT) {
+                eachPointer(op, [&](auto& pointer) { sendLeave(pointer, LEFT); });
                 op.surface = surface;
                 enterPointers(op);
             }
         } else if (const auto WINDOW = windowOf(op))
             op.local = Desktop::viewState()->hitTest().surfaceLocalAt(pos, WINDOW, op.surface.lock());
-        for (const auto& pointer : op.pointers) {
-            if (!pointer)
-                continue;
-            pointer->sendMotion(now(), op.local);
-            pointer->sendFrame();
-        }
+        eachPointer(op, [&](auto& pointer) {
+            sendMotion(pointer, op.local);
+            sendFrame(pointer);
+        });
+    }
+
+    // Popups that mapped without a grab (hkAddOrStartGrab), by client. A grab closes its popups on a click outside them,
+    // and a client waits for that: GTK takes no click on the window under an open menu. Any press outside them, the
+    // user's or deskpilot's, closes them here instead.
+    std::map<wl_client*, std::vector<WP<CXDGPopupResource>>> g_ungrabbed;
+
+    void closeUngrabbed(const SP<CWLSurfaceResource>& target) {
+        std::erase_if(g_ungrabbed, [&](auto& entry) {
+            auto& popups = entry.second;
+            std::erase_if(popups, [](const auto& popup) { return !popup; });
+            if (std::ranges::any_of(popups, [&](const auto& popup) { return popup->m_surface && popup->m_surface->m_surface.lock() == target; }))
+                return false;
+            for (const auto& popup : popups | std::views::reverse)
+                popup->done();
+            return true;
+        });
+    }
+
+    using SeatButtonFn = void (*)(CSeatManager*, uint32_t, uint32_t, wl_pointer_button_state);
+    CFunctionHook* g_seatButtonHook = nullptr;
+
+    void hkSendPointerButton(CSeatManager* self, uint32_t timeMs, uint32_t button, wl_pointer_button_state state) {
+        if (const auto SURFACE = self->m_state.pointerFocus.lock(); SURFACE && state == WL_POINTER_BUTTON_STATE_PRESSED)
+            closeUngrabbed(SURFACE);
+        reinterpret_cast<SeatButtonFn>(g_seatButtonHook->m_original)(self, timeMs, button, state);
     }
 
     void hiddenButton(SOp& op, uint32_t button, wl_pointer_button_state state) {
-        for (const auto& pointer : op.pointers) {
-            if (!pointer)
-                continue;
-            pointer->sendButton(now(), button, state);
-            pointer->sendFrame();
-        }
+        if (const auto SURFACE = op.surface.lock(); SURFACE && state == WL_POINTER_BUTTON_STATE_PRESSED)
+            closeUngrabbed(SURFACE);
+        eachPointer(op, [&](auto& pointer) {
+            sendButton(pointer, button, state);
+            sendFrame(pointer);
+        });
         pumpFrames(windowOf(op));
     }
 
-    // What CSeatManager::sendPointerAxis sends one pointer for a wheel notch.
     void hiddenWheel(SOp& op, int sign) {
-        for (const auto& pointer : op.pointers) {
-            if (!pointer)
-                continue;
-            pointer->sendAxis(now(), WL_POINTER_AXIS_VERTICAL_SCROLL, 15.0 * sign);
-            pointer->sendAxisSource(WL_POINTER_AXIS_SOURCE_WHEEL);
-            pointer->sendAxisRelativeDirection(WL_POINTER_AXIS_VERTICAL_SCROLL, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL);
-            if (pointer->version() >= 8)
-                pointer->sendAxisValue120(WL_POINTER_AXIS_VERTICAL_SCROLL, 120 * sign);
-            else
-                pointer->sendAxisDiscrete(WL_POINTER_AXIS_VERTICAL_SCROLL, sign);
-            pointer->sendFrame();
-        }
+        eachPointer(op, [&](auto& pointer) {
+            sendNotch(pointer, sign);
+            sendFrame(pointer);
+        });
         pumpFrames(windowOf(op));
     }
 
-    // Only a pointer still on the action's surface leaves: one the user's pointer has entered since is theirs.
+    // Only a pointer still on the action's surface leaves: a client pointer the user's pointer has entered since is
+    // theirs.
     void hiddenLeave(SOp& op) {
         const auto SURFACE = op.surface.lock();
         const auto USER    = g_pSeatManager->m_state.pointerFocus.lock();
-        if (!SURFACE || (USER && USER->client() == SURFACE->client()))
+        if (!SURFACE || (!op.agentSeat && USER && USER->client() == SURFACE->client()))
             return;
-        for (const auto& pointer : op.pointers) {
-            if (!pointer)
-                continue;
-            pointer->sendLeave();
-            pointer->sendFrame();
-        }
+        eachPointer(op, [&](auto& pointer) {
+            sendLeave(pointer, SURFACE);
+            sendFrame(pointer);
+        });
     }
 
     // Windows off screen that get frame callbacks until a time, as a window on screen gets them every frame.
@@ -1704,20 +1932,30 @@ namespace {
         g_pumpTimer->updateTimeout(ms(1));
     }
 
-    // A popup's grab confines the user's pointer and keyboard to it until a click outside closes it. A popup of a
-    // window off screen (a menu a hidden action opened) maps without one: the user could not see what holds their
-    // input, and the window's client still gets its input there.
+    // A popup's grab confines the user's pointer and keyboard to it until a click outside closes it, and moves their
+    // keyboard focus into it. A popup deskpilot's input opened maps without one, as does any popup of a window off
+    // screen, which the user could not see holding their input; the window's client still gets its input there.
     using GrabFn = void (*)(CXDGShellProtocol*, SP<CXDGPopupResource>);
     CFunctionHook* g_grabHook = nullptr;
 
     void hkAddOrStartGrab(CXDGShellProtocol* self, SP<CXDGPopupResource> popup) {
+        // A popup is opened by the latest input its client got. The seat its grab names does not say whose that was:
+        // GTK 4 names its first seat for a popup the agent seat opened.
+        const auto SURFACE = popup && popup->m_surface ? popup->m_surface->m_surface.lock() : nullptr;
+        if (SURFACE && g_agentLast[SURFACE->client()]) {
+            g_ungrabbed[SURFACE->client()].emplace_back(popup);
+            return;
+        }
         auto parent = popup ? popup->m_parent.lock() : nullptr;
         while (parent && parent->m_popup && parent->m_popup->m_parent)
             parent = parent->m_popup->m_parent.lock();
         const auto HLSURFACE = parent ? Desktop::View::CWLSurface::fromResource(parent->m_surface.lock()) : nullptr;
         const auto WINDOW    = HLSURFACE ? Desktop::View::CWindow::fromView(HLSURFACE->view()) : nullptr;
-        if (WINDOW && !g_pHyprRenderer->shouldRenderWindow(WINDOW))
+        if (WINDOW && !g_pHyprRenderer->shouldRenderWindow(WINDOW)) {
+            if (SURFACE)
+                g_ungrabbed[SURFACE->client()].emplace_back(popup);
             return;
+        }
         reinterpret_cast<GrabFn>(g_grabHook->m_original)(self, popup);
     }
 
@@ -2637,8 +2875,18 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_leaveHook        = hook(handle, "CWLPointerResource", "sendLeave", reinterpret_cast<void*>(&hkSendLeave));
     g_popupFocusHook   = hook(handle, "CPopup", "focusAvailable", reinterpret_cast<void*>(&hkPopupFocusAvailable));
     g_keyboardLeaveHook = hook(handle, "CWLKeyboardResource", "sendLeave", reinterpret_cast<void*>(&hkKeyboardSendLeave));
+    g_seatButtonHook    = hook(handle, "CSeatManager", "sendPointerButton", reinterpret_cast<void*>(&hkSendPointerButton));
+    g_shapeHook         = hook(handle, "CCursorShapeProtocol", "onSetShape", reinterpret_cast<void*>(&hkOnSetShape));
+    g_cursorSessionHook = hook(handle, "CScreenshareManager", "newCursorSession", reinterpret_cast<void*>(&hkNewCursorSession));
+    g_swipeHook         = hook(handle, "CPointerGesturesProtocol", "onGetSwipeGesture", reinterpret_cast<void*>(&hkGetForPointer<g_swipeHook, eInert::SWIPE, CPointerGesturesProtocol, CZwpPointerGesturesV1>));
+    g_pinchHook         = hook(handle, "CPointerGesturesProtocol", "onGetPinchGesture", reinterpret_cast<void*>(&hkGetForPointer<g_pinchHook, eInert::PINCH, CPointerGesturesProtocol, CZwpPointerGesturesV1>));
+    g_holdHook          = hook(handle, "CPointerGesturesProtocol", "onGetHoldGesture", reinterpret_cast<void*>(&hkGetForPointer<g_holdHook, eInert::HOLD, CPointerGesturesProtocol, CZwpPointerGesturesV1>));
+    g_relativeHook      = hook(handle, "CRelativePointerProtocol", "onGetRelativePointer", reinterpret_cast<void*>(&hkGetForPointer<g_relativeHook, eInert::RELATIVE, CRelativePointerProtocol, CZwpRelativePointerManagerV1>));
+    g_lockHook          = hook(handle, "CPointerConstraintsProtocol", "onLockPointer", reinterpret_cast<void*>(&hkConstrain<g_lockHook, eInert::LOCKED>));
+    g_confineHook       = hook(handle, "CPointerConstraintsProtocol", "onConfinePointer", reinterpret_cast<void*>(&hkConstrain<g_confineHook, eInert::CONFINED>));
 
     agentcursor::init();
+    startAgentSeat();
     g_pumpTimer = makeShared<CEventLoopTimer>(std::nullopt, pumpTick, nullptr);
     g_pEventLoopManager->addTimer(g_pumpTimer);
 
@@ -2672,6 +2920,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     }
     g_tickets.clear();
     restorePaste();
+    stopAgentSeat();
     agentcursor::shutdown();
     dropTimer(g_pumpTimer);
     g_pumped.clear();

@@ -50,12 +50,21 @@ def build_dir() -> Path:
     return Path(base) / "deskpilot"
 
 
-def source_hash() -> str:
-    """Names a build after its source, so a changed plugin is rebuilt and reloaded rather than mistaken for current."""
+def _digest(*names: str) -> str:
     digest = hashlib.sha256()
-    for name in ("deskpilot.cpp", "Makefile"):
+    for name in names:
         digest.update((SOURCE / name).read_bytes())
     return digest.hexdigest()[:12]
+
+
+def source_hash() -> str:
+    """Names a build after its source, so a changed plugin is rebuilt and reloaded rather than mistaken for current."""
+    return _digest("deskpilot.cpp", "seat.cpp", "seat.hpp", "Makefile")
+
+
+def seat_hash() -> str:
+    """Names the agent seat library after its own source: the plugin keeps one open for the life of Hyprland."""
+    return _digest("seat.cpp", "seat.hpp")
 
 
 def headers_commit() -> str | None:
@@ -72,6 +81,10 @@ def headers_commit() -> str | None:
 
 def build_path(commit: str) -> Path:
     return build_dir() / f"deskpilot-{commit[:12]}-{source_hash()}.so"
+
+
+def seat_path(commit: str) -> Path:
+    return build_dir() / f"deskpilot-seat-{commit[:12]}-{seat_hash()}.so"
 
 
 def parse_reply(text: str) -> dict:
@@ -246,10 +259,11 @@ class Plugin:
         return running
 
     def build(self) -> Path:
-        out = build_path(self.running_commit())
+        commit = self.running_commit()
+        out = build_path(commit)
         out.parent.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            ["make", "-C", str(SOURCE), f"OUT={out}", f"SOURCE_HASH={source_hash()}"],
+            ["make", "-C", str(SOURCE), f"OUT={out}", f"SEAT={seat_path(commit)}", f"SOURCE_HASH={source_hash()}"],
             capture_output=True,
             text=True,
             check=False,

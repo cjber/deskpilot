@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **GTK and Qt apps get a pointer of deskpilot's own.** The plugin adds a second seat, `deskpilot`, with a pointer
+  only. An app that binds it takes clicks, scrolls, drags and hovers there, so a hidden action works on a window of
+  the app the user's pointer is on, and nothing of the user's is held. Apps that bind only the first seat (Chromium,
+  Electron, kitty), XWayland apps, apps started before the plugin first loaded, and keys keep the routes they had.
+- **A menu deskpilot opens no longer grabs the user's pointer and keyboard**, in any app or mode, and a click
+  outside it, the user's or deskpilot's, closes it as the user's own menus close.
 - **A click into a covered window is refused, not reported as done.** An on-screen click, scroll, drag or hover
   on a native Wayland window at a point another window covered went to the window beneath and reported success,
   though the user saw nothing happen there. It is now refused as `covered`, as it already was for XWayland windows;
