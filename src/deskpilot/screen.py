@@ -156,3 +156,9 @@ def to_global(window: Window, x: float, y: float, scale: float) -> tuple[int, in
             f"({x}, {y}) at scale {scale} is outside {window.cls} ({window.width}x{window.height} window pixels)"
         )
     return window.x + round(wx), window.y + round(wy)
+
+
+def window_to_global(window: Window, x: float, y: float) -> tuple[int, int]:
+    """A point in window pixels as a global compositor position, wherever it is. Only for a point on a popup, which may
+    reach past the window and is checked against the popup instead of the window."""
+    return window.x + round(x), window.y + round(y)

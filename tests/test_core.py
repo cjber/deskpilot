@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 import pytest
 from PIL import Image
 
-from deskpilot import clipboard, keys, screen
+from deskpilot import a11y, clipboard, keys, screen
 from deskpilot import desk as desk_module
 from deskpilot import plugin as plugin_module
 from deskpilot.desk import Desk, NotVisible, error_code
@@ -247,6 +247,7 @@ class FakePlugin:
 
     def __init__(self):
         self.calls = []
+        self.mapped: list[dict] = []  # the window's popups
 
     def register(self, owner=None):
         self.calls.append(("register", owner))
@@ -267,6 +268,10 @@ class FakePlugin:
 
     def end(self, ticket):
         self.calls.append(("end", ticket))
+
+    def popups(self, address):
+        self.calls.append(("popups", address))
+        return self.mapped
 
 
 def make_desk(tmp_path, monkeypatch):
@@ -300,6 +305,14 @@ def test_click_goes_through_the_plugin_and_leaves_the_pointer_alone(tmp_path, mo
 
 
 AGENT_CLIENT = {**CLIENT, "address": "0xdef", "workspace": {"name": "special:agent-tester"}}
+
+
+def launched_desk(tmp_path, monkeypatch):
+    """A desk whose one window the agent launched, for hidden actions."""
+    desk, fake, inp, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients = [AGENT_CLIENT]
+    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
+    return desk, fake, inp, plugin
 
 
 def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkeypatch):
@@ -887,9 +900,10 @@ def test_hover_then_click_clicks_before_the_pointer_leaves(tmp_path, monkeypatch
 
 
 def test_an_element_is_targeted_at_its_live_centre(tmp_path, monkeypatch):
-    desk, *_ = make_desk(tmp_path, monkeypatch)
-    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: (10, 20, 30, 40))
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: a11y.Located(10, 20, 30, 40))
     assert desk.click("battle", None, None, element="e3") == (2527 + 25, 966 + 40)
+    assert plugin.calls[-1][-1][0] == "m2552,1006"
     with pytest.raises(ValueError, match="not both"):
         desk.click("battle", 1, 2, element="e3")
     with pytest.raises(ValueError, match="neither"):
@@ -902,3 +916,56 @@ def test_key_hold_is_bounded(tmp_path, monkeypatch):
     assert plugin.calls[-1] == ("keys", "0xabc", ["+106", "-106"], {"hold": 2, "mode": "plain"})
     with pytest.raises(ValueError):
         desk.key("Right", "battle", hold=11)
+
+
+def popup(id, parent, x, y, sx, sy, width=100, height=200):
+    return {"id": id, "parent": parent, "x": x, "y": y, "sx": sx, "sy": sy, "width": width, "height": height}
+
+
+def test_a_gtk3_element_is_clicked_on_the_surface_it_is_on(tmp_path, monkeypatch):
+    desk, _, _, plugin = launched_desk(tmp_path, monkeypatch)
+    located = a11y.Located(10, 20, 30, 40, known=True)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: located)
+    desk.click("0xdef", None, None, element="e3", hidden=True)
+    assert plugin.calls[-1] == ("path", "0xdef", "hidden", ["s", "m2552,1006", "d52", "p272", "r272"])
+
+    # A menu item: its centre (46,19) on the menu's surface at 14,183.
+    plugin.mapped = [popup(0, -1, 20, 188, 14, 183)]
+    located = a11y.Located(6, 9, 80, 20, ((20, 188),), True)
+    assert desk.click("0xdef", None, None, element="e4", hidden=True) == (2527 + 60, 966 + 202)
+    assert plugin.calls[-2:] == [
+        ("popups", "0xdef"),
+        ("path", "0xdef", "hidden", ["s14,183", "m2587,1168", "d52", "p272", "r272"]),
+    ]
+
+    # A submenu item is on the menu's single child, wherever GTK places that, even past the window's edge.
+    plugin.mapped = [popup(0, -1, 20, 188, 14, 183), popup(1, 0, 162, 640, 156, 635)]
+    located = a11y.Located(6, 30, 80, 20, ((20, 188), (162, 124)), True)
+    desk.scroll("0xdef", None, None, 2, element="e6", hidden=True)
+    assert plugin.calls[-1][-1][:2] == ["s156,635", f"m{2527 + 156 + 46},{966 + 635 + 40}"]
+
+
+def test_a_window_element_is_refused_while_a_popup_is_at_the_window_origin(tmp_path, monkeypatch):
+    desk, _, _, plugin = launched_desk(tmp_path, monkeypatch)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: a11y.Located(10, 20, 30, 40, known=True))
+    plugin.mapped = [popup(0, -1, 0, 0, -6, -5)]
+    with pytest.raises(a11y.A11yError) as error:
+        desk.click("0xdef", None, None, element="e3", hidden=True)
+    assert error_code(error.value) == "ambiguous"
+    assert not any(call[0] == "path" for call in plugin.calls)
+
+
+def test_a_popup_element_that_cannot_be_placed_is_refused(tmp_path, monkeypatch):
+    desk, _, _, plugin = launched_desk(tmp_path, monkeypatch)
+    located = a11y.Located(6, 9, 80, 20, ((20, 188),), True)
+    monkeypatch.setattr("deskpilot.desk.a11y.locate", lambda win, element: located)
+    for mapped, code in (
+        ([], "stale"),
+        ([popup(0, -1, 20, 188, 14, 183), popup(1, -1, 20, 188, 14, 183)], "ambiguous"),
+        ([popup(0, -1, 20, 188, 14, 183, height=10)], "offscreen"),
+    ):
+        plugin.mapped = mapped
+        with pytest.raises(a11y.A11yError) as error:
+            desk.click("0xdef", None, None, element="e4", hidden=True)
+        assert error_code(error.value) == code
+    assert not any(call[0] == "path" for call in plugin.calls)

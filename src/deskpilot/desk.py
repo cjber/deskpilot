@@ -253,12 +253,27 @@ class Desk:
         """Resolve a point to a global position. The point is in pixels of `shot`, or of the window's latest shot,
         or at `scale` (1 for window pixels); with no shot at all it is in window pixels. With `element` it is the
         centre of that element of the window's accessibility tree, where the app says it is now."""
+        win, gx, gy, _ = self._aim(query, x, y, scale, shot, show, element, hidden)
+        return win, gx, gy
+
+    def _aim(
+        self,
+        query: str,
+        x: float | None,
+        y: float | None,
+        scale: float | None,
+        shot: str | None,
+        show: bool,
+        element: str | None,
+        hidden: bool,
+    ) -> tuple[Window, int, int, list[str]]:
+        """`point`, and the path steps that go before the first move: for an element, the surface it is on, which the
+        plugin checks the point hits."""
         if (element is None) == (x is None or y is None):
             raise ValueError("give a point (x and y) or an element, not both or neither")
         win = self._target(query, show, hidden)
         if element is not None:
-            ex, ey, ew, eh = a11y.locate(win, element)
-            return win, *screen.to_global(win, ex + ew / 2, ey + eh / 2, 1.0)
+            return win, *self._element_point(win, element)
         assert x is not None and y is not None
         if scale is None:
             taken = screen.load(shot) if shot else screen.latest(win.address)
@@ -266,7 +281,28 @@ class Desk:
                 taken.check(win)
             scale = taken.scale if taken else 1.0
         gx, gy = screen.to_global(win, x, y, scale)
-        return win, gx, gy
+        return win, gx, gy, []
+
+    def _popups(self, win: Window) -> list[a11y.Popup]:
+        """The window's mapped popups, as the plugin reports them."""
+        return [a11y.Popup(**popup) for popup in self.plugin.popups(win.address)]
+
+    def _element_point(self, win: Window, element: str) -> tuple[int, int, list[str]]:
+        """An element's centre as a global position, and its surface step. A GTK 3 popup element is placed through
+        its popup's surface, and its centre must lie in the popup."""
+        at = a11y.locate(win, element)
+        cx, cy = at.x + at.width / 2, at.y + at.height / 2
+        popup = a11y.resolve(self._popups(win), at.keys) if at.known else None
+        if popup is None:
+            gx, gy = screen.to_global(win, cx, cy, 1.0)
+            return gx, gy, ["s"] if at.known else []
+        px, py = popup.sx + cx, popup.sy + cy
+        if not (popup.x <= px < popup.x + popup.width and popup.y <= py < popup.y + popup.height):
+            raise a11y.A11yError(
+                f"Element {element}'s centre is outside its popup; scroll it into view or take a new snapshot.",
+                "offscreen",
+            )
+        return *screen.window_to_global(win, px, py), [f"s{popup.sx},{popup.sy}"]
 
     @staticmethod
     def _mode(hidden: bool, cursor: bool = True) -> str:
@@ -329,13 +365,13 @@ class Desk:
             )
         if take_focus:
             self.focus(query)
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
+        win, gx, gy, surface = self._aim(query, x, y, scale, shot, show, element, hidden)
         if take_pointer:
             self._take_pointer(win, gx, gy)
             self.input.click(button, count)
         else:
             code = BUTTON_CODES[button]
-            self._path(win, [f"m{gx},{gy}", f"d{HOLD_MS}", *[f"p{code}", f"r{code}"] * count], hidden)
+            self._path(win, [*surface, f"m{gx},{gy}", f"d{HOLD_MS}", *[f"p{code}", f"r{code}"] * count], hidden)
         return gx, gy
 
     def scroll(
@@ -357,12 +393,12 @@ class Desk:
             raise ValueError("a hidden scroll leaves the user's pointer alone: drop take_pointer")
         if dy == 0 or abs(dy) > 50:
             raise ValueError("scroll 1 to 50 notches, positive up")
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
+        win, gx, gy, surface = self._aim(query, x, y, scale, shot, show, element, hidden)
         if take_pointer:
             self._take_pointer(win, gx, gy)
             self.input.scroll(dy=dy)
         else:
-            self._path(win, [f"m{gx},{gy}", f"d{HOLD_MS}", f"w{dy}"], hidden)
+            self._path(win, [*surface, f"m{gx},{gy}", f"d{HOLD_MS}", f"w{dy}"], hidden)
         return gx, gy
 
     def drag(
@@ -415,15 +451,15 @@ class Desk:
         pixels, it clicks there next instead, before the pointer leaves, and returns that point."""
         if not 0 <= wait <= 5:
             raise ValueError("a hover waits 0 to 5 seconds")
-        win, gx, gy = self.point(query, x, y, scale, shot, show, element, hidden)
+        win, gx, gy, surface = self._aim(query, x, y, scale, shot, show, element, hidden)
         if then_click is not None:
             _, cx, cy = self.point(query, *then_click, scale, shot, show, hidden=hidden)
             code = BUTTON_CODES[button]
-            steps = [f"m{gx},{gy}", f"d{round(wait * 1000)}", f"m{cx},{cy}", f"p{code}", f"r{code}"]
+            steps = [*surface, f"m{gx},{gy}", f"d{round(wait * 1000)}", f"m{cx},{cy}", f"p{code}", f"r{code}"]
             self._path(win, steps, hidden)
             return cx, cy
         self._shootable(win)
-        reply = self._path(win, [f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"], hidden)
+        reply = self._path(win, [*surface, f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"], hidden)
         try:
             time.sleep(wait)
             return screen.capture(win, max_width=max_width)
@@ -433,7 +469,8 @@ class Desk:
     def elements(self, query: str, show: bool = False, hidden: bool = False, peek: bool = False) -> a11y.Element:
         """The window's accessibility tree, whose element ids click, hover, move and scroll take. A peek leaves the
         latest snapshot, and the ids taken from it, in place."""
-        return a11y.snapshot(self._target(query, show, hidden), peek=peek)
+        win = self._target(query, show, hidden)
+        return a11y.snapshot(win, peek=peek, popups=lambda: self._popups(win))
 
     def key(
         self,

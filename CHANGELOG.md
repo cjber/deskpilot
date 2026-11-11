@@ -30,6 +30,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
   that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
   desktop can be told apart.
+- **`click --element` on an item of a GTK 3 popup menu clicks the item,** such as a country in an open combo box or
+  an entry of a submenu, instead of the window behind it at the item's popup-relative position. `elements` reports
+  such items in window pixels, so they line up with the shot, and gives zero bounds to one whose popup cannot be told
+  apart. An element action is refused `stale` or `ambiguous` when its popup cannot be identified exactly, and
+  `covered` when another surface takes the point. `move`, `scroll` and `hover` with `--element` do the same.
 - **`paste` into an app that holds your clipboard is refused with `owns_clipboard`** instead of pasting your
   clipboard. Apps such as Chrome paste their own copy while they own the clipboard, so a paste into Chrome after you
   copied in Chrome inserted your text, not the given one. Type the text instead, or copy something in another app.

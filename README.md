@@ -147,7 +147,11 @@ element's centre where the app reports it at that moment. Each `elements` call p
 `SNAPSHOT:e5` pins an id to that snapshot: it is refused as stale once a newer snapshot replaces it, since every
 snapshot numbers its elements afresh. An element whose role or name changed since is stale too, and one no longer
 showing is offscreen. `elements --peek` reads the tree without replacing the latest snapshot, so a program can check
-what changed before it acts on an id it already holds. GTK and Qt apps expose a tree; Chromium, Electron and
+what changed before it acts on an id it already holds. An item of a GTK 3 popup menu (an open combo box, a menu or
+submenu) is placed on the popup it is in, so its bounds line up with a shot showing the popup and a click lands on it;
+when the popup cannot be told exactly the action is refused (`stale` once it closed, `ambiguous` when several could be
+it) and `elements` reports the item with zero bounds. An element's click is also refused `covered` when another
+surface, such as a submenu over its menu, takes the point. GTK and Qt apps expose a tree; Chromium, Electron and
 Firefox expose one only when started with accessibility on (`--force-renderer-accessibility` for Chromium and
 Electron), and Wine games expose none. An app with no tree is an error saying so, never a guessed one.
 

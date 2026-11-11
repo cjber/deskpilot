@@ -4,6 +4,10 @@
 // is mX,Y to move to global X,Y (the first step enters there), pBUTTON or rBUTTON to press or release, wNOTCHES to turn
 // the wheel, dMS to wait, or n to answer the caller at once while the rest goes on. A path must release every button it
 // presses. Clicks, scrolls, drags and hovers are all paths. `hyprctl deskpilot end <ticket>` ends a running one early.
+// An element action starts with sX,Y or s, the surface its element is on: the popup whose surface origin is X,Y relative
+// to the window (see `popups`), or the window's own surface. Its first point must hit that surface when entered and at
+// each press or wheel notch there, in the window's hit test, or the action is refused as covered: a submenu over its
+// menu, or a menu over the toplevel, would otherwise take the click.
 //
 // A window whose app bound the agent seat (see "agent seat") takes every path through that seat's pointer, in any mode,
 // and nothing of the user's is held. Otherwise SHOWN and PLAIN run on the user's own seat, so every client receives
@@ -76,6 +80,9 @@
 //
 // A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
 // <event>...`, and the `keys` or `paste` request naming <txn> queues all of it as one action.
+//
+// `hyprctl deskpilot popups <window>` lists the window's mapped popups, with each one's parent, position and surface
+// origin relative to the window and size, as Hyprland places them.
 //
 // Actions run one at a time in the order they arrive; up to MAX_QUEUED wait behind the running one and any more are
 // refused. Each request is answered when its own action has finished, or after REPLY_WAIT with
@@ -255,6 +262,9 @@ namespace {
         size_t                             next = 0;
         std::vector<uint32_t>              down; // buttons this action holds down, released when it ends however it ends
         bool                               answered = false; // a path's `n` step has answered its caller already
+        // From an `s` step: the surface the first point must hit, the window's own (an empty inner value) or the popup
+        // whose surface origin relative to the window is this. Unset, any surface of the window takes it.
+        std::optional<std::optional<Vector2D>> onSurface;
         // The input goes to the window client's own pointer (see "hidden pointer" below), leaving the user's pointer,
         // focus and input alone. Otherwise the seat's pointer is moved onto the window and the user's input is held:
         // for an XWayland window, which reads the one X pointer, and for a window of the app the user's pointer is on.
@@ -1219,6 +1229,7 @@ namespace {
     // Defined with the private members they need, below.
     void dndMotion(const Vector2D& pos);
     void dndDrop();
+    bool onElementSurface(SOp& op, const Vector2D& pos);
     void hiddenEnter(SOp& op, const Vector2D& pos);
     void hiddenMove(SOp& op, const Vector2D& pos);
     bool hiddenReady(SOp& op);
@@ -1237,6 +1248,8 @@ namespace {
     // window covering the point never sees the motion of an action refused at it.
     void enterAt(const Vector2D& pos) {
         g_op->target = pos;
+        if (!onElementSurface(*g_op, pos))
+            return;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
@@ -1256,6 +1269,8 @@ namespace {
     // the way Hyprland takes one.
     void moveTo(const Vector2D& pos) {
         g_op->target = pos;
+        // The element's surface is that of the first point alone.
+        g_op->onSurface.reset();
         if (g_op->mode == eMode::SHOWN)
             agentcursor::moveTo(g_op->agent, pos);
         if (direct()) {
@@ -1278,7 +1293,7 @@ namespace {
 
     // The seat call processMouseDownNormal ends with, without its refocus and raise before it.
     void press(uint32_t button) {
-        if (direct() ? !(clearAt() && hiddenReady(*g_op)) : !targetUnderPointer())
+        if (!onElementSurface(*g_op, g_op->target) || (direct() ? !(clearAt() && hiddenReady(*g_op)) : !targetUnderPointer()))
             return;
         if (g_op->mode == eMode::SHOWN)
             agentcursor::press(g_op->agent);
@@ -1322,6 +1337,8 @@ namespace {
     // One wheel notch as onMouseWheel sends it with a scroll factor of 1: delta 15, one discrete step, value120 of 120.
     // Negative is up in Wayland.
     void wheel(int sign) {
+        if (!onElementSurface(*g_op, g_op->target))
+            return;
         if (direct()) {
             if (clearAt() && hiddenReady(*g_op))
                 hiddenWheel(*g_op, sign);
@@ -1796,6 +1813,31 @@ namespace {
             return false;
         }
         return true;
+    }
+
+    // Whether `pos` hits the surface the action's element is on (SOp::onSurface), asked as the window's own hit test
+    // (windowSurfaceAt) asks, on screen or hidden: its popups first, by their geometry, then the window's surface tree.
+    bool onElementSurface(SOp& op, const Vector2D& pos) {
+        if (!op.onSurface)
+            return true;
+        const auto WINDOW = windowOf(op);
+        if (!WINDOW || !WINDOW->mapped()) {
+            op.error = "the window closed";
+            op.code  = "gone";
+            return false;
+        }
+        const auto HEAD   = WINDOW->backend().isX11() ? nullptr : WINDOW->popupHead();
+        const auto POPUP  = HEAD ? HEAD->at(pos) : nullptr;
+        const auto HIT    = POPUP ? std::optional<Vector2D>{POPUP->coordsRelativeToParent()} : std::nullopt;
+        const auto& WANT  = *op.onSurface;
+        if (HIT == WANT)
+            return true;
+        const auto WHERE = [](const std::optional<Vector2D>& origin) {
+            return origin ? std::format("the popup with its surface at {},{} in the window", origin->x, origin->y) : std::string("the window's own surface");
+        };
+        op.error = std::format("{} is at {},{}, over {}, which the element is on", WHERE(HIT), pos.x, pos.y, WHERE(WANT));
+        op.code  = "covered";
+        return false;
     }
 
     // The window's surface at `pos` and the point on it.
@@ -2831,8 +2873,9 @@ namespace {
     // `path [agent=NAME] <window> <shown|plain|hidden> <step>...`, where NAME is whose agent cursor shows it. A step is
     // mX,Y to move the pointer to global X,Y (the first step, where it enters the window), pB or rB to press or release
     // button B (272-274), wN to turn the wheel N notches (negative is up), dMS to wait MS milliseconds, or n to answer
-    // the request there while the action goes on, with its ticket for `end`.
-    constexpr auto PATH_USAGE = "usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>...; a step is mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n";
+    // the request there while the action goes on, with its ticket for `end`. sX,Y or s, before the first move, names
+    // the surface the first point must hit (SOp::onSurface).
+    constexpr auto PATH_USAGE = "usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>...; a step is sX,Y or s (first), mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n";
 
     IPC::Socket1::SResponse pathCommand(const std::vector<std::string>& args, const std::string& agent) {
         if (args.size() < 5)
@@ -2859,13 +2902,30 @@ namespace {
             const std::string& WORD = args[i];
             const auto         BAD  = "bad path step '" + WORD + "'";
             const std::string  REST = WORD.substr(1);
-            if (WORD[0] == 'm') {
+            const auto         XY   = [&REST]() -> std::optional<Vector2D> {
                 const auto COMMA = REST.find(',');
                 const auto X     = COMMA == std::string::npos ? std::nullopt : number(REST.substr(0, COMMA));
                 const auto Y     = COMMA == std::string::npos ? std::nullopt : number(REST.substr(COMMA + 1));
-                if (!X || !Y)
+                return X && Y ? std::optional<Vector2D>{Vector2D{*X, *Y}} : std::nullopt;
+            };
+            if (WORD[0] == 's') {
+                if (moves > 0 || op.onSurface)
+                    return refuse(BAD + ": the surface comes once, before the first move");
+                if (REST.empty()) {
+                    op.onSurface.emplace();
+                    continue;
+                }
+                const auto ORIGIN = XY();
+                if (!ORIGIN)
                     return refuse(BAD);
-                const Vector2D POINT{*X, *Y};
+                op.onSurface.emplace(*ORIGIN);
+                continue;
+            }
+            if (WORD[0] == 'm') {
+                const auto XYPOINT = XY();
+                if (!XYPOINT)
+                    return refuse(BAD);
+                const Vector2D POINT = *XYPOINT;
                 if (moves++ == 0) {
                     op.start = op.target = POINT;
                     op.steps.push_back({[POINT] { enterAt(POINT); }, MOVE_GAP});
@@ -2920,6 +2980,8 @@ namespace {
             }
             return refuse(WORD == "n" ? "a path answers once" : BAD);
         }
+        if (moves == 0)
+            return refuse("a path starts with a move, mX,Y");
         if (!down.empty())
             return refuse("the path leaves a button down: release every button it presses");
         if (moves > MAX_MOVES || presses > MAX_PRESSES || notches > MAX_NOTCHES || dwell > MAX_DWELL)
@@ -3135,6 +3197,59 @@ namespace {
         });
     }
 
+    // ---- popups ----
+    //
+    // `popups <window>`: the window's mapped popups (menus, tooltips) in Hyprland's popup tree, breadth first. Each has an
+    // id, its parent's id (-1 for a popup of the window itself), x,y its window geometry's position and sx,sy its
+    // surface's origin, both relative to the window's position, and its geometry's size. GTK 3 reports a popup element
+    // relative to its popup's surface and the popup's position as GDK placed it, so deskpilot needs both, exactly as
+    // the window's hit test places the popup (coordsRelativeToParent). A popup keeps its parent and backend private.
+    struct SPopupParent {
+        friend constexpr auto member(SPopupParent);
+    };
+    template struct SAccess<&Desktop::View::CPopup::m_parent, SPopupParent>;
+    struct SPopupBackend {
+        friend constexpr auto member(SPopupBackend);
+    };
+    template struct SAccess<&Desktop::View::CPopup::m_backend, SPopupBackend>;
+
+    IPC::Socket1::SResponse popupsCommand(const std::vector<std::string>& args) {
+        if (args.size() != 3)
+            return refuse("usage: deskpilot popups <window>");
+        const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
+        if (!WINDOW || !WINDOW->mapped())
+            return refuse("no mapped window " + args[2], "gone");
+        std::vector<SP<Desktop::View::CPopup>> popups;
+        if (const auto HEAD = WINDOW->backend().isX11() ? nullptr : WINDOW->popupHead())
+            HEAD->breadthfirst(
+                [&popups](SP<Desktop::View::CPopup> popup, void*) {
+                    // The head is a placeholder for the window itself, with no backend.
+                    if (popup && popup.get()->*member(SPopupBackend{}) && popup->mapped() && popup->wlSurface() && popup->wlSurface()->resource())
+                        popups.push_back(popup);
+                },
+                nullptr);
+        std::string out = R"({"ok":true,"popups":[)";
+        bool        first = true;
+        for (size_t id = 0; id < popups.size(); ++id) {
+            const auto& POPUP   = popups[id];
+            const auto  PARENT  = (POPUP.get()->*member(SPopupParent{})).lock();
+            const auto  IT      = std::ranges::find(popups, PARENT);
+            long        parent  = -1;
+            if (IT != popups.end())
+                parent = IT - popups.begin();
+            else if (!PARENT || PARENT.get()->*member(SPopupBackend{}))
+                continue; // a popup of a popup that is not mapped does not show
+            const auto& BACKEND = POPUP.get()->*member(SPopupBackend{});
+            const auto  ORIGIN  = POPUP->coordsRelativeToParent();
+            const auto  BOX     = BACKEND->surfaceGeometry();
+            const auto  SIZE    = BOX.size() == Vector2D{} ? POPUP->size() : BOX.size();
+            out += std::format(R"({}{{"id":{},"parent":{},"x":{},"y":{},"sx":{},"sy":{},"width":{},"height":{}}})", first ? "" : ",", id, parent, ORIGIN.x + BOX.x,
+                               ORIGIN.y + BOX.y, ORIGIN.x, ORIGIN.y, SIZE.x, SIZE.y);
+            first = false;
+        }
+        return IPC::Socket1::SResponse(out + "]}");
+    }
+
     IPC::Socket1::SResponse onCommand(const IPC::Socket1::SRequest& req) {
         std::istringstream       in(req.command);
         std::vector<std::string> args;
@@ -3180,9 +3295,11 @@ namespace {
             return cursorCommand(args, agent);
         if (VERB == "agent")
             return agents::command(args);
+        if (VERB == "popups")
+            return popupsCommand(args);
         return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>... | "
-                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | agent <name> [owner=PID|stop] | end <ticket> | wait <ticket> | "
-                      "status; a key event is +code, -code, pHEX, rHEX or tHEX, and a path step mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
+                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|stop] | "
+                      "end <ticket> | wait <ticket> | status; a key event is +code, -code, pHEX, rHEX or tHEX, and a path step sX,Y or s (first), mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
 }
 

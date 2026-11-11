@@ -200,8 +200,16 @@ class Plugin:
         there first), "plain" (on screen, no cursor) or "hidden" (the window's own pointer, wherever the window is).
         `mX,Y` moves to a global point (the first step enters the window there), `pCODE` and `rCODE` press and
         release a button, `wN` turns the wheel N notches (positive up), `dMS` waits, and `n` answers here with the
-        action's ticket while it goes on, until it ends or `end` ends it."""
+        action's ticket while it goes on, until it ends or `end` ends it. `sX,Y` or `s`, before the first move, is the
+        surface an element is on: the popup whose surface origin is X,Y in window pixels (see `popups`), or the window's
+        own. The first point must hit that surface, or the action is refused `covered`."""
         return self._call("path", *self._agent(), address, mode, *steps)
+
+    def popups(self, address: str) -> list[dict]:
+        """The window's mapped popups as Hyprland places them: each one's `id`, its `parent` (-1 on the window), `x`,`y`
+        its window geometry's position and `sx`,`sy` its surface's origin, both in window pixels, and its `width` and
+        `height`."""
+        return self._call("popups", address)["popups"]
 
     def cursor(self, gx: int, gy: int) -> dict:
         """Glide this agent's cursor to a global point, in turn with the actions, and return once it lands."""
