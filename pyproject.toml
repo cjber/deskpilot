@@ -19,7 +19,7 @@ Changelog = "https://github.com/cjber/deskpilot/blob/main/CHANGELOG.md"
 deskpilot = "deskpilot.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.12", "ty>=0.0.1"]
+dev = ["fonttools>=4.58", "pytest>=8", "ruff>=0.12", "ty>=0.0.1"]
 
 [build-system]
 requires = ["hatchling"]

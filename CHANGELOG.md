@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **A logo, a wordmark, and the README opens with them.** The mark is a flight-path ring with wings locked on a
+  cursor, the same shapes the agent cursor draws on screen; the wordmark sets it beside "deskpilot" and follows the
+  reader's dark mode. A 1280×640 social preview is in `assets/` for the repository card, and the README also
+  carries CI, version and licence badges.
+
 ## [0.6.0] - 2026-11-11
 
 - **`--hidden` now drives apps the agent launched, never the user's own windows.** `deskpilot launch CMD...` (with
