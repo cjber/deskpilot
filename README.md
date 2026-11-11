@@ -12,10 +12,16 @@ meanwhile: an XWayland window (X11 and Wine apps, which read the one X pointer),
 pointer is on. Keys likewise hold the user's input for a stroke only when their keyboard focus is in the target's app
 or the target is an XWayland window. In those cases the plugin refuses a click when another window covers the point.
 
-An agent cursor shows where deskpilot acts. The plugin draws it above every window, separate from the user's
-pointer: it glides along an arc to each point before the action starts, shrinks and sends out a ring at each press,
-follows a drag as it moves, and fades after a few idle seconds. Window screenshots never include it.
-`DESKPILOT_CURSOR=off` turns it off.
+An agent cursor shows where deskpilot acts: a flight-path marker, a ring with wings, centred on the point. The plugin
+draws it above every window, separate from the user's pointer: it glides along an arc to each point before the action
+starts, lock-on brackets close in around it as it lands, it shrinks and sends out a ring at each press, follows a drag
+as it moves, and fades after a few idle seconds. Window screenshots never include it. `DESKPILOT_CURSOR=off` turns it
+off.
+
+Several agents can work on one desktop at once, each with a cursor of its own. Set `DESKPILOT_AGENT` to a name (up to
+32 letters, digits, `-`, `_` or `.`), such as `DESKPILOT_AGENT=CLAUDE-1`, and that agent's cursor carries the name on a
+tag, in a colour taken from the name and kept apart from the other cursors on screen. Without it, actions share one
+unnamed cursor. Actions still run one at a time; the cursors show whose each one is.
 
 `--hidden` acts on a window wherever it is, on a hidden or special workspace included, fully out of the user's
 view: no workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin

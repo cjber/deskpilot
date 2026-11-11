@@ -365,6 +365,24 @@ def test_plugin_waits_on_a_queued_action_until_it_finishes():
         Plugin(lambda args: '{"ok":false,"error":"the deskpilot queue is full"}').cursor(1, 2)
 
 
+def test_each_agent_names_its_own_cursor(monkeypatch):
+    calls = []
+    run = lambda args: calls.append(args) or '{"ok":true}'  # noqa: E731
+    monkeypatch.delenv("DESKPILOT_AGENT", raising=False)
+    Plugin(run).cursor(1, 2)
+    monkeypatch.setenv("DESKPILOT_AGENT", "CLAUDE-1")
+    Plugin(run).cursor(1, 2)
+    Plugin(run).path("0xabc", "shown", ["m1,2"])
+    assert calls == [
+        ["deskpilot", "cursor", "1", "2"],
+        ["deskpilot", "cursor", "agent=CLAUDE-1", "1", "2"],
+        ["deskpilot", "path", "agent=CLAUDE-1", "0xabc", "shown", "m1,2"],
+    ]
+    monkeypatch.setenv("DESKPILOT_AGENT", "two words")
+    with pytest.raises(ValueError, match="DESKPILOT_AGENT"):
+        Plugin(run)
+
+
 def test_a_refusal_from_a_stale_plugin_names_the_build_and_the_fix():
     def run(args, version):
         if args[1] == "status":

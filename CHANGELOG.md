@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **A new agent cursor, one per agent.** The sharp arrow is now a flight-path marker, a ring with wings centred on
+  the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
+  that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
+  desktop can be told apart.
+
 ## [0.5.2] - 2026-11-11
 
 - **A click no longer lets the app take the user's focus afterwards.** An app such as Chrome asks to be activated
