@@ -12,6 +12,12 @@ meanwhile: an XWayland window (X11 and Wine apps, which read the one X pointer),
 pointer is on. Keys likewise hold the user's input for a stroke only when their keyboard focus is in the target's app
 or the target is an XWayland window. In those cases the plugin refuses a click when another window covers the point.
 
+The plugin also adds a second seat named `deskpilot`, with a pointer only. GTK and Qt apps bind every seat they find
+at startup, and such an app takes pointer actions through that seat's pointer: the user's pointer can be anywhere,
+on the same app included, and nothing of theirs is held. Apps that bind only the first seat (Chromium, Electron,
+kitty), XWayland apps, and apps started before the plugin first loaded since login keep the routes above. Keys
+always use the routes above.
+
 An agent cursor shows where deskpilot acts. The plugin draws it above every window, separate from the user's
 pointer: it glides along an arc to each point before the action starts, shrinks and sends out a ring at each press,
 follows a drag as it moves, and fades after a few idle seconds. Window screenshots never include it.
@@ -23,7 +29,7 @@ sends pointer input straight to that window's own client, and lets it draw while
 action shows the result. Tooltips and menus it opens show in that screenshot and take its clicks, and they never
 grab the user's input. It works for native Wayland windows. An XWayland window (X11 and Wine apps) is refused,
 since X clients read the one X pointer only the user's pointer moves; so is a window of the app the user's pointer is
-on, and a drag and drop the press starts is cancelled.
+on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled.
 
 Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
 the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
