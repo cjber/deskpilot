@@ -193,6 +193,23 @@ def test_a_vanished_element_is_stale_and_a_failing_bus_is_unavailable(tmp_path, 
     assert error.value.code == "unavailable"
 
 
+def test_a_missing_registry_is_unavailable_not_stale(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    missing = SimpleNamespace(
+        header=SimpleNamespace(fields={HeaderFields.error_name: "org.freedesktop.DBus.Error.ServiceUnknown"}), body=()
+    )
+
+    class NoRegistry(FakeBus):
+        def call(self, destination, object_path, interface, method, signature, body):
+            if destination == a11y.A11Y_BUS_NAME:
+                raise DBusErrorResponse(missing)
+            return super().call(destination, object_path, interface, method, signature, body)
+
+    with pytest.raises(a11y.A11yError) as error:
+        a11y.snapshot(window(), bus=NoRegistry())
+    assert error.value.code == "unavailable"
+
+
 def test_a_malformed_record_is_stale(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     a11y.snapshot(window(), bus=FakeBus())
