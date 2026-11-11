@@ -1,7 +1,19 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/wordmark-dark.svg">
+    <img src="assets/wordmark.svg" alt="deskpilot: desktop control for agents on Hyprland" width="360">
+  </picture>
+</p>
+
 # deskpilot
 
 Desktop control for agents on Hyprland. An agent takes a screenshot of a window, picks a point in it, and clicks
 or types there, in any app: native Wayland, XWayland and Wine programs such as the Battle.net launcher and games.
+
+[![ci](https://img.shields.io/github/actions/workflow/status/cjber/deskpilot/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/cjber/deskpilot/actions/workflows/ci.yml)
+[![pypi](https://img.shields.io/pypi/v/deskpilot?style=flat-square&color=3ECF8E)](https://pypi.org/project/deskpilot/)
+![python](https://img.shields.io/badge/python-3.12%20%7C%203.14-475569?style=flat-square)
+![license](https://img.shields.io/badge/license-MIT-475569?style=flat-square)
 
 Deskpilot never blocks the user. Clicks, scrolls, drags and keys run inside the compositor through the deskpilot
 Hyprland plugin, which sends them straight to the target app's own pointer and keyboard: the user's pointer, cursor,
@@ -218,3 +230,4 @@ claude mcp add deskpilot -- deskpilot mcp
 
 [AGENTS.md](AGENTS.md) has the checks, the layout and the rules a change must keep, and
 [CONTRIBUTING.md](CONTRIBUTING.md) how to report a bug or send a change.
+[SECURITY.md](SECURITY.md) says how to report a vulnerability privately.

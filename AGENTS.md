@@ -36,6 +36,8 @@ window on the hidden `special:dptest` workspace, with a headless output to act o
 - `src/deskpilot/keys.py`: key names, chords and text as the plugin's key events
 - `src/deskpilot/clipboard.py`: the user's clipboard through wl-clipboard
 - `scripts/nested.py`: a throwaway nested Hyprland for live checks of the plugin off the user's screen
+- `scripts/wordmark.py`: the wordmark, its dark variant and the GitHub social preview, from `assets/logo.svg` and
+  Liberation Sans (`uv run python scripts/wordmark.py`)
 - `src/deskpilot/a11y.py`: the target app's AT-SPI accessibility tree over D-Bus, and element ids for actions
 
 ## Rules
