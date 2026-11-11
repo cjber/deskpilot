@@ -237,7 +237,9 @@ def _call(
     except A11yError:
         raise
     except Exception as exc:
-        code = "stale" if isinstance(exc, DBusErrorResponse) and exc.name in GONE_ERRORS else "unavailable"
+        # Only an app's own object can be gone; a registry that is not there is the bus being unavailable.
+        gone = isinstance(exc, DBusErrorResponse) and exc.name in GONE_ERRORS and destination != A11Y_BUS_NAME
+        code = "stale" if gone else "unavailable"
         raise A11yError(f"Could not call {interface}.{method} on {object_path}: {exc}", code) from exc
 
 

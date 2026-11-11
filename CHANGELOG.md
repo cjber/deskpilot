@@ -13,6 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   `--hidden` acts on the window beneath on purpose.
 - **Clicks reach a window's own menus when it is under your pointer.** A click into a dropdown or menu the target
   window had opened was refused as `covered` whenever the action had to go through your pointer.
+- **A missing accessibility registry is reported as `unavailable`.** When no AT-SPI registry was running, `elements`
+  failed with `stale`, which tells a program to take a new snapshot; it now fails with `unavailable`.
 - **A new agent cursor, one per agent.** The sharp arrow is now a flight-path marker, a ring with wings centred on
   the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
   that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
