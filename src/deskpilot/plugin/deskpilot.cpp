@@ -368,6 +368,31 @@ namespace {
         reinterpret_cast<ActivateFn>(g_activateHook->m_original)(self, force);
     }
 
+    // A client asks for an xdg-activation token (or a pointer warp) with the serial of an input event, and Hyprland
+    // grants it if the seat recorded that serial. A client such as Chrome asks after every click and activates itself
+    // once its own reply comes back, after the action has ended, so dropping its activation mid-action is not enough.
+    // Input deskpilot sends carries serials Hyprland never records: the client handles the event as usual, but its
+    // serial earns no activation or warp. Drags and moves are unaffected, since they check the separate record of
+    // button serials. The user's own input replayed after an action is theirs and keeps recorded serials.
+    using NextSerialFn         = uint32_t (*)(CSeatManager*, SP<CWLSeatResource>, bool);
+    CFunctionHook* g_serialHook = nullptr;
+    bool           g_agentInput = false;
+
+    // Marks the input sent in a scope as deskpilot's (or, with false, as the user's), restoring the outer scope's.
+    struct SInputOwner {
+        bool outer;
+        explicit SInputOwner(bool agent = true) : outer(std::exchange(g_agentInput, agent)) {}
+        ~SInputOwner() { g_agentInput = outer; }
+        SInputOwner(const SInputOwner&)            = delete;
+        SInputOwner& operator=(const SInputOwner&) = delete;
+    };
+
+    uint32_t hkNextSerial(CSeatManager* self, SP<CWLSeatResource> seat, bool enter) {
+        if (g_agentInput && seat)
+            return wl_display_next_serial(g_pCompositor->m_wlDisplay);
+        return reinterpret_cast<NextSerialFn>(g_serialHook->m_original)(self, seat, enter);
+    }
+
 
     void hkOnKeyboardKey(CInputManager* self, const IKeyboard::SKeyEvent& e, SP<IKeyboard> keyboard) {
         auto replay = [self, e, keyboard] { reinterpret_cast<KeyFn>(g_keyHook->m_original)(self, e, keyboard); };
@@ -938,7 +963,8 @@ namespace {
     }
 
     void replayHeld(std::vector<std::function<void()>>& held) {
-        auto input = std::move(held);
+        SInputOwner user{false};
+        auto        input = std::move(held);
         held.clear();
         for (auto& replay : input)
             replay();
@@ -992,7 +1018,8 @@ namespace {
     }
 
     void finish() {
-        auto op = std::move(*g_op);
+        SInputOwner agent;
+        auto        op = std::move(*g_op);
         g_op.reset();
         dropTimer(op.timer);
         op.focusChange.reset();
@@ -1041,6 +1068,7 @@ namespace {
     void runNext(SP<CEventLoopTimer>, void*) {
         if (!g_op)
             return;
+        SInputOwner agent;
         if (!g_op->error.empty() || g_op->next >= g_op->steps.size()) {
             finish();
             return;
@@ -1221,7 +1249,9 @@ namespace {
     }
 
     void enterPointers(SOp& op) {
-        const auto SURFACE = op.surface.lock();
+        // Also run when the user's pointer moves, outside the action's own steps.
+        SInputOwner agent;
+        const auto  SURFACE = op.surface.lock();
         for (const auto& pointer : op.pointers) {
             if (!pointer || !SURFACE)
                 continue;
@@ -1662,6 +1692,7 @@ namespace {
     }
 
     void finishKeys() {
+        SInputOwner agent;
         endLinger(*g_keyOp);
         auto op = std::move(*g_keyOp);
         g_keyOp.reset();
@@ -1681,6 +1712,8 @@ namespace {
         op.inStroke = false;
         // A window off screen draws what the keys changed only with frame callbacks.
         pumpFrames(op.window.lock());
+        // The deferred focus change and the held input are Hyprland's and the user's, not the stroke's.
+        SInputOwner user{false};
         if (const auto DEFERRED = std::exchange(op.deferredFocus, std::nullopt))
             reinterpret_cast<FocusFn>(g_focusHook->m_original)(g_pSeatManager.get(), DEFERRED->lock());
         auto held = std::move(op.heldInput);
@@ -1699,6 +1732,7 @@ namespace {
     void endLinger(SKeyOp& op) {
         if (!std::exchange(op.lingering, false))
             return;
+        SInputOwner agent;
         eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
     }
 
@@ -1893,6 +1927,7 @@ namespace {
 
     // Runs steps until one has to wait: with no hold, a Wayland stroke goes out in one event-loop turn.
     void keyTick(SP<CEventLoopTimer>, void*) {
+        SInputOwner agent;
         while (g_keyOp) {
             if (g_keyOp->phase == SKeyOp::DONE) {
                 finishKeys();
@@ -2327,6 +2362,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_modHook      = hook(handle, "CInputManager", "onKeyboardMod", reinterpret_cast<void*>(&hkOnKeyboardMod));
     g_activateHook = hook(handle, "CWindow", "activate", reinterpret_cast<void*>(&hkActivate));
     g_focusHook    = hook(handle, "CSeatManager", "setKeyboardFocus", reinterpret_cast<void*>(&hkSetKeyboardFocus));
+    g_serialHook   = hook(handle, "CSeatManager", "nextSerial", reinterpret_cast<void*>(&hkNextSerial));
     g_grabHook     = hook(handle, "CXDGShellProtocol", "addOrStartGrab", reinterpret_cast<void*>(&hkAddOrStartGrab));
     g_pointerFocusHook = hook(handle, "CSeatManager", "setPointerFocus", reinterpret_cast<void*>(&hkSetPointerFocus));
     g_leaveHook        = hook(handle, "CWLPointerResource", "sendLeave", reinterpret_cast<void*>(&hkSendLeave));

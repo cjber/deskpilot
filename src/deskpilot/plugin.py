@@ -55,6 +55,18 @@ def source_hash() -> str:
     return digest.hexdigest()[:12]
 
 
+def headers_commit() -> str | None:
+    """The Hyprland commit the installed headers are from, which is what `make` compiles the plugin against."""
+    flags = subprocess.run(["pkg-config", "--cflags-only-I", "hyprland"], capture_output=True, text=True, check=False)
+    for flag in flags.stdout.split():
+        version = Path(flag.removeprefix("-I")) / "src/version.h"
+        if version.is_file():
+            for line in version.read_text().splitlines():
+                if line.startswith("#define GIT_COMMIT_HASH"):
+                    return line.split('"')[1]
+    return None
+
+
 def build_path(commit: str) -> Path:
     return build_dir() / f"deskpilot-{commit[:12]}-{source_hash()}.so"
 
@@ -203,8 +215,22 @@ class Plugin:
     def commit(self) -> str:
         return json.loads(self.run(["-j", "version"]))["commit"]
 
+    def running_commit(self) -> str:
+        """The running Hyprland's commit, once the installed headers are shown to be from it. After an upgrade the
+        headers are the new version's until Hyprland restarts, and a build against them would not load, so this is
+        checked before anything is built or the loaded build is unloaded."""
+        running, headers = self.commit(), headers_commit()
+        if headers != running:
+            raise PluginError(
+                f"the installed Hyprland headers are from commit {(headers or 'unknown')[:12]}, but the running"
+                f" Hyprland is {running[:12]}: Hyprland was upgraded and needs a restart before the plugin can be"
+                " built or reloaded. The loaded plugin is left in place.",
+                "unavailable",
+            )
+        return running
+
     def build(self) -> Path:
-        out = build_path(self.commit())
+        out = build_path(self.running_commit())
         out.parent.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
             ["make", "-C", str(SOURCE), f"OUT={out}", f"SOURCE_HASH={source_hash()}"],
@@ -219,9 +245,9 @@ class Plugin:
 
     def load(self) -> Path:
         """Build the plugin for the running Hyprland if needed and load it, replacing a loaded build of other source."""
-        path = build_path(self.commit())
         if self.loaded():
-            return path
+            return build_path(self.commit())
+        path = build_path(self.running_commit())
         self.unload()
         if not path.exists():
             path = self.build()

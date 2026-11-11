@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 
 from deskpilot import clipboard, keys, screen
+from deskpilot import plugin as plugin_module
 from deskpilot.desk import Desk, NotVisible
 from deskpilot.hypr import (
     AmbiguousWindow,
@@ -374,6 +375,21 @@ def test_a_refusal_from_a_stale_plugin_names_the_build_and_the_fix():
         Plugin(lambda args: run(args, "000000000000")).keys("0xabc", ["+28", "-28"])
     with pytest.raises(PluginError, match=r"^hold and gap must be"):
         Plugin(lambda args: run(args, source_hash())).keys("0xabc", ["+28", "-28"])
+
+
+def test_load_after_an_upgrade_refuses_and_keeps_the_loaded_build(monkeypatch):
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        if args[:2] == ["-j", "version"]:
+            return '{"commit":"aaaaaaaaaaaaaaaa"}'
+        return '{"ok":true,"version":"000000000000","path":"/old.so"}'
+
+    monkeypatch.setattr(plugin_module, "headers_commit", lambda: "bbbbbbbbbbbbbbbb")
+    with pytest.raises(PluginError, match=r"headers are from commit bbbbbbbbbbbb.*running Hyprland is aaaaaaaaaaaa"):
+        Plugin(run).load()
+    assert not any(args[0] == "plugin" for args in calls)
 
 
 def test_plugin_sends_button_codes_and_reads_replies():

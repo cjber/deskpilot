@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- **A click no longer lets the app take the user's focus afterwards.** An app such as Chrome asks to be activated
+  after each click, using the click's input serial, and its request arrived after the click had ended. Input
+  deskpilot sends now carries serials Hyprland does not record, so it earns no activation or pointer warp.
+- **`plugin load` refuses after a Hyprland upgrade instead of unloading the working plugin.** Until Hyprland
+  restarts, the installed headers are the new version's and no build can load, so the loaded build is left in place.
+
 ## [0.5.1] - 2026-11-10
 
 - **A combo box's chosen item reads as selected.** GTK reports a combo box's active item only through the
