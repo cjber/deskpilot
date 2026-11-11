@@ -94,6 +94,9 @@ than one window is an error listing them, so a click never lands on a guessed wi
 taken at. A window resized since that shot is refused, as is a point outside the window. Pass `--scale 1` to give
 window pixels instead.
 
+An on-screen action is refused as `covered` at a point another window, bar or popup is over, since the user
+would see it land on that instead. `--hidden` acts on the window beneath it.
+
 A window on a hidden workspace or scrolled off its monitor is reported as `"visible": false`, and `shot`, `move`,
 `click`, `scroll`, `drag`, `hover` and `elements` refuse it rather than move the user's view. `--hidden` acts on it
 where it is, out of view; `--show` focuses it to bring it on screen first.
