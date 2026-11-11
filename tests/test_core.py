@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 
 from deskpilot import clipboard, keys, screen
+from deskpilot import desk as desk_module
 from deskpilot import plugin as plugin_module
 from deskpilot.desk import Desk, NotVisible
 from deskpilot.hypr import (
@@ -267,7 +268,13 @@ AGENT_CLIENT = {**CLIENT, "address": "0xdef", "workspace": {"name": "special:age
 
 def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkeypatch):
     desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
-    fake.clients.append(AGENT_CLIENT)
+    # A window the user moved onto the agent's workspace has no launch token.
+    moved = {**CLIENT, "address": "0x123", "pid": 8, "workspace": {"name": "special:agent-tester"}}
+    fake.clients += [AGENT_CLIENT, moved]
+    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: pid == 7 and token == "deskpilot-agent-tester")
+    with pytest.raises(WindowNotFound, match="deskpilot launch"):
+        desk.click("0x123", 100, 50, hidden=True)
+    plugin.calls.clear()
     desk.click("0xdef", 100, 50, scale=0.5, hidden=True)
     assert plugin.calls == [("register", None), ("path", "0xdef", "hidden", ["m2727,1066", "d52", "p272", "r272"])]
     assert not any(c[0] == "dispatch" for c in fake.calls), "hidden input must not focus or show anything"

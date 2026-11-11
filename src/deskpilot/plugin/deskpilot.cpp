@@ -2819,24 +2819,37 @@ namespace {
             return *rule;
         }
 
-        // Every process of this user whose environment carries the agent's token.
-        std::vector<pid_t> processes(const std::string& name) {
-            const std::string     ENTRY = std::format("{}={}", Desktop::Rule::EXEC_RULE_ENV_NAME, token(name));
-            std::vector<pid_t>    found;
-            std::error_code       error;
+        // Each process this user may read, with the agent its environment names by token, if any.
+        void eachTagged(const std::function<void(pid_t, const std::string&)>& fn) {
+            const std::string PREFIX = std::format("{}={}", Desktop::Rule::EXEC_RULE_ENV_NAME, token(""));
+            std::error_code   error;
             for (const auto& dir : std::filesystem::directory_iterator("/proc", error)) {
                 const auto PID = number(dir.path().filename().string());
                 if (!PID || *PID <= 1 || *PID == getpid())
                     continue;
                 std::ifstream file(dir.path() / "environ", std::ios::binary);
                 for (std::string entry; std::getline(file, entry, '\0');) {
-                    if (entry == ENTRY) {
-                        found.push_back(static_cast<pid_t>(*PID));
+                    if (entry.starts_with(PREFIX)) {
+                        fn(static_cast<pid_t>(*PID), entry.substr(PREFIX.size()));
                         break;
                     }
                 }
             }
-            return found;
+        }
+
+        // Registers NAME's rule if it has none, and marks it in use.
+        bool ensure(const std::string& name) {
+            auto& agent = g_agents[name];
+            if (!agent.rule) {
+                agent.rule = makeRule(name);
+                if (!agent.rule) {
+                    g_agents.erase(name);
+                    return false;
+                }
+                Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(agent.rule));
+            }
+            agent.used = Time::steadyNow();
+            return true;
         }
 
         void forget(const std::string& name) {
@@ -2863,8 +2876,10 @@ namespace {
             agent.stopping = makeShared<CEventLoopTimer>(
                 GRACE,
                 [name](SP<CEventLoopTimer>, void*) {
-                    for (const auto PID : processes(name))
-                        kill(PID, SIGTERM);
+                    eachTagged([&name](pid_t pid, const std::string& agent) {
+                        if (agent == name)
+                            kill(pid, SIGTERM);
+                    });
                     forget(name);
                 },
                 nullptr);
@@ -2884,7 +2899,13 @@ namespace {
             self->updateTimeout(CHECK);
         }
 
+        // A reloaded plugin starts with no agents, while their apps run on: it takes them back from the apps' tokens,
+        // so their next window still opens out of view. Their owners are not known again until they next register.
         void init() {
+            eachTagged([](pid_t, const std::string& name) {
+                if (agentcursor::validName(name) && !g_agents.contains(name))
+                    ensure(name);
+            });
             g_reaper = makeShared<CEventLoopTimer>(CHECK, reap, nullptr);
             g_pEventLoopManager->addTimer(g_reaper);
             g_reloaded = Event::bus()->m_events.config.reloaded.listen([] {
@@ -2933,18 +2954,10 @@ namespace {
             }
             if (IT != g_agents.end() && IT->second.stopping)
                 return refuse(std::format("agent {} is stopping; try again in {} seconds", NAME, GRACE.count()), "busy");
-            auto& agent = g_agents[NAME];
-            if (!agent.rule) {
-                agent.rule = makeRule(NAME);
-                if (!agent.rule) {
-                    g_agents.erase(NAME);
-                    return refuse("could not build the window rule for agent " + NAME);
-                }
-                Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(agent.rule));
-            }
+            if (!ensure(NAME))
+                return refuse("could not build the window rule for agent " + NAME);
             if (owner)
-                agent.owner = owner;
-            agent.used = Time::steadyNow();
+                g_agents[NAME].owner = owner;
             return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"workspace":{},"token":{}}})", jsonString(workspace(NAME)), jsonString(token(NAME))));
         }
     }

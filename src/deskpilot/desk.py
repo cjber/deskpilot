@@ -72,6 +72,15 @@ HOVER_SHOT_MS = 5000
 LAUNCH_TIMEOUT = 30.0
 
 
+def launched_by(pid: int, token: str) -> bool:
+    """Whether the process carries an agent's launch token, which `launch` set and the app's children inherit."""
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    return f"HL_EXEC_RULE_TOKEN={token}".encode() in environ.split(b"\0")
+
+
 def owner_from_env() -> int | None:
     """The process named by DESKPILOT_OWNER_PID, whose exit closes the agent's launched apps."""
     value = os.environ.get("DESKPILOT_OWNER_PID") or None
@@ -116,9 +125,10 @@ class Desk:
         self.hypr.focus(win)
         return win
 
-    def _workspace(self) -> str:
-        """The agent's hidden workspace, registering the agent with the plugin, which marks it in use."""
-        return self.plugin.register(self.owner)["workspace"]
+    def _register(self) -> dict:
+        """The agent's hidden workspace and launch token, registering the agent with the plugin, which marks it in
+        use."""
+        return self.plugin.register(self.owner)
 
     def _target(self, query: str, show: bool, hidden: bool) -> Window:
         """The window to act on. A hidden action reaches only the agent's own launched windows, on its hidden
@@ -127,8 +137,13 @@ class Desk:
         if show and hidden:
             raise ValueError("show brings a window into view and hidden acts out of view: pass one")
         if hidden:
-            workspace = self._workspace()
-            mine = [w for w in self.hypr.windows() if w.workspace == workspace]
+            agent = self._register()
+            # A window the user moved there is still theirs: only the agent's launched apps carry its token.
+            mine = [
+                w
+                for w in self.hypr.windows()
+                if w.workspace == agent["workspace"] and launched_by(w.pid, agent["token"])
+            ]
             try:
                 return find_window(mine, query)
             except WindowNotFound:
@@ -159,7 +174,7 @@ class Desk:
         hands its window to a copy already running for the user (a single-instance app) opens nothing here."""
         if not command:
             raise ValueError("name the app to launch")
-        agent = self.plugin.register(self.owner)
+        agent = self._register()
         workspace = agent["workspace"]
         # Hyprland reuses a closed window's address, so a window is known by its stable id too.
         before = {(w.address, w.stable_id) for w in self.hypr.windows()}
@@ -195,7 +210,7 @@ class Desk:
     def show_agent(self) -> None:
         """Show the agent's hidden workspace on the user's focused monitor, or hide it again. Input the user gives
         there is theirs; the agent's actions go on and keep their refusals."""
-        self.hypr.toggle_special(self._workspace().removeprefix("special:"))
+        self.hypr.toggle_special(self._register()["workspace"].removeprefix("special:"))
 
     def stop(self) -> None:
         """Close the agent's launched windows, as the user closing them would, and end its apps' processes left five
@@ -442,7 +457,7 @@ class Desk:
             return focused
         win = self.focus(query) if take_focus else self.window(query)
         if self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
-            self._workspace()  # marks the agent in use
+            self._register()  # marks the agent in use
         return win
 
     def wait_for(
