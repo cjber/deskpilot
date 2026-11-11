@@ -969,3 +969,11 @@ def test_a_popup_element_that_cannot_be_placed_is_refused(tmp_path, monkeypatch)
             desk.click("0xdef", None, None, element="e4", hidden=True)
         assert error_code(error.value) == code
     assert not any(call[0] == "path" for call in plugin.calls)
+
+
+def test_the_mcp_server_reports_the_package_version():
+    from importlib.metadata import version
+
+    from deskpilot import mcp_server
+
+    assert mcp_server.mcp.version == version("deskpilot") != ""

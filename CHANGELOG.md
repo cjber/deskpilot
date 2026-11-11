@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the agent's apps, which also close when the owner process (`DESKPILOT_OWNER_PID`, or the MCP server) exits, or
   after 30 minutes unused. The MCP server gains `launch` and `stop`. A hidden action on a window the agent did not
   launch is now refused as `not_found`.
+- **The MCP server reports its version** to clients on initialize, rather than an empty string.
 - **GTK and Qt apps get a pointer of deskpilot's own.** The plugin adds a second seat, `deskpilot`, with a pointer
   only. An app that binds it takes clicks, scrolls, drags and hovers there, so a hidden action works on a window of
   the app the user's pointer is on, and nothing of the user's is held. Apps that bind only the first seat (Chromium,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import os
+from importlib.metadata import version
 from typing import Literal
 
 from mcp.server.mcpserver import Image, MCPServer
@@ -11,7 +12,7 @@ from mcp.types import CallToolResult, TextContent
 
 from .desk import EXPECTED, Desk, error_code, owner_from_env
 
-mcp = MCPServer("deskpilot")
+mcp = MCPServer("deskpilot", version=version("deskpilot"))
 # The server is the agent's owner process: its apps close when it exits, unless DESKPILOT_OWNER_PID names another.
 desk = Desk(owner=owner_from_env() or os.getpid())
 
