@@ -86,6 +86,9 @@ class Window:
     # Some of the window lies on a monitor showing its workspace. False for a hidden workspace and for a column a
     # scrolling layout has moved off every monitor.
     visible: bool = True
+    # Some of the window lies in its own monitor's area, whatever workspace that shows. Hyprland copies a capture of
+    # the window only then, so a column a scrolling layout has moved off its monitor cannot be shot.
+    on_monitor: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -114,6 +117,7 @@ class Monitor:
     width: int
     height: int
     showing: frozenset[str]
+    id: int = -1
 
     @classmethod
     def from_json(cls, m: dict) -> Monitor:
@@ -124,11 +128,13 @@ class Monitor:
         # A special workspace covers the monitor's normal one while it is open.
         special = str((m.get("specialWorkspace") or {}).get("name") or "")
         shown = special or str((m.get("activeWorkspace") or {}).get("name", ""))
-        return cls(m["x"], m["y"], width, height, frozenset({shown}))
+        return cls(m["x"], m["y"], width, height, frozenset({shown}), m.get("id", -1))
+
+    def overlaps(self, x: int, y: int, width: int, height: int) -> bool:
+        return x < self.x + self.width and self.x < x + width and y < self.y + self.height and self.y < y + height
 
     def shows(self, workspace: str, x: int, y: int, width: int, height: int) -> bool:
-        overlaps = x < self.x + self.width and self.x < x + width and y < self.y + self.height and self.y < y + height
-        return workspace in self.showing and overlaps
+        return workspace in self.showing and self.overlaps(x, y, width, height)
 
 
 class WindowNotFound(LookupError):
@@ -157,6 +163,7 @@ class Hyprland:
             x, y = c["at"]
             w, h = c["size"]
             workspace = str((c.get("workspace") or {}).get("name", ""))
+            monitor = c.get("monitor", -1)
             found.append(
                 Window(
                     address=c["address"],
@@ -166,13 +173,14 @@ class Hyprland:
                     y=y,
                     width=w,
                     height=h,
-                    monitor=c.get("monitor", -1),
+                    monitor=monitor,
                     workspace=workspace,
                     xwayland=bool(c.get("xwayland")),
                     pid=c.get("pid", 0),
                     focused=c["address"] == active.get("address"),
                     stable_id=str(c.get("stableId") or ""),
                     visible=any(m.shows(workspace, x, y, w, h) for m in monitors),
+                    on_monitor=any(m.id == monitor and m.overlaps(x, y, w, h) for m in monitors),
                 )
             )
         return found

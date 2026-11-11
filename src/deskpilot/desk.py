@@ -225,7 +225,19 @@ class Desk:
         show: bool = False,
         hidden: bool = False,
     ) -> screen.Shot:
-        return screen.capture(self._target(query, show, hidden), out, max_width)
+        return screen.capture(self._shootable(self._target(query, show, hidden)), out, max_width)
+
+    @staticmethod
+    def _shootable(win: Window) -> Window:
+        """The window, if a shot of it can get a frame. Hyprland copies a window's frame only while the window lies
+        partly in its monitor's area, so a hidden shot of a scrolling layout's off-screen column is refused here
+        rather than left to time out."""
+        if not win.on_monitor:
+            raise NotVisible(
+                f"{win.cls} ({win.address}) lies outside its monitor's area, where Hyprland sends no frame of it, so "
+                "it cannot be shot even hidden. Pass --show (show) to bring it into view, which focuses it"
+            )
+        return win
 
     def point(
         self,
@@ -257,11 +269,12 @@ class Desk:
         return win, gx, gy
 
     @staticmethod
-    def _mode(hidden: bool) -> str:
-        """How the plugin reaches the window: hidden, or on screen with the agent cursor unless DESKPILOT_CURSOR=off."""
+    def _mode(hidden: bool, cursor: bool = True) -> str:
+        """How the plugin reaches the window: hidden, or on screen with the agent cursor unless DESKPILOT_CURSOR=off
+        or the action has none, as keys have not."""
         if hidden:
             return "hidden"
-        return "plain" if os.environ.get("DESKPILOT_CURSOR") == "off" else "shown"
+        return "plain" if not cursor or os.environ.get("DESKPILOT_CURSOR") == "off" else "shown"
 
     def _path(self, win: Window, steps: list[str], hidden: bool) -> dict:
         return self.plugin.path(win.address, self._mode(hidden), steps)
@@ -409,6 +422,7 @@ class Desk:
             steps = [f"m{gx},{gy}", f"d{round(wait * 1000)}", f"m{cx},{cy}", f"p{code}", f"r{code}"]
             self._path(win, steps, hidden)
             return cx, cy
+        self._shootable(win)
         reply = self._path(win, [f"m{gx},{gy}", "n", f"d{round(wait * 1000) + HOVER_SHOT_MS}"], hidden)
         try:
             time.sleep(wait)
@@ -421,25 +435,55 @@ class Desk:
         latest snapshot, and the ids taken from it, in place."""
         return a11y.snapshot(self._target(query, show, hidden), peek=peek)
 
-    def key(self, combo: str, query: str | None = None, take_focus: bool = False, hold: float = 0.0) -> None:
+    def key(
+        self,
+        combo: str,
+        query: str | None = None,
+        take_focus: bool = False,
+        hold: float = 0.0,
+        *,
+        show: bool = False,
+        hidden: bool = False,
+    ) -> None:
         """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
         keys go to the focused window. Each key is held `hold` seconds, up to 10, for an app that acts while a key is
         down (auto-repeat, a game's movement)."""
         if not 0 <= hold <= 10:
             raise ValueError("a key is held 0 to 10 seconds")
-        self.plugin.keys(self._key_target(query, take_focus).address, keys.chord_words(combo), hold=hold)
+        target = self._key_target(query, take_focus, show, hidden)
+        self.plugin.keys(target.address, keys.chord_words(combo), hold=hold, mode=self._mode(hidden, cursor=False))
 
-    def type(self, text: str, query: str | None = None, delay: float = 0.0, take_focus: bool = False) -> None:
+    def type(
+        self,
+        text: str,
+        query: str | None = None,
+        delay: float = 0.0,
+        take_focus: bool = False,
+        *,
+        show: bool = False,
+        hidden: bool = False,
+    ) -> None:
         """Type text as written, on the user's own keymap. Each key is held `delay` seconds, and the next follows
         `delay` seconds later."""
-        target = self._key_target(query, take_focus)
-        self.plugin.keys(target.address, keys.text_words(text), hold=delay, gap=delay)
+        target = self._key_target(query, take_focus, show, hidden)
+        self.plugin.keys(
+            target.address, keys.text_words(text), hold=delay, gap=delay, mode=self._mode(hidden, cursor=False)
+        )
 
-    def paste(self, text: str, query: str | None = None, take_focus: bool = False, combo: str = "ctrl+v") -> None:
+    def paste(
+        self,
+        text: str,
+        query: str | None = None,
+        take_focus: bool = False,
+        combo: str = "ctrl+v",
+        *,
+        show: bool = False,
+        hidden: bool = False,
+    ) -> None:
         """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `combo` (the app's
         paste chord, ctrl+shift+v in most terminals) is pressed there. Any text pastes, whatever the keymap types."""
-        target = self._key_target(query, take_focus)
-        self.plugin.keys(target.address, keys.chord_words(combo), paste=text)
+        target = self._key_target(query, take_focus, show, hidden)
+        self.plugin.keys(target.address, keys.chord_words(combo), paste=text, mode=self._mode(hidden, cursor=False))
 
     def clipboard(self) -> str:
         """The user's clipboard text."""
@@ -449,15 +493,28 @@ class Desk:
         """Replace the user's clipboard with text."""
         clipboard.write(text)
 
-    def _key_target(self, query: str | None, take_focus: bool) -> Window:
+    def _key_target(self, query: str | None, take_focus: bool, show: bool = False, hidden: bool = False) -> Window:
+        """The window keys go to, resolved as for every other action: a named one must be on screen unless `show`
+        brings it there, and hidden keys reach only the agent's launched windows. Hidden keys need a named window, since
+        the focused one has the user's keyboard, and so does show, since the focused window is in view already and
+        take_focus brings one there itself."""
+        if hidden and (query is None or take_focus):
+            raise ValueError(
+                "hidden keys go to a named window and leave the user's focus alone: name a window and drop take_focus"
+            )
+        if show and (query is None or take_focus):
+            raise ValueError(
+                "show brings a named window into view: name a window and drop take_focus, which does it too"
+            )
         if query is None:
             focused = next((w for w in self.hypr.windows() if w.focused), None)
             if focused is None:
                 raise WindowNotFound("no window has keyboard focus; name one with a window query")
             return focused
-        win = self.focus(query) if take_focus else self.window(query)
-        if self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
-            self._register()  # marks the agent in use
+        win = self.focus(query) if take_focus else self._target(query, show, hidden)
+        # A hidden target registered the agent already; keys to its window shown on screen mark it in use too.
+        if not hidden and self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
+            self._register()
         return win
 
     def wait_for(
@@ -523,7 +580,7 @@ class Desk:
         deadline = time.monotonic() + timeout
         while True:
             win = self._target(query, False, hidden)
-            now = screen.capture(win, max_width=base.width)
+            now = screen.capture(self._shootable(win), max_width=base.width)
             # A resize, or a move to a monitor of another scale, changes the whole image.
             if (now.width, now.height) != (base.width, base.height):
                 return now, (0, 0, now.width, now.height)

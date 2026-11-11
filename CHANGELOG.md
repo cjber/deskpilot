@@ -30,6 +30,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
   that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
   desktop can be told apart.
+- **`key`, `type` and `paste` take `--hidden` and `--show`, as `hidden` and `show` over MCP.** `--hidden` sends the
+  keys to a named window the agent launched, on its hidden workspace, without focusing it or holding the user's
+  input; an XWayland window, or a window of the app the user's keyboard focus is in, is refused with `refused`, and
+  so is the rest of the text when the user focuses that app while it is typed. `--show` needs a named window and no
+  `--take-focus`.
+- **Keys to a window that is not on screen are now refused with `not_visible`,** as clicks already were. Add
+  `--show` to bring it into view first; scripts that sent keys to an off-screen window without a flag need it, or
+  the app started with `deskpilot launch` and `--hidden`.
+- **A hidden `shot`, `hover` or `wait-for --changed` of a window outside its monitor's area is refused with
+  `not_visible`** instead of hanging, since Hyprland sends no frame of it; a column of the agent's workspace that a
+  scrolling layout puts off screen is one. Any capture that gets no frame now fails after 5 seconds with code
+  `timeout` rather than a traceback.
 - **The first action after a Hyprland restart no longer fails with "Cannot load a plugin twice!"** when several
   deskpilot calls start at once. One call loads the plugin while the others wait and then use it, and a call that
   cannot reach Hyprland says so instead of trying to load the plugin again.

@@ -228,19 +228,27 @@ class Plugin:
         self._send("end", str(ticket))
 
     def keys(
-        self, address: str, words: list[str], hold: float = 0.0, gap: float = 0.0, paste: str | None = None
+        self,
+        address: str,
+        words: list[str],
+        hold: float = 0.0,
+        gap: float = 0.0,
+        paste: str | None = None,
+        mode: str = "plain",
     ) -> dict:
         """Send key events (see keys.py) to a window without focusing it, as one action. Each press is held `hold`
         seconds, and keystrokes (runs of events that end with no key down) are `gap` seconds apart. A sequence too long
         for one request is staged ahead in parts and queued whole by the last, so no other keys land in between. With
-        `paste`, that text is the window's clipboard, and its alone, when the keys (its paste chord) arrive."""
+        `paste`, that text is the window's clipboard, and its alone, when the keys (its paste chord) arrive. `mode`
+        "hidden" never holds the user's input: the plugin refuses an XWayland window and a stroke while the user's
+        keyboard focus is in the window's app."""
         if paste is None:
-            return self._keys(["keys", address], words, hold, gap)
+            return self._keys(["keys", address, mode], words, hold, gap)
         fd, path = tempfile.mkstemp(prefix="deskpilot-paste-", dir=os.environ.get("XDG_RUNTIME_DIR"))
         try:
             with os.fdopen(fd, "wb") as file:
                 file.write(paste.encode())
-            return self._keys(["paste", address, path], words, hold, gap)
+            return self._keys(["paste", address, mode, path], words, hold, gap)
         finally:
             Path(path).unlink(missing_ok=True)
 

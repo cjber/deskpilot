@@ -200,29 +200,53 @@ def elements(window: str, show: bool = False, hidden: bool = False, peek: bool =
 
 
 @_tool()
-def key(combo: str, window: str | None = None, take_focus: bool = False, hold: float = 0.0) -> str:
+def key(
+    combo: str,
+    window: str | None = None,
+    take_focus: bool = False,
+    hold: float = 0.0,
+    show: bool = False,
+    hidden: bool = False,
+) -> str:
     """Press a key or chord such as Return, ctrl+a or alt+F4 in a window without focusing it. take_focus focuses
     the window first instead; with no window the keys go to the focused one. hold keeps each key down that many
-    seconds, up to 10, for auto-repeat or a game's movement."""
-    desk.key(combo, window, take_focus, hold)
+    seconds, up to 10, for auto-repeat or a game's movement. A window not on screen is refused unless show brings it
+    into view. hidden sends the keys to a window the agent launched (see launch), out of view; it needs a window and
+    refuses XWayland windows and the app with the user's keyboard focus."""
+    desk.key(combo, window, take_focus, hold, show=show, hidden=hidden)
     return "ok"
 
 
 @_tool()
-def type_text(text: str, window: str | None = None, delay: float = 0.0, take_focus: bool = False) -> str:
+def type_text(
+    text: str,
+    window: str | None = None,
+    delay: float = 0.0,
+    take_focus: bool = False,
+    show: bool = False,
+    hidden: bool = False,
+) -> str:
     """Type text as written, on the user's keymap, into a window without focusing it. Keys go as fast as the
     app reads them by default. Games read keys once per frame: for them, each key is held `delay` seconds, 0.1 or
-    more, and the next follows after the same gap. For long text, paste_text is faster still."""
-    desk.type(text, window, delay, take_focus)
+    more, and the next follows after the same gap. For long text, paste_text is faster still. show and hidden work
+    as for key."""
+    desk.type(text, window, delay, take_focus, show=show, hidden=hidden)
     return "ok"
 
 
 @_tool()
-def paste_text(text: str, window: str | None = None, take_focus: bool = False, keys: str = "ctrl+v") -> str:
+def paste_text(
+    text: str,
+    window: str | None = None,
+    take_focus: bool = False,
+    keys: str = "ctrl+v",
+    show: bool = False,
+    hidden: bool = False,
+) -> str:
     """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `keys` (the app's
     paste chord, ctrl+shift+v in most terminals) is pressed there. Pastes any text, including characters the keymap
-    cannot type. Not for XWayland windows, which share one clipboard."""
-    desk.paste(text, window, take_focus, keys)
+    cannot type. Not for XWayland windows, which share one clipboard. show and hidden work as for key."""
+    desk.paste(text, window, take_focus, keys, show=show, hidden=hidden)
     return "ok"
 
 

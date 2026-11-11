@@ -37,9 +37,9 @@
 // `hyprctl deskpilot agent <name> [owner=PID]` places every window an agent launched on its hidden workspace, and
 // `agent <name> stop` closes them (see agents).
 //
-// `hyprctl deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys in <window>
-// without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or release the
-// key that gives character U+HEX unmodified (a chord's ctrl+a), or `tHEX` to type U+HEX. Characters are resolved on the
+// `hyprctl deskpilot keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <event>...` presses and releases keys
+// in <window> without focusing it. An event is `+code` or `-code` for an evdev key code, `pHEX` or `rHEX` to press or
+// release the key that gives character U+HEX unmodified (a chord's ctrl+a), or `tHEX` to type U+HEX. Characters are resolved on the
 // active keyboard's keymap, the one every client has, when the action starts: a typed character's key is pressed
 // between presses of the keymap's own keys for the modifiers it needs (Shift, AltGr), as a physical keyboard does, since
 // an X client such as Wine reads Shift only from a key press. Locks it needs off (Caps Lock under French é) are set
@@ -62,8 +62,11 @@
 //     makes meanwhile waits for the stroke to end. A step that does not happen in time ends the sequence with an
 //     error.
 //
-// `hyprctl deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <event>...` sends the same key events (the
-// window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
+// HIDDEN keys never hold the user's input: an XWayland window is refused, and so is each stroke, before anything is
+// sent, while the user's keyboard focus is in the window's app, since the keys would take it from there.
+//
+// `hyprctl deskpilot paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <event>...` sends the same key
+// events (the window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
 // The seat's selection never changes, so the user's clipboard and every other client's stay as they are. After
 // PASTE_WAIT, or at the next paste, the client gets the clipboard it would otherwise have: the user's if it has
 // keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard.
@@ -290,6 +293,7 @@ namespace {
         PHLWINDOWREF                       window;
         WP<CWLSurfaceResource>             surface;
         bool                               x11 = false;
+        bool                               hidden = false; // never holds the user's input: refused where it would
         uint32_t                           xid = 0;
         KeyEvents                          events;
         size_t                             next = 0;
@@ -448,10 +452,16 @@ namespace {
     //
     // Each change also sends every client's keyboard empty modifiers and a leave. Mid-stroke, a change between other
     // apps' surfaces goes ahead without the stroke's keyboards getting either (g_shieldKeys), so a held chord keeps its
-    // modifiers; one into the window's own app waits, since that app's keyboard is in use.
+    // modifiers; one into the window's own app waits, since that app's keyboard is in use. Hidden keys never hold the
+    // user's input, so a change into their window's app ends the sequence there instead, and goes ahead at once.
     bool g_shieldKeys = false;
 
-    void endLinger(SKeyOp& op);
+    constexpr auto HIDDEN_KEYS_INTERRUPTED = "the user's keyboard focus moved into this window's app mid-stroke, and hidden keys never hold it: the "
+                                             "stroke's keys were let go and the rest not sent";
+
+    void              endLinger(SKeyOp& op);
+    std::optional<ms> restoreStroke(SKeyOp& op);
+    std::optional<ms> endStroke(SKeyOp& op);
 
     void hkSetKeyboardFocus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
         // Hyprland enters the surface it focuses itself, so a window still entered between strokes is left first.
@@ -464,10 +474,16 @@ namespace {
         if (g_keyOp && g_keyOp->inStroke) {
             const auto TARGET = g_keyOp->surface.lock();
             if (g_keyOp->holding || (surface && TARGET && surface->client() == TARGET->client())) {
-                g_keyOp->deferredFocus = surface;
-                return;
-            }
-            g_shieldKeys = true;
+                if (!g_keyOp->hidden) {
+                    g_keyOp->deferredFocus = surface;
+                    return;
+                }
+                SInputOwner agent;
+                g_keyOp->error = HIDDEN_KEYS_INTERRUPTED;
+                restoreStroke(*g_keyOp);
+                g_keyOp->timer->updateTimeout(ms(1));
+            } else
+                g_shieldKeys = true;
         }
         reinterpret_cast<FocusFn>(g_focusHook->m_original)(self, surface);
         g_shieldKeys = false;
@@ -2286,6 +2302,7 @@ namespace {
             return endStroke(op);
         }
         eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
+        op.lingering = false;
         if (const auto SIBLING = op.sibling.lock()) {
             wl_array keys;
             wl_array_init(&keys);
@@ -2322,6 +2339,14 @@ namespace {
         }
         op.phase = op.down.empty() || LAST ? SKeyOp::RESTORE : SKeyOp::KEY;
         return std::nullopt;
+    }
+
+    constexpr auto HIDDEN_KEYS_FOCUSED = "the user's keyboard focus is in this window's app, and hidden keys would take it from there";
+
+    // Whether hidden keys would take the user's keyboard focus: it is on the window or on another surface of its app.
+    bool userKeyboardIn(const SP<CWLSurfaceResource>& surface) {
+        const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+        return surface && FOCUS && FOCUS->client() == surface->client();
     }
 
     // One step of a key sequence: how long to wait before the next, or nothing to go on in this event-loop turn.
@@ -2368,6 +2393,11 @@ namespace {
                         return std::nullopt;
                     }
                     endLinger(op);
+                }
+                if (op.hidden && userKeyboardIn(SURFACE)) {
+                    op.error = op.next ? std::format("{}; the keys before this stroke were sent", HIDDEN_KEYS_FOCUSED) : HIDDEN_KEYS_FOCUSED;
+                    op.phase = SKeyOp::DONE;
+                    return std::nullopt;
                 }
                 op.surface       = SURFACE;
                 op.keyboards     = keyboardsOf(SURFACE->client());
@@ -2711,17 +2741,19 @@ namespace {
         return std::nullopt;
     }
 
-    // `keys <window> <hold> <gap> <txn|none> <event>...`, or `paste <window> <file> ...` with the same words after the
-    // file, which offers the file's text as the window's clipboard just before the keys (its paste chord) are sent.
+    // `keys <window> <plain|hidden> <hold> <gap> <txn|none> <event>...`, or `paste <window> <plain|hidden> <file> ...`
+    // with the same words after the file, which offers the file's text as the window's clipboard just before the keys
+    // (its paste chord) are sent.
     IPC::Socket1::SResponse keysCommand(const std::vector<std::string>& args) {
         const bool   PASTE = args[1] == "paste";
-        const size_t AT    = PASTE ? 4 : 3; // where <hold-ms> is
-        if (args.size() < AT + 3)
-            return refuse(PASTE ? "usage: deskpilot paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>..." :
-                                  "usage: deskpilot keys <window> <hold-ms> <gap-ms> <txn|none> <key event>...");
+        const size_t AT    = PASTE ? 5 : 4; // where <hold-ms> is
+        if (args.size() < AT + 3 || (args[3] != "plain" && args[3] != "hidden"))
+            return refuse(PASTE ? "usage: deskpilot paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>..." :
+                                  "usage: deskpilot keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>...");
+        const bool                 HIDDEN = args[3] == "hidden";
         std::optional<std::string> text;
         if (PASTE) {
-            if (const auto ERROR = readPaste(args[3], text.emplace()))
+            if (const auto ERROR = readPaste(args[4], text.emplace()))
                 return refuse(*ERROR);
         }
         const auto WINDOW = Desktop::viewState()->query().selector("address:" + args[2]).runWindow();
@@ -2746,10 +2778,16 @@ namespace {
             return refuse("no mapped window " + args[2]);
         if (PASTE && WINDOW->backend().isX11())
             return refuse("an XWayland window reads the clipboard every X client shares, so a paste would replace the user's clipboard: type the text instead");
+        if (HIDDEN && WINDOW->backend().isX11())
+            return refuse("an XWayland window reads keys from the X server, which only the user's keyboard focus reaches: act on it on screen instead");
         op.window = WINDOW;
+        op.hidden = HIDDEN;
         op.hold   = ms(static_cast<int>(*HOLD));
         op.gap    = ms(static_cast<int>(*GAP));
         return enqueue([op = std::move(op), text = std::move(text)](uint64_t ticket) mutable -> std::optional<std::string> {
+            // A hidden paste is refused before the window's client is offered the text, as its keys would be.
+            if (const auto WINDOW = op.window.lock(); op.hidden && WINDOW && userKeyboardIn(WINDOW->wlSurface()->resource()))
+                return HIDDEN_KEYS_FOCUSED;
             if (text) {
                 if (const auto ERROR = offerPaste(op.window.lock(), std::move(*text)))
                     return ERROR;
@@ -3113,9 +3151,9 @@ namespace {
             return cursorCommand(args, agent);
         if (VERB == "agent")
             return agents::command(args);
-        return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <hold-ms> <gap-ms> <txn|none> <key event>... | "
-                      "paste <window> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | agent <name> [owner=PID|stop] | end <ticket> | wait <ticket> | status; a key "
-                      "event is +code, -code, pHEX, rHEX or tHEX, and a path step mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
+        return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>... | "
+                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | agent <name> [owner=PID|stop] | end <ticket> | wait <ticket> | "
+                      "status; a key event is +code, -code, pHEX, rHEX or tHEX, and a path step mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
 }
 

@@ -21,9 +21,12 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    focuses it and moves the user's view, so ask the user before `--show`.
    To work out of the user's sight, set `DESKPILOT_AGENT` to a name and start your own copy of the app with
    `deskpilot launch CMD...`: it and every window it opens later stay on your hidden workspace, and `--hidden` acts
-   on them (only on them, never the user's windows) on `shot`, `click`, `scroll`, `drag`, `hover`, `elements` and
-   `wait-for --changed`. An XWayland window is refused hidden. `deskpilot stop` closes your apps when you are done;
-   `deskpilot show` lets the user see them. For web pages and browsers use fastbrowse instead.
+   on them (only on them, never the user's windows) on `shot`, `click`, `scroll`, `drag`, `hover`, `elements`, `key`,
+   `type`, `paste` and `wait-for --changed`. An XWayland window is refused hidden. Hidden keys need `--window` and
+   are refused while the user's keyboard focus is in that window's app. A hidden `shot`, `hover` or
+   `wait-for --changed` of a window scrolled outside its monitor's area is refused, since Hyprland sends no frame of
+   it. `deskpilot stop` closes your apps when you are done; `deskpilot show` lets the user see them. For web pages
+   and browsers use fastbrowse instead.
 3. Run `deskpilot shot WINDOW`, read the image at the `path` it prints, and choose a point in that image. Note its
    `shot` id.
 4. Act with that point as given, passing the id: `deskpilot click WINDOW X Y --shot ID` (`--button right`,

@@ -46,6 +46,13 @@ since X clients read the one X pointer only the user's pointer moves; so is a wi
 on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled. A single-instance
 app that hands its window to a copy the user already runs opens nothing for the agent.
 
+Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched windows, go to that window's own
+client and never hold the user's input: keys never use the `deskpilot` seat, so an XWayland window is refused, and so
+is a keystroke while the user's keyboard focus is in the window's app. A hidden `shot`, `hover` or
+`wait-for --changed` of a window that lies outside its monitor's area, such as a column of the agent's workspace that
+a scrolling layout puts off screen, is refused with `not_visible`: Hyprland sends no frame of it. A capture that gets
+no frame in 5 seconds fails with `timeout`.
+
 Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
 the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
 XWayland target gets X focus for each stroke and sees a focus-in and focus-out around it; Hyprland's own focus
@@ -114,8 +121,8 @@ An on-screen action is refused as `covered` at a point another window, bar or po
 would see it land on that instead.
 
 A window on a hidden workspace or scrolled off its monitor is reported as `"visible": false`, and `shot`, `move`,
-`click`, `scroll`, `drag`, `hover` and `elements` refuse it rather than move the user's view; `--show` focuses it
-to bring it on screen first.
+`click`, `scroll`, `drag`, `hover`, `elements`, `key`, `type` and `paste` refuse it rather than move the user's
+view; `--show` focuses it to bring it on screen first.
 
 The first action that needs the plugin builds and loads it for the running Hyprland, so it comes back by itself
 after Hyprland restarts or upgrades. `deskpilot plugin load` does the same ahead of time.
@@ -175,8 +182,9 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
 id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`, `key`, `type_text`, `paste_text`,
 `clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
-`take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements` and
-`wait_changed` take `hidden`, for windows from `launch`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
+`take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements`,
+`key`, `type_text`, `paste_text` and `wait_changed` take `hidden`, for windows from `launch`, and `key`, `type_text` and
+`paste_text` take `show`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
 keeps one input device open for the session, and the apps it launched close when it exits.
 
 Every expected failure has a code, one stable word to branch on: `not_found`, `ambiguous`, `not_visible`,
