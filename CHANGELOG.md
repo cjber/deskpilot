@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-11
+
 - **`--hidden` now drives apps the agent launched, never the user's own windows.** `deskpilot launch CMD...` (with
   `DESKPILOT_AGENT` set) starts an app on the agent's hidden workspace, and every window it opens, then or later,
   stays there without taking focus. `deskpilot show` lets the user see that workspace, and `deskpilot stop` closes
