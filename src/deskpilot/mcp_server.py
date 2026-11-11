@@ -245,7 +245,9 @@ def paste_text(
 ) -> str:
     """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `keys` (the app's
     paste chord, ctrl+shift+v in most terminals) is pressed there. Pastes any text, including characters the keymap
-    cannot type. Not for XWayland windows, which share one clipboard. show and hidden work as for key."""
+    cannot type. Not for XWayland windows, which share one clipboard, nor for an app that holds the user's clipboard
+    (owns_clipboard), which pastes its own copy: type the text there instead, noting each newline is sent as Return.
+    show and hidden work as for key."""
     desk.paste(text, window, take_focus, keys, show=show, hidden=hidden)
     return "ok"
 

@@ -476,6 +476,22 @@ def test_paste_sends_its_text_in_a_file_the_request_names_and_removes_it(tmp_pat
     assert text == "naïve 日本 ✓" and not pathlib.Path(args[4]).exists()
 
 
+def test_a_paste_into_the_app_that_owns_the_clipboard_is_refused_with_its_own_code(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    files = []
+
+    def run(args):
+        if args[1] == "paste":
+            files.append(pathlib.Path(args[4]))
+            return '{"ok":true,"pending":3}'
+        return '{"ok":false,"error":"this window\'s app holds the user\'s clipboard","code":"owns_clipboard"}'
+
+    with pytest.raises(PluginError, match="holds the user's clipboard") as error:
+        Plugin(run).keys("0xabc", ["p76"], paste="text")
+    assert error_code(error.value) == "owns_clipboard"
+    assert not files[0].exists()
+
+
 def test_plugin_stages_a_long_key_sequence_and_queues_it_whole():
     calls = []
     events = [word for _ in range(5000) for word in ("+30", "-30")]

@@ -40,8 +40,8 @@ EXPECTED = (
 
 def error_code(error: BaseException) -> str:
     """The kind of an expected failure, one stable word a program branches on rather than reading the message:
-    not_found, ambiguous, not_visible, offscreen, stale, covered, gone, refused, busy, no_tree, unavailable, timeout or
-    invalid."""
+    not_found, ambiguous, not_visible, offscreen, stale, covered, gone, owns_clipboard, refused, busy, no_tree,
+    unavailable, timeout or invalid."""
     code = getattr(error, "code", None)
     if isinstance(code, str):
         return code

@@ -163,7 +163,9 @@ compositor, so they never trigger a Hyprland keybind: use `hyprctl dispatch` for
 `paste` hands text to a window as a clipboard only that window sees, then presses its paste chord (`--keys`,
 `ctrl+v` by default; most terminals want `ctrl+shift+v`). It pastes any text, including characters the keymap cannot
 type, and the user's clipboard stays as it is. XWayland windows share one clipboard, so `paste` refuses them: use
-`type`. `clipboard` reads the user's clipboard, and `clipboard --set` replaces it.
+`type`. An app that holds the user's clipboard, because they last copied in it, pastes its own copy instead, so a
+paste into any of its windows is refused with `owns_clipboard`: `type` the text (each newline becomes Return, which
+can submit a form), or ask the user to copy something in another app. `clipboard` reads the user's clipboard, and `clipboard --set` replaces it.
 
 `type` sends keys as fast as the app reads them, about 1 KB a second into Chrome. Games read keys once per frame,
 so type into them with `--delay 0.1` or more: each key is held that long, with the same gap before the next. For
@@ -188,9 +190,9 @@ id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`,
 keeps one input device open for the session, and the apps it launched close when it exits.
 
 Every expected failure has a code, one stable word to branch on: `not_found`, `ambiguous`, `not_visible`,
-`offscreen`, `stale`, `covered` (another window is over the point), `gone` (the window closed), `refused`, `busy`,
-`no_tree`, `unavailable`, `timeout` or `invalid`. The CLI prints `deskpilot: CODE: message`. An MCP tool returns
-an error result whose text is `CODE: message` and whose structured content is `{"code": ..., "message": ...}`.
+`offscreen`, `stale`, `covered` (another window is over the point), `gone` (the window closed), `owns_clipboard`
+(a paste's target app holds the user's clipboard), `refused`, `busy`, `no_tree`, `unavailable`, `timeout` or
+`invalid`. The CLI prints `deskpilot: CODE: message`. An MCP tool returns an error result whose text is `CODE: message` and whose structured content is `{"code": ..., "message": ...}`.
 
 ```sh
 claude mcp add deskpilot -- deskpilot mcp
@@ -199,7 +201,7 @@ claude mcp add deskpilot -- deskpilot mcp
 ## Limits
 
 - `type` can only send characters the active keymap types; a character it lacks (such as `é` on a US layout) is
-  an error rather than skipped. `paste` takes any text, except into XWayland windows.
+  an error rather than skipped. `paste` takes any text, except into XWayland windows and apps that hold the user's clipboard.
 - Hyprland plugins load only into the exact Hyprland they were built against, so `deskpilot plugin load` builds
   one per Hyprland commit and plugin source under `~/.local/share/deskpilot`, and replaces a loaded build of
   other source.

@@ -36,7 +36,8 @@ AGENT_NAME = re.compile(r"[A-Za-z0-9._-]{1,32}")
 
 class PluginError(RuntimeError):
     """The plugin's refusal. `code` is the plugin's word for its kind: covered (another window or layer is over the
-    point), gone (the window or surface went away), busy (its queue is full), unavailable, or refused."""
+    point), gone (the window or surface went away), owns_clipboard (a paste's target app holds the user's clipboard),
+    busy (its queue is full), unavailable, or refused."""
 
     def __init__(self, message: str, code: str = "refused"):
         super().__init__(message)

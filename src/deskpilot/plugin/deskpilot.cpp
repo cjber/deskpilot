@@ -69,7 +69,10 @@
 // events (the window's paste chord) with the file's text offered as the clipboard of the window's client alone, just before them.
 // The seat's selection never changes, so the user's clipboard and every other client's stay as they are. After
 // PASTE_WAIT, or at the next paste, the client gets the clipboard it would otherwise have: the user's if it has
-// keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard.
+// keyboard focus, none if not. An XWayland window is refused, since X clients read one shared clipboard. So is a
+// window whose client owns the user's clipboard, with code owns_clipboard: such a client (Chrome, GTK, Qt, Firefox)
+// ignores the offer and pastes its own copy, which is the user's clipboard, until its source is cancelled, and
+// cancelling it would destroy the user's clipboard.
 //
 // A key sequence too long for one hyprctl request is sent ahead in parts with `hyprctl deskpilot stage <txn>
 // <event>...`, and the `keys` or `paste` request naming <txn> queues all of it as one action.
@@ -340,9 +343,16 @@ namespace {
         std::optional<std::string> result;
         std::optional<SWaiter>     waiter;
     };
+    // Why a queued action could not start, and its code (see SOp::code).
+    struct SRefusal {
+        std::string why;
+        std::string code = "refused";
+        SRefusal(std::string why_, std::string code_ = "refused") : why(std::move(why_)), code(std::move(code_)) {}
+        SRefusal(const char* why_) : why(why_) {}
+    };
     // Starts a queued action. It returns an error when the action cannot start, and otherwise runs it to completion,
     // which ends in complete() with its ticket.
-    using Start = std::function<std::optional<std::string>(uint64_t ticket)>;
+    using Start = std::function<std::optional<SRefusal>(uint64_t ticket)>;
     struct SQueued {
         uint64_t ticket = 0;
         Start    start;
@@ -613,7 +623,7 @@ namespace {
             auto queued = std::move(g_queue.front());
             g_queue.pop_front();
             if (const auto ERROR = queued.start(queued.ticket))
-                complete(queued.ticket, errorReply(*ERROR));
+                complete(queued.ticket, errorReply(ERROR->why, ERROR->code));
         }
     }
 
@@ -2139,7 +2149,8 @@ namespace {
     };
 
     // How long a window keeps the pasted text as its clipboard. A client may read the text as soon as it is offered,
-    // as Chrome does to cache it, and paste that copy when the chord arrives; another reads it at the chord. Nothing
+    // as Chrome does to cache it, and paste that copy when the chord arrives; another reads it at the chord. A client
+    // that owns the user's clipboard reads neither and pastes its own copy, so it is refused (ownsSelection). Nothing
     // tells when a client is done with it, and taking it back after the first read left Chrome with an empty
     // clipboard by the time its chord arrived, so the offer lasts this long.
     constexpr auto PASTE_WAIT = std::chrono::seconds(10);
@@ -2161,14 +2172,32 @@ namespace {
         ((*PROTO::data).*member(SSendSelection{}))(DEVICE, FOCUSED ? g_pSeatManager->m_selection.currentSelection.lock() : nullptr);
     }
 
-    // Offers `text` as the clipboard of `window`'s client alone, until PASTE_WAIT passes or the next paste.
-    std::optional<std::string> offerPaste(const PHLWINDOW& window, std::string text) {
+    // Whether `client` may own the seat's selection, the user's clipboard: its source is one of the client's own
+    // wl_data_sources, or one whose data device is gone, so its client is unknown.
+    bool ownsSelection(wl_client* client) {
+        const auto SOURCE = dynamicPointerCast<CWLDataSourceResource>(g_pSeatManager->m_selection.currentSelection);
+        if (!SOURCE)
+            return false;
+        const auto DEVICE = SOURCE->m_device.lock();
+        return !DEVICE || DEVICE->client() == client;
+    }
+
+    constexpr auto OWNS_CLIPBOARD = "this window's app holds the user's clipboard, so it would paste that instead of the text, and taking the "
+                                    "clipboard from it would lose the user's copy: type the text instead (type sends each newline as Return, "
+                                    "which can submit a form), or ask the user to copy something in another app first";
+
+    // Offers `text` as the clipboard of `window`'s client alone, until PASTE_WAIT passes or the next paste. The check
+    // that the client does not own the user's clipboard runs here, as the action starts, since the user may copy while
+    // it waits; a copy in the app between this and the chord, a few milliseconds, still pastes the user's clipboard.
+    std::optional<SRefusal> offerPaste(const PHLWINDOW& window, std::string text) {
         if (!window || !window->mapped())
             return "the window closed before its text was offered";
         const auto SURFACE = window->wlSurface()->resource();
         const auto DEVICE  = SURFACE ? ((*PROTO::data).*member(SDeviceForClient{}))(SURFACE->client()) : nullptr;
         if (!DEVICE || DEVICE->type() != DATA_SOURCE_TYPE_WAYLAND)
             return "the window's client has no Wayland clipboard to paste from";
+        if (ownsSelection(SURFACE->client()))
+            return SRefusal{OWNS_CLIPBOARD, "owns_clipboard"};
         restorePaste();
         g_paste.emplace(SPaste{.source = makeShared<CPasteSource>(std::move(text)), .device = DEVICE, .surface = SURFACE});
         g_paste->timer = makeShared<CEventLoopTimer>(PASTE_WAIT, [](SP<CEventLoopTimer>, void*) { restorePaste(); }, nullptr);
@@ -2784,7 +2813,7 @@ namespace {
         op.hidden = HIDDEN;
         op.hold   = ms(static_cast<int>(*HOLD));
         op.gap    = ms(static_cast<int>(*GAP));
-        return enqueue([op = std::move(op), text = std::move(text)](uint64_t ticket) mutable -> std::optional<std::string> {
+        return enqueue([op = std::move(op), text = std::move(text)](uint64_t ticket) mutable -> std::optional<SRefusal> {
             // A hidden paste is refused before the window's client is offered the text, as its keys would be.
             if (const auto WINDOW = op.window.lock(); op.hidden && WINDOW && userKeyboardIn(WINDOW->wlSurface()->resource()))
                 return HIDDEN_KEYS_FOCUSED;
@@ -3095,7 +3124,7 @@ namespace {
         if (!X || !Y)
             return refuse("usage: deskpilot cursor [agent=NAME] <x> <y>");
         const Vector2D POINT{*X, *Y};
-        return enqueue([POINT, agent](uint64_t ticket) -> std::optional<std::string> {
+        return enqueue([POINT, agent](uint64_t ticket) -> std::optional<SRefusal> {
             g_gliding = true;
             agentcursor::glideTo(agent, POINT, [ticket, POINT] {
                 g_gliding = false;

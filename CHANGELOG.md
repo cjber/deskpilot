@@ -30,6 +30,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the point, with a soft shadow and lock-on brackets that close in as it lands. Set `DESKPILOT_AGENT` to a name and
   that agent gets a cursor of its own, with the name on a tag and a colour of its own, so any number of agents on one
   desktop can be told apart.
+- **`paste` into an app that holds your clipboard is refused with `owns_clipboard`** instead of pasting your
+  clipboard. Apps such as Chrome paste their own copy while they own the clipboard, so a paste into Chrome after you
+  copied in Chrome inserted your text, not the given one. Type the text instead, or copy something in another app.
 - **`key`, `type` and `paste` take `--hidden` and `--show`, as `hidden` and `show` over MCP.** `--hidden` sends the
   keys to a named window the agent launched, on its hidden workspace, without focusing it or holding the user's
   input; an XWayland window, or a window of the app the user's keyboard focus is in, is refused with `refused`, and
