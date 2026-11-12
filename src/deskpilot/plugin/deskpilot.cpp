@@ -89,12 +89,15 @@
 // {"ok":true,"pending":<ticket>}, collected with `hyprctl deskpilot wait <ticket>`, since hyprctl stops reading a
 // reply after five seconds. Replies are JSON. `hyprctl deskpilot status` reports the plugin's version and queue.
 
+#include <hyprland/src/protocols/PrimarySelection.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
 
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/rule/Engine.hpp>
 #include <hyprland/src/desktop/rule/windowRule/WindowRule.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/state/GlobalWindowController.hpp>
+#include <hyprland/src/desktop/view/window/WindowGroupMembership.hpp>
 #include <hyprland/src/desktop/state/ViewHitTester.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/Popup.hpp>
@@ -133,6 +136,10 @@
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/state/WorkspaceState.hpp>
+#include <hyprland/src/state/workspace/Resolver.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
+#include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
 
 #include "seat.hpp"
@@ -154,6 +161,8 @@
 #include <fstream>
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <format>
 #include <functional>
 #include <map>
@@ -206,6 +215,8 @@ namespace {
     constexpr auto X_WAIT = ms(500);
     // How often a step that waits on the X server or a client checks it.
     constexpr auto X_POLL = ms(1);
+    // How long a client that has not yet asked for the agent seat's keyboard may take to, after the seat announced it.
+    constexpr auto AGENT_BIND_WAIT = std::chrono::seconds(1);
     // How long the window's client may leave earlier input unread before the next keystroke gives up on it.
     constexpr auto CLIENT_WAIT = std::chrono::seconds(5);
 
@@ -269,6 +280,7 @@ namespace {
         // focus and input alone. Otherwise the seat's pointer is moved onto the window and the user's input is held:
         // for an XWayland window, which reads the one X pointer, and for a window of the app the user's pointer is on.
         bool                               direct = false;
+        std::vector<WP<CWLKeyboardResource>> modifierKeyboards;
         // The window's client bound the agent seat, so the input goes to its agent pointer (see "agent seat").
         bool                               agentSeat = false;
         // A direct action: the surface its pointer is on and the pointers entered there, the client's own wl_pointer
@@ -302,7 +314,7 @@ namespace {
     bool               g_gliding = false; // a SHOWN action waits for the agent cursor to land
 
     struct SKeyOp {
-        enum ePhase { ENTER, AWAIT_FOCUS, KEY, AWAIT_KEY, RESTORE, AWAIT_RESTORE, DONE } phase = ENTER;
+        enum ePhase { ENTER, AWAIT_FOCUS, KEY, AWAIT_KEY, AWAIT_CLIENT, RESTORE, AWAIT_RESTORE, DONE } phase = ENTER;
         PHLWINDOWREF                       window;
         WP<CWLSurfaceResource>             surface;
         bool                               x11 = false;
@@ -315,6 +327,11 @@ namespace {
         // The stroke in progress: the window client's wl_keyboard resources it goes to, whether they were entered for
         // it, and the surface of the same client that had keyboard focus and is entered again after it.
         std::vector<WP<CWLKeyboardResource>> keyboards;
+        // The agent route: the keys go to the agent seat's keyboards the window's client bound (see "agent keys"), which
+        // Hyprland never enters or leaves, so the user's keyboard focus and input are not involved at all.
+        bool                               agent = false;
+        std::vector<WP<CWlKeyboard>>       agentKeyboards;
+        std::optional<std::chrono::steady_clock::time_point> agentDeadline; // how long the client may take to bind its keyboard
         bool                               entered = false;
         WP<CWLSurfaceResource>             sibling;
         bool                               inStroke = false;
@@ -326,6 +343,10 @@ namespace {
         // which flickers its title bar. It is left when the sequence ends or the user focuses its app, and entered again
         // when a focus change between other apps has left it.
         bool                               lingering = false;
+        bool                               clientPong = false;
+        SP<CXdgWmBase>                     clientBarrier;
+        std::function<void(CXdgWmBase*, uint32_t)> originalPong;
+        uint32_t                           clientSerial = 0;
         // A keyboard focus change Hyprland asked for mid-stroke, applied when the stroke ends.
         std::optional<WP<CWLSurfaceResource>> deferredFocus;
         std::optional<std::chrono::steady_clock::time_point> clientDeadline;
@@ -441,28 +462,39 @@ namespace {
         SInputOwner& operator=(const SInputOwner&) = delete;
     };
 
-    // Whether the latest input event each client got was deskpilot's. A client keeps its entry after it disconnects; a
-    // new client at its address overwrites it with its first event.
-    std::map<wl_client*, bool> g_agentLast;
-
     uint32_t hkNextSerial(CSeatManager* self, SP<CWLSeatResource> seat, bool enter) {
-        if (seat)
-            g_agentLast[seat->client()] = g_agentInput;
         if (g_agentInput && seat)
             return wl_display_next_serial(g_pCompositor->m_wlDisplay);
         return reinterpret_cast<NextSerialFn>(g_serialHook->m_original)(self, seat, enter);
     }
 
 
+    std::function<void()> keyboardReplay(std::function<void()> replay);
+
     void hkOnKeyboardKey(CInputManager* self, const IKeyboard::SKeyEvent& e, SP<IKeyboard> keyboard) {
         auto replay = [self, e, keyboard] { reinterpret_cast<KeyFn>(g_keyHook->m_original)(self, e, keyboard); };
-        if (!holdForStroke(replay))
+        if ((g_op && !g_op->direct) || (g_keyOp && g_keyOp->holding)) {
+            // The pointer or agent stroke may have replaced the client's modifiers. Deliver the event's own
+            // modifiers first, including when they were already held before the action began.
+            auto held = keyboardReplay([self, keyboard, replay] {
+                reinterpret_cast<ModFn>(g_modHook->m_original)(self, keyboard);
+                replay();
+            });
+            if (g_op && !g_op->direct)
+                g_op->heldInput.emplace_back(std::move(held));
+            else
+                holdForStroke(std::move(held));
+        } else
             replay();
     }
 
     void hkOnKeyboardMod(CInputManager* self, SP<IKeyboard> keyboard) {
         auto replay = [self, keyboard] { reinterpret_cast<ModFn>(g_modHook->m_original)(self, keyboard); };
-        if (!holdForStroke(replay))
+        if (g_op && !g_op->direct)
+            g_op->heldInput.emplace_back(keyboardReplay(replay));
+        else if (g_keyOp && g_keyOp->holding)
+            holdForStroke(keyboardReplay(replay));
+        else
             replay();
     }
 
@@ -486,12 +518,12 @@ namespace {
     void hkSetKeyboardFocus(CSeatManager* self, SP<CWLSurfaceResource> surface) {
         // Hyprland enters the surface it focuses itself, so a window still entered between strokes is left first.
         // Mid-stroke the change is shielded or deferred instead, and endStroke ends the linger before a deferred one.
-        if (g_keyOp && g_keyOp->lingering && !g_keyOp->inStroke) {
+        if (g_keyOp && g_keyOp->lingering && !g_keyOp->inStroke && !g_keyOp->agent) {
             const auto TARGET = g_keyOp->surface.lock();
             if (!TARGET || (surface && surface->client() == TARGET->client()))
                 endLinger(*g_keyOp);
         }
-        if (g_keyOp && g_keyOp->inStroke) {
+        if (g_keyOp && g_keyOp->inStroke && !g_keyOp->agent) {
             const auto TARGET = g_keyOp->surface.lock();
             if (g_keyOp->holding || (surface && TARGET && surface->client() == TARGET->client())) {
                 if (!g_keyOp->hidden) {
@@ -1371,6 +1403,9 @@ namespace {
         g_op->answered = true;
     }
 
+    void clearPointerMods(SOp& op);
+    void restorePointerMods(SOp& op);
+
     void finish() {
         SInputOwner agent;
         auto        op = std::move(*g_op);
@@ -1412,6 +1447,7 @@ namespace {
             g_pHyprRenderer->ensureCursorRenderingMode();
         }
 
+        restorePointerMods(op);
         replayHeld(op.heldInput);
 
         if (!op.answered)
@@ -1454,6 +1490,7 @@ namespace {
             op.focusWindow  = Desktop::focusState()->window();
             op.focusSurface = Desktop::focusState()->surface();
             op.hadFocus     = op.focusWindow || op.focusSurface;
+            clearPointerMods(op);
         }
         g_op.emplace(std::move(op));
 
@@ -1577,9 +1614,107 @@ namespace {
         return out;
     }
 
+    struct SKeyboardPressed { friend constexpr auto member(SKeyboardPressed); };
+    template struct SAccess<&IKeyboard::m_pressed, SKeyboardPressed>;
+
+    // Input devices advance before the input-manager hooks run. Keep the state each queued event observed,
+    // including other keyboards used by Hyprland's merged modifier and key-release checks.
+    std::function<void()> keyboardReplay(std::function<void()> replay) {
+        using Mask = std::array<uint32_t, 6>;
+        const auto readMask = [](xkb_state* state) -> Mask {
+            if (!state)
+                return {};
+            return {xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED),
+                    xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED),
+                    xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED),
+                    xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_DEPRESSED),
+                    xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_LATCHED),
+                    xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_LOCKED)};
+        };
+        const auto applyMask = [](xkb_state* state, const Mask& mask) {
+            if (state)
+                xkb_state_update_mask(state, mask[0], mask[1], mask[2], mask[3], mask[4], mask[5]);
+        };
+        struct SState {
+            SP<IKeyboard> keyboard;
+            decltype(IKeyboard::m_modifiersState) mods;
+            std::vector<uint32_t> pressed;
+            Mask state, symState;
+        };
+        const auto read = [readMask](SP<IKeyboard> keyboard) -> SState {
+            return {keyboard, keyboard->m_modifiersState, (*keyboard).*member(SKeyboardPressed{}),
+                    readMask(keyboard->m_xkbState), readMask(keyboard->m_xkbSymState)};
+        };
+        std::vector<SState> states;
+        for (const auto& keyboard : g_pInputManager->m_keyboards)
+            states.push_back(read(keyboard));
+        return [replay = std::move(replay), states = std::move(states), read, readMask, applyMask] {
+            std::vector<SState> live;
+            std::vector<xkb_state*> resources;
+            for (const auto& state : states) {
+                live.push_back(read(state.keyboard));
+                resources.push_back(state.keyboard->m_xkbState);
+                state.keyboard->m_modifiersState = state.mods;
+                (*state.keyboard).*member(SKeyboardPressed{}) = state.pressed;
+                applyMask(state.keyboard->m_xkbState, state.state);
+                applyMask(state.keyboard->m_xkbSymState, state.symState);
+            }
+            replay();
+            for (size_t i = 0; i < states.size(); ++i) {
+                const auto& state = states[i];
+                const auto& saved = live[i];
+                const auto& keyboard = state.keyboard;
+                // A replayed binding may switch layout or replace the keymap. Preserve those deliberate changes.
+                if (keyboard->m_xkbState != resources[i])
+                    continue;
+                auto& mods = keyboard->m_modifiersState;
+                if (mods.depressed == state.mods.depressed && mods.latched == state.mods.latched &&
+                    mods.locked == state.mods.locked && mods.group == state.mods.group)
+                    mods = saved.mods;
+                auto& pressed = (*keyboard).*member(SKeyboardPressed{});
+                if (pressed == state.pressed)
+                    pressed = saved.pressed;
+                if (readMask(keyboard->m_xkbState) == state.state)
+                    applyMask(keyboard->m_xkbState, saved.state);
+                if (readMask(keyboard->m_xkbSymState) == state.symState)
+                    applyMask(keyboard->m_xkbSymState, saved.symState);
+            }
+        };
+    }
+
+    // XWayland pointer events carry its shared X keyboard modifiers, even when another X window has focus.
+    // Pointer actions have no modifier argument, so isolate their buttons from the user's held modifiers.
+    void clearPointerMods(SOp& op) {
+        SInputOwner agent;
+        const auto WINDOW = windowOf(op);
+        const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
+        if (!WINDOW || !WINDOW->backend().isX11() || !KEYBOARD)
+            return;
+        const auto SURFACE = WINDOW->wlSurface()->resource();
+        op.modifierKeyboards = keyboardsOf(SURFACE->client());
+        for (const auto& weak : op.modifierKeyboards) {
+            if (const auto resource = weak.lock())
+                resource->sendMods(0, 0, KEYBOARD->m_modifiersState.locked, KEYBOARD->m_modifiersState.group);
+        }
+    }
+
+    void restorePointerMods(SOp& op) {
+        const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
+        if (!KEYBOARD)
+            return;
+        const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+        const auto& MODS = KEYBOARD->m_modifiersState;
+        for (const auto& weak : op.modifierKeyboards) {
+            if (const auto resource = weak.lock()) {
+                const bool FOCUSED = FOCUS && resource->m_owner && resource->m_owner->client() == FOCUS->client();
+                resource->sendMods(FOCUSED ? MODS.depressed : 0, FOCUSED ? MODS.latched : 0, MODS.locked, MODS.group);
+            }
+        }
+    }
+
     // ---- agent seat ----
     //
-    // A wl_seat named "deskpilot", with a pointer and nothing else, which seat.cpp advertises (see seat.hpp for why it
+    // A wl_seat named "deskpilot", with independent pointer and optional keyboard resources, which seat.cpp advertises (see seat.hpp for why it
     // lives in its own library). A client that binds every seat (GTK and Qt do) gets a second pointer, the action's
     // alone: a window of that client takes each pointer action through it, in every mode, so the user's pointer can be
     // anywhere, the same app included, and nothing of theirs is held. Clients that bind one seat (Chromium, Electron,
@@ -1589,12 +1724,11 @@ namespace {
     //   - A move, resize, pointer warp or activation that names the agent seat is ignored, as Hyprland finds no record of
     //     it, and its events carry serials Hyprland never records, so they earn nothing, as for hkNextSerial.
     //   - A popup it opens asks for its grab on the client's first seat (GTK 4 always grabs with the default seat), so
-    //     the grab is told from the user's by the client's latest input (hkAddOrStartGrab).
+    //     its grab is told from the user's by the input serial (hkAddOrStartGrab).
     void*             g_agentLibrary = nullptr;
     const SAgentSeat* g_agentSeat    = nullptr;
 
-    uint32_t agentSerial(wl_client* client) {
-        g_agentLast[client] = true;
+    uint32_t agentSerial(wl_client*) {
         return wl_display_next_serial(g_pCompositor->m_wlDisplay);
     }
 
@@ -2028,11 +2162,40 @@ namespace {
     using GrabFn = void (*)(CXDGShellProtocol*, SP<CXDGPopupResource>);
     CFunctionHook* g_grabHook = nullptr;
 
+    struct SSeatResources { friend constexpr auto member(SSeatResources); };
+    template struct SAccess<&CWLSeatProtocol::m_seatResources, SSeatResources>;
+    bool userSerialValid(wl_client* client, uint32_t serial) {
+        for (const auto& seat : (*PROTO::seat).*member(SSeatResources{})) {
+            if (seat->client() == client && g_pSeatManager->serialValid(seat, serial, false))
+                return true;
+        }
+        return false;
+    }
+
+    struct SPopupResource { friend constexpr auto member(SPopupResource); };
+    template struct SAccess<&CXDGPopupResource::m_resource, SPopupResource>;
+
+    wl_protocol_logger* g_popupLogger = nullptr;
+    std::optional<std::pair<wl_resource*, bool>> g_popupGrab;
+
+    // Wayland logs a request immediately before invoking its handler. Hyprland discards the grab serial in that
+    // handler, so capture its provenance here, against the real seat's existing serial history. Agent serials are
+    // deliberately absent from that history (hkNextSerial/agentSerial), even if GTK names the regular seat.
+    void popupRequest(void*, wl_protocol_logger_type direction, const wl_protocol_logger_message* message) {
+        if (direction != WL_PROTOCOL_LOGGER_REQUEST || message->arguments_count != 2 ||
+            std::string_view(wl_resource_get_class(message->resource)) != "xdg_popup" ||
+            std::string_view(message->message->name) != "grab")
+            return;
+        const auto SERIAL = message->arguments[1].u;
+        const bool user = userSerialValid(wl_resource_get_client(message->resource), SERIAL);
+        g_popupGrab = std::pair{message->resource, user};
+    }
+
     void hkAddOrStartGrab(CXDGShellProtocol* self, SP<CXDGPopupResource> popup) {
-        // A popup is opened by the latest input its client got. The seat its grab names does not say whose that was:
-        // GTK 4 names its first seat for a popup the agent seat opened.
         const auto SURFACE = popup && popup->m_surface ? popup->m_surface->m_surface.lock() : nullptr;
-        if (SURFACE && g_agentLast[SURFACE->client()]) {
+        const auto REQUEST = std::exchange(g_popupGrab, std::nullopt);
+        const auto RESOURCE = popup ? (*popup).*member(SPopupResource{}) : nullptr;
+        if (SURFACE && REQUEST && RESOURCE && REQUEST->first == RESOURCE->resource() && !REQUEST->second) {
             g_ungrabbed[SURFACE->client()].emplace_back(popup);
             return;
         }
@@ -2125,10 +2288,14 @@ namespace {
         ((*PROTO::data).*member(SDropDrag{}))();
     }
 
+    struct SDataDevices { friend constexpr auto member(SDataDevices); };
+    template struct SAccess<&CWLDataDeviceProtocol::m_devices, SDataDevices>;
+
     class CPasteSource;
     struct SPaste {
         SP<CPasteSource>       source;
-        WP<IDataDevice>        device;
+        WP<IDataDevice>        device; // Hyprland normally offers the seat selection to this first device only
+        std::vector<WP<IDataDevice>> devices;
         WP<CWLSurfaceResource> surface;
         SP<CEventLoopTimer>    timer;
     };
@@ -2207,13 +2374,14 @@ namespace {
         auto paste = std::move(*g_paste);
         g_paste.reset();
         dropTimer(paste.timer);
-        const auto DEVICE = paste.device.lock();
-        if (!DEVICE)
-            return;
         const auto FOCUS   = g_pSeatManager->m_state.keyboardFocusResource.lock();
         const auto SURFACE = paste.surface.lock();
         const bool FOCUSED = FOCUS && SURFACE && FOCUS->client() == SURFACE->client();
-        ((*PROTO::data).*member(SSendSelection{}))(DEVICE, FOCUSED ? g_pSeatManager->m_selection.currentSelection.lock() : nullptr);
+        const auto PRIMARY = paste.device.lock();
+        for (const auto& weak : paste.devices) {
+            if (const auto DEVICE = weak.lock())
+                ((*PROTO::data).*member(SSendSelection{}))(DEVICE, FOCUSED && DEVICE == PRIMARY ? g_pSeatManager->m_selection.currentSelection.lock() : nullptr);
+        }
     }
 
     // Whether `client` may own the seat's selection, the user's clipboard: its source is one of the client's own
@@ -2246,8 +2414,95 @@ namespace {
         g_paste.emplace(SPaste{.source = makeShared<CPasteSource>(std::move(text)), .device = DEVICE, .surface = SURFACE});
         g_paste->timer = makeShared<CEventLoopTimer>(PASTE_WAIT, [](SP<CEventLoopTimer>, void*) { restorePaste(); }, nullptr);
         g_pEventLoopManager->addTimer(g_paste->timer);
-        ((*PROTO::data).*member(SSendSelection{}))(DEVICE, g_paste->source);
+        // GTK keeps a data device per seat and pastes from the seat of its last input. Hyprland's lookup returns
+        // only the first device, so offer to every device of this client, without changing the shared selection.
+        for (const auto& device : (*PROTO::data).*member(SDataDevices{})) {
+            if (device->client() != SURFACE->client())
+                continue;
+            g_paste->devices.emplace_back(device);
+            ((*PROTO::data).*member(SSendSelection{}))(device, g_paste->source);
+        }
         return std::nullopt;
+    }
+
+    // Selection protocols accept an input serial but Hyprland does not validate it. Agent events deliberately
+    // have unrecorded serials, so validate at the request boundary, before either selection can be replaced.
+    struct SDataResource { friend constexpr auto member(SDataResource); };
+    template struct SAccess<&CWLDataDeviceResource::m_resource, SDataResource>;
+    struct SPrimaryDevices { friend constexpr auto member(SPrimaryDevices); };
+    template struct SAccess<&CPrimarySelectionProtocol::m_devices, SPrimaryDevices>;
+    struct SPrimaryResource { friend constexpr auto member(SPrimaryResource); };
+    template struct SAccess<&CPrimarySelectionDevice::m_resource, SPrimaryResource>;
+    struct SDataRequests { friend constexpr auto member(SDataRequests); };
+    template struct SAccess<&CWlDataDevice::requests, SDataRequests>;
+    struct SPrimaryRequests { friend constexpr auto member(SPrimaryRequests); };
+    template struct SAccess<&CZwpPrimarySelectionDeviceV1::requests, SPrimaryRequests>;
+
+
+    template <typename T> using SelectionHandler = std::function<void(T*, wl_resource*, uint32_t)>;
+    template <typename T> std::map<T*, SelectionHandler<T>> g_selectionHandlers;
+    CFunctionHook* g_dataSelectionHook = nullptr;
+    CFunctionHook* g_primarySelectionHook = nullptr;
+
+    template <typename T, CFunctionHook*& Hook>
+    void hkSelectionHandler(T* self, SelectionHandler<T>&& handler) {
+        // Keep originals only for live devices. The generated setter has no destroy notification of its own.
+        std::erase_if(g_selectionHandlers<T>, [self](const auto& item) {
+            if (item.first == self)
+                return false;
+            if constexpr (std::is_same_v<T, CWlDataDevice>)
+                return std::ranges::none_of((*PROTO::data).*member(SDataDevices{}), [&](const auto& device) {
+                    return ((*device).*member(SDataResource{})).get() == item.first;
+                });
+            else
+                return std::ranges::none_of((*PROTO::primarySelection).*member(SPrimaryDevices{}), [&](const auto& device) {
+                    return ((*device).*member(SPrimaryResource{})).get() == item.first;
+                });
+        });
+        g_selectionHandlers<T>[self] = handler;
+        SelectionHandler<T> guarded = [original = std::move(handler)](T* resource, wl_resource* source, uint32_t serial) {
+            if (userSerialValid(resource->client(), serial)) {
+                original(resource, source, serial);
+                return;
+            }
+            // The client must learn that its agent-generated copy was not accepted, or GTK keeps treating its
+            // local source as the clipboard owner and ignores a later client-local paste offer.
+            if (source) {
+                if constexpr (std::is_same_v<T, CWlDataDevice>) {
+                    if (const auto SOURCE = CWLDataSourceResource::fromResource(source))
+                        SOURCE->cancelled();
+                }
+                // Primary-selection cancellation clears GTK's highlight. Its agent selection stays local to the
+                // client, so keep that highlight while refusing to publish it as the user's primary selection.
+            }
+        };
+        using SetHandler = void (*)(T*, SelectionHandler<T>&&);
+        reinterpret_cast<SetHandler>(Hook->m_original)(self, std::move(guarded));
+    }
+
+    void selectionGuards(bool install) {
+        for (const auto& device : (*PROTO::data).*member(SDataDevices{})) {
+            const auto resource = (*device).*member(SDataResource{});
+            auto& handler = ((*resource).*member(SDataRequests{})).setSelection;
+            if (install) {
+                auto original = handler;
+                resource->setSetSelection(std::move(original));
+            } else if (const auto it = g_selectionHandlers<CWlDataDevice>.find(resource.get()); it != g_selectionHandlers<CWlDataDevice>.end())
+                handler = std::move(it->second);
+        }
+        for (const auto& device : (*PROTO::primarySelection).*member(SPrimaryDevices{})) {
+            const auto resource = (*device).*member(SPrimaryResource{});
+            auto& handler = ((*resource).*member(SPrimaryRequests{})).setSelection;
+            if (install) {
+                auto original = handler;
+                resource->setSetSelection(std::move(original));
+            } else if (const auto it = g_selectionHandlers<CZwpPrimarySelectionDeviceV1>.find(resource.get()); it != g_selectionHandlers<CZwpPrimarySelectionDeviceV1>.end())
+                handler = std::move(it->second);
+        }
+        if (!install) {
+            g_selectionHandlers<CWlDataDevice>.clear();
+            g_selectionHandlers<CZwpPrimarySelectionDeviceV1>.clear();
+        }
     }
 
     // CWLKeyboardResource keeps the surface it is entered on private (see SX11Surface).
@@ -2255,6 +2510,46 @@ namespace {
         friend constexpr auto member(SKeyboardSurface);
     };
     template struct SAccess<&CWLKeyboardResource::m_currentSurface, SKeyboardSurface>;
+
+    struct SXdgBaseResource { friend constexpr auto member(SXdgBaseResource); };
+    template struct SAccess<&CXDGWMBase::m_resource, SXdgBaseResource>;
+    struct SXdgBaseRequests { friend constexpr auto member(SXdgBaseRequests); };
+    template struct SAccess<&CXdgWmBase::requests, SXdgBaseRequests>;
+
+    // A serial-matched protocol round trip separates keyboard events at the client's dispatcher. In particular,
+    // Chromium can discard a shortcut when its complete chord and leave arrive in one batch.
+    bool clientBarrier(SKeyOp& op) {
+        if (!op.clientBarrier) {
+            const auto SURFACE = op.surface.lock();
+            const auto ROLE = SURFACE ? dynamicPointerCast<CXDGSurfaceRole>(SURFACE->m_role) : nullptr;
+            const auto XDG = ROLE ? ROLE->m_xdgSurface.lock() : nullptr;
+            const auto BASE = XDG ? XDG->m_owner.lock() : nullptr;
+            if (!BASE)
+                return false;
+            op.clientBarrier = (*BASE).*member(SXdgBaseResource{});
+            auto& handler = ((*op.clientBarrier).*member(SXdgBaseRequests{})).pong;
+            op.originalPong = handler;
+            handler = [original = handler](CXdgWmBase* resource, uint32_t serial) {
+                if (g_keyOp && g_keyOp->clientBarrier.get() == resource && g_keyOp->clientSerial == serial) {
+                    g_keyOp->clientPong = true;
+                    return;
+                }
+                original(resource, serial);
+            };
+        }
+        op.clientPong = false;
+        op.clientSerial = agentSerial(op.surface.lock()->client());
+        op.clientBarrier->sendPing(op.clientSerial);
+        wl_client_flush(op.surface.lock()->client());
+        return true;
+    }
+
+    void restoreClientBarrier(SKeyOp& op) {
+        if (op.clientBarrier) {
+            ((*op.clientBarrier).*member(SXdgBaseRequests{})).pong = std::move(op.originalPong);
+            op.clientBarrier.reset();
+        }
+    }
 
     // Whether every keyboard of the stroke is still entered on the surface.
     bool stillEntered(const SKeyOp& op, const SP<CWLSurfaceResource>& surface) {
@@ -2264,18 +2559,92 @@ namespace {
         });
     }
 
+    // ---- agent keys ----
+    //
+    // A client that binds every seat (GTK and Qt do) also gets the agent seat's keyboard (seat.cpp), which Hyprland never
+    // enters or leaves: the stroke's enter, keys, modifiers and leave go to it alone, with serials of the agent's own.
+    // So the user's keyboard focus and input are neither held nor moved, even when it is in the same client, and the
+    // route works for a window anywhere. It is chosen by the caller (`agent` and `agent-hidden`), never detected: a
+    // client that binds the keyboard may still discard its keys (Qt does for a seat it takes as not its main one), and
+    // nothing here can tell. A client that never asked for the keyboard (one that binds a single seat), or an XWayland
+    // window, is refused, never sent through another route.
+    //
+    // The keymap it sends is the active keyboard's own, as the regular route's keys are resolved against.
+    std::string g_agentKeymap;
+    int32_t     g_agentRate = -1, g_agentDelay = -1;
+
+    // Gives the agent seat's keyboard the active keyboard's keymap, once and again only when it changed. Clients that
+    // bound the seat before it had a keyboard are told it has one, and ask for it after this returns.
+    bool configureAgentKeymap() {
+        const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
+        if (!g_agentSeat || !KEYBOARD || !KEYBOARD->m_xkbKeymap)
+            return false;
+        // wl_keyboard's only keymap format is xkb_v1, which is what Hyprland keeps its V1 keymap for.
+        const bool V1 = KEYBOARD->m_xkbKeymapV1FD.isValid() && !KEYBOARD->m_xkbKeymapV1String.empty();
+        const auto& FD     = V1 ? KEYBOARD->m_xkbKeymapV1FD : KEYBOARD->m_xkbKeymapFD;
+        const auto& STRING = V1 ? KEYBOARD->m_xkbKeymapV1String : KEYBOARD->m_xkbKeymapString;
+        struct stat info;
+        if (!FD.isValid() || STRING.empty() || fstat(FD.get(), &info) != 0 || info.st_size <= 0)
+            return false;
+        if (STRING == g_agentKeymap && KEYBOARD->m_repeatRate == g_agentRate && KEYBOARD->m_repeatDelay == g_agentDelay)
+            return true;
+        if (!g_agentSeat->configureKeymap(FD.get(), static_cast<uint32_t>(info.st_size), KEYBOARD->m_repeatRate, KEYBOARD->m_repeatDelay))
+            return false;
+        g_agentKeymap = STRING;
+        g_agentRate   = KEYBOARD->m_repeatRate;
+        g_agentDelay  = KEYBOARD->m_repeatDelay;
+        return true;
+    }
+
+    // What a stroke sends a keyboard, for the client's own wl_keyboard and the agent seat's alike.
+    void kbEnter(CWLKeyboardResource& keyboard, const SP<CWLSurfaceResource>& surface, wl_array* keys) {
+        keyboard.sendEnter(surface, keys);
+    }
+    void kbEnter(CWlKeyboard& keyboard, const SP<CWLSurfaceResource>& surface, wl_array* keys) {
+        keyboard.sendEnterRaw(agentSerial(keyboard.client()), surface->getResource()->resource(), keys);
+    }
+    void kbLeave(CWLKeyboardResource& keyboard, const SP<CWLSurfaceResource>&) {
+        keyboard.sendLeave();
+    }
+    void kbLeave(CWlKeyboard& keyboard, const SP<CWLSurfaceResource>& surface) {
+        if (surface)
+            keyboard.sendLeaveRaw(agentSerial(keyboard.client()), surface->getResource()->resource());
+    }
+    void kbKey(CWLKeyboardResource& keyboard, uint32_t time, uint32_t code, wl_keyboard_key_state state) {
+        keyboard.sendKey(time, code, state);
+    }
+    void kbKey(CWlKeyboard& keyboard, uint32_t time, uint32_t code, wl_keyboard_key_state state) {
+        keyboard.sendKey(agentSerial(keyboard.client()), time, code, state);
+    }
+    void kbMods(CWLKeyboardResource& keyboard, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+        keyboard.sendMods(depressed, latched, locked, group);
+    }
+    void kbMods(CWlKeyboard& keyboard, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
+        keyboard.sendModifiers(agentSerial(keyboard.client()), depressed, latched, locked, group);
+    }
+
+    // Whether every agent keyboard of the stroke is still there and the client has asked for no other.
+    bool agentStillBound(const SKeyOp& op, const SP<CWLSurfaceResource>& surface) {
+        const auto BOUND = g_agentSeat->keyboardsOf(surface->client());
+        return BOUND.size() == op.agentKeyboards.size() && std::ranges::all_of(op.agentKeyboards, [](const auto& weak) { return weak.lock().get() != nullptr; });
+    }
+
     template <typename FN>
     void eachKeyboard(SKeyOp& op, FN&& fn) {
         for (const auto& weak : op.keyboards) {
             if (const auto KEYBOARD = weak.lock())
-                fn(KEYBOARD);
+                fn(*KEYBOARD);
+        }
+        for (const auto& weak : op.agentKeyboards) {
+            if (const auto KEYBOARD = weak.lock())
+                fn(*KEYBOARD);
         }
     }
 
     void sendMods(SKeyOp& op) {
         const auto DEPRESSED = xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_DEPRESSED), LATCHED = xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_LATCHED),
                    LOCKED = xkb_state_serialize_mods(op.xkb, XKB_STATE_MODS_LOCKED), GROUP = xkb_state_serialize_layout(op.xkb, XKB_STATE_LAYOUT_EFFECTIVE);
-        eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendMods(DEPRESSED, LATCHED, LOCKED, GROUP); });
+        eachKeyboard(op, [&](auto& keyboard) { kbMods(keyboard, DEPRESSED, LATCHED, LOCKED, GROUP); });
     }
 
     // The modifiers the user's keyboard really has, as the seat would send them.
@@ -2284,7 +2653,7 @@ namespace {
         if (!KEYBOARD)
             return;
         const auto& MODS = KEYBOARD->m_modifiersState;
-        eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendMods(MODS.depressed, MODS.latched, MODS.locked, MODS.group); });
+        eachKeyboard(op, [&](auto& keyboard) { kbMods(keyboard, MODS.depressed, MODS.latched, MODS.locked, MODS.group); });
     }
 
     // The locks a typed character needs, over the modifiers its pressed modifier keys hold, in the user's layout.
@@ -2298,7 +2667,7 @@ namespace {
     // changed them).
     void sendKey(SKeyOp& op, uint32_t code, bool press) {
         const auto TIME = now();
-        eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendKey(TIME, code, press ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED); });
+        eachKeyboard(op, [&](auto& keyboard) { kbKey(keyboard, TIME, code, press ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED); });
         xkb_state_update_key(op.xkb, code + 8, press ? XKB_KEY_DOWN : XKB_KEY_UP);
         sendMods(op);
         if (press)
@@ -2321,6 +2690,7 @@ namespace {
         if (g_keyOp->inStroke)
             endStroke(*g_keyOp);
         endLinger(*g_keyOp);
+        restoreClientBarrier(*g_keyOp);
         auto op = std::move(*g_keyOp);
         g_keyOp.reset();
         dropTimer(op.timer);
@@ -2363,7 +2733,8 @@ namespace {
         if (!std::exchange(op.lingering, false))
             return;
         SInputOwner agent;
-        eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
+        const auto  SURFACE = op.surface.lock();
+        eachKeyboard(op, [&](auto& keyboard) { kbLeave(keyboard, SURFACE); });
     }
 
     // Keys this stroke holds are released and its keyboards left, or given back the user's modifiers if the window
@@ -2380,7 +2751,8 @@ namespace {
             op.lingering = true;
             return endStroke(op);
         }
-        eachKeyboard(op, [](const auto& keyboard) { keyboard->sendLeave(); });
+        const auto LEFT = op.surface.lock();
+        eachKeyboard(op, [&](auto& keyboard) { kbLeave(keyboard, LEFT); });
         op.lingering = false;
         if (const auto SIBLING = op.sibling.lock()) {
             wl_array keys;
@@ -2390,7 +2762,7 @@ namespace {
                 if (auto* data = wl_array_add(&keys, PRESSED.size() * sizeof(uint32_t)))
                     std::ranges::copy(PRESSED, static_cast<uint32_t*>(data));
             }
-            eachKeyboard(op, [&](const auto& keyboard) { keyboard->sendEnter(SIBLING, &keys); });
+            eachKeyboard(op, [&](auto& keyboard) { kbEnter(keyboard, SIBLING, &keys); });
             wl_array_release(&keys);
             sendRealMods(op);
         }
@@ -2465,13 +2837,47 @@ namespace {
                 // A lingering window is used again only while its keyboards are still entered on it: a focus change
                 // between other apps sends every keyboard a leave, and keys to a left keyboard are dropped.
                 if (op.lingering) {
-                    if (op.surface.lock() == SURFACE && !(FOCUS && FOCUS->client() == SURFACE->client()) && stillEntered(op, SURFACE)) {
+                    if (op.surface.lock() == SURFACE &&
+                        (op.agent ? agentStillBound(op, SURFACE) : !(FOCUS && FOCUS->client() == SURFACE->client()) && stillEntered(op, SURFACE))) {
                         op.inStroke = true;
                         sendMods(op);
                         op.phase = SKeyOp::KEY;
                         return std::nullopt;
                     }
                     endLinger(op);
+                }
+                if (op.agent) {
+                    if (!configureAgentKeymap()) {
+                        op.error = "the agent seat's keyboard has no keymap to give: the user's keyboard has none";
+                        op.phase = SKeyOp::DONE;
+                        return std::nullopt;
+                    }
+                    op.agentKeyboards = g_agentSeat->keyboardsOf(SURFACE->client());
+                    if (op.agentKeyboards.empty()) {
+                        // A client that bound the seat before it had a keyboard asks for it once told, which takes a round trip.
+                        const auto NOW = std::chrono::steady_clock::now();
+                        if (!op.agentDeadline)
+                            op.agentDeadline = NOW + AGENT_BIND_WAIT;
+                        if (NOW < *op.agentDeadline)
+                            return X_POLL;
+                        op.error = "the window's client has no deskpilot seat keyboard: it binds one seat (or started before the plugin first loaded), so "
+                                   "its keys go through the regular route";
+                        op.phase = SKeyOp::DONE;
+                        return std::nullopt;
+                    }
+                    op.agentDeadline.reset();
+                    op.surface   = SURFACE;
+                    op.entered   = true;
+                    op.sibling   = nullptr;
+                    op.inStroke  = true;
+                    op.holding   = false;
+                    wl_array keys;
+                    wl_array_init(&keys);
+                    eachKeyboard(op, [&](auto& keyboard) { kbEnter(keyboard, SURFACE, &keys); });
+                    wl_array_release(&keys);
+                    sendMods(op);
+                    op.phase = SKeyOp::KEY;
+                    return std::nullopt;
                 }
                 if (op.hidden && userKeyboardIn(SURFACE)) {
                     op.error = op.next ? std::format("{}; the keys before this stroke were sent", HIDDEN_KEYS_FOCUSED) : HIDDEN_KEYS_FOCUSED;
@@ -2499,9 +2905,9 @@ namespace {
                     }
                     wl_array keys;
                     wl_array_init(&keys);
-                    eachKeyboard(op, [&](const auto& keyboard) {
-                        keyboard->sendLeave();
-                        keyboard->sendEnter(SURFACE, &keys);
+                    eachKeyboard(op, [&](auto& keyboard) {
+                        kbLeave(keyboard, SURFACE);
+                        kbEnter(keyboard, SURFACE, &keys);
                     });
                     wl_array_release(&keys);
                     if (op.x11) {
@@ -2543,12 +2949,36 @@ namespace {
                 sendKey(op, EVENT.code, EVENT.press);
                 if (EVENT.locks && !EVENT.press)
                     setLocks(op, op.locked);
+                if (!op.x11 && !op.agent && op.entered) {
+                    if (!clientBarrier(op)) {
+                        op.error = "the window has no protocol acknowledgement for keyboard events";
+                        return restoreStroke(op);
+                    }
+                    op.phase = SKeyOp::AWAIT_CLIENT;
+                    op.deadline = std::chrono::steady_clock::now() + CLIENT_WAIT;
+                    return X_POLL;
+                }
                 if (!(op.x11 && op.entered))
                     return afterKey(op);
                 op.phase    = SKeyOp::AWAIT_KEY;
                 op.deadline = std::chrono::steady_clock::now() + X_WAIT;
                 return X_POLL;
             }
+            case SKeyOp::AWAIT_CLIENT:
+                if (const auto WINDOW = op.window.lock(); !WINDOW || !WINDOW->mapped() || !op.surface.lock()) {
+                    op.error = "the window closed mid-sequence";
+                    op.code = "gone";
+                    return restoreStroke(op);
+                }
+                if (op.clientPong) {
+                    return afterKey(op);
+                }
+                if (EXPIRED) {
+                    op.error = "the window did not acknowledge its keyboard events";
+                    op.code = "unavailable";
+                    return restoreStroke(op);
+                }
+                return X_POLL;
             case SKeyOp::AWAIT_KEY:
                 if (xKeyDown(op.events[op.next].code) == op.events[op.next].press)
                     return afterKey(op);
@@ -2595,7 +3025,7 @@ namespace {
         return xkb_utf32_to_keysym(codePoint);
     }
 
-    // The key that gives `keysym` on `keymap` under locks `locked` and the user's layout, with the fewest modifiers, as
+    // The lowest key that gives `keysym` on `keymap` under locks `locked` and the user's layout, with the fewest modifiers on that key, as
     // its evdev code and those modifiers. With `bare`, only a key that gives it with no modifiers: the key a chord such
     // as ctrl+a names. Lock modifiers are never chosen, since holding one is not how a key is typed.
     std::optional<std::pair<uint32_t, xkb_mod_mask_t>> keyUnder(xkb_keymap* keymap, xkb_keysym_t keysym, xkb_mod_mask_t locked, xkb_layout_index_t group, bool bare) {
@@ -2610,7 +3040,9 @@ namespace {
         std::optional<std::pair<uint32_t, xkb_mod_mask_t>> best;
         // X keycodes stop at 255, and the first eight are not keys.
         const auto LAST = std::min<xkb_keycode_t>(xkb_keymap_max_keycode(keymap), 255);
-        for (xkb_keycode_t keycode = std::max<xkb_keycode_t>(xkb_keymap_min_keycode(keymap), 9); keycode <= LAST; ++keycode) {
+        // Prefer the first matching key over an extended duplicate with fewer modifiers: XKB includes dedicated
+        // keypad parentheses which Wine maps to VK_NONAME, while the number-row keys have Windows scan codes.
+        for (xkb_keycode_t keycode = std::max<xkb_keycode_t>(xkb_keymap_min_keycode(keymap), 9); keycode <= LAST && !best; ++keycode) {
             xkb_state_update_mask(state, 0, 0, locked, 0, 0, group);
             const auto LAYOUT = xkb_state_key_get_layout(state, keycode);
             if (LAYOUT == XKB_LAYOUT_INVALID)
@@ -2732,6 +3164,8 @@ namespace {
             return "no keyboard";
         if (const auto ERROR = resolveKeys(op.events, KEYBOARD))
             return ERROR;
+        if (op.agent && !g_agentSeat)
+            return "the agent seat is not running";
         op.ticket = ticket;
         op.x11    = WINDOW->backend().isX11();
         op.xkb    = scratchState(KEYBOARD);
@@ -2820,16 +3254,19 @@ namespace {
         return std::nullopt;
     }
 
-    // `keys <window> <plain|hidden> <hold> <gap> <txn|none> <event>...`, or `paste <window> <plain|hidden> <file> ...`
+    // `keys <window> <plain|hidden|agent|agent-hidden> <hold> <gap> <txn|none> <event>...`, or `paste <window> <plain|hidden> <file> ...`
     // with the same words after the file, which offers the file's text as the window's clipboard just before the keys
     // (its paste chord) are sent.
     IPC::Socket1::SResponse keysCommand(const std::vector<std::string>& args) {
         const bool   PASTE = args[1] == "paste";
         const size_t AT    = PASTE ? 5 : 4; // where <hold-ms> is
-        if (args.size() < AT + 3 || (args[3] != "plain" && args[3] != "hidden"))
+        if (args.size() < AT + 3 || (args[3] != "plain" && args[3] != "hidden" && args[3] != "agent" && args[3] != "agent-hidden"))
             return refuse(PASTE ? "usage: deskpilot paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>..." :
-                                  "usage: deskpilot keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>...");
+                                  "usage: deskpilot keys <window> <plain|hidden|agent|agent-hidden> <hold-ms> <gap-ms> <txn|none> <key event>...");
+        const bool                 AGENT  = args[3] == "agent" || args[3] == "agent-hidden";
         const bool                 HIDDEN = args[3] == "hidden";
+        if (AGENT && PASTE)
+            return refuse("a paste offers its text through the user's keyboard focus, which the agent route never takes: paste through the regular route");
         std::optional<std::string> text;
         if (PASTE) {
             if (const auto ERROR = readPaste(args[4], text.emplace()))
@@ -2857,10 +3294,13 @@ namespace {
             return refuse("no mapped window " + args[2]);
         if (PASTE && WINDOW->backend().isX11())
             return refuse("an XWayland window reads the clipboard every X client shares, so a paste would replace the user's clipboard: type the text instead");
+        if (AGENT && WINDOW->backend().isX11())
+            return refuse("an XWayland window reads keys from the X server, which the agent seat does not reach: act on it through the regular route");
         if (HIDDEN && WINDOW->backend().isX11())
             return refuse("an XWayland window reads keys from the X server, which only the user's keyboard focus reaches: act on it on screen instead");
         op.window = WINDOW;
         op.hidden = HIDDEN;
+        op.agent  = AGENT;
         op.hold   = ms(static_cast<int>(*HOLD));
         op.gap    = ms(static_cast<int>(*GAP));
         return enqueue([op = std::move(op), text = std::move(text)](uint64_t ticket) mutable -> std::optional<SRefusal> {
@@ -3005,6 +3445,9 @@ namespace {
     // children) on the hidden special:agent-NAME workspace, silently and without taking focus. Hyprland's own exec
     // rules are not used: they place only the first window and expire a minute after launch, so a later dialog would
     // open on the user's workspace. A config reload clears every rule, so the plugin registers them again after it.
+    struct SGroupRules { friend constexpr auto member(SGroupRules); };
+    template struct SAccess<&Desktop::View::CWindowGroupMembership::m_rules, SGroupRules>;
+
     namespace agents {
         // An agent with no owner process is stopped after this long without a request naming it.
         constexpr auto IDLE = std::chrono::minutes(30);
@@ -3012,8 +3455,33 @@ namespace {
         constexpr auto GRACE = std::chrono::seconds(5);
         constexpr auto CHECK = std::chrono::seconds(30);
 
+        // A process `launch` registered: its Linux start time (clock ticks since boot, field 22 of /proc/PID/stat) tells
+        // it from a later process that reuses the pid. `rule` places its windows by pid when the app scrubbed the token
+        // from its environment; it is the main process alone, since its children do not carry the pid.
+        struct SProcess {
+            uint64_t                       birth = 0;
+            SP<Desktop::Rule::CWindowRule> rule;
+        };
+
+        // A window the user's own app opened that `adopt` moved onto the agent's workspace. Ownership has two sources:
+        // a process `launch` registered (every window it opens, by pid or token; see `owns`) and an exact adopted window
+        // (here). An adopted window's process is never the agent's: its pid is not registered, and adoption refuses a
+        // process some agent launched, so stopping the agent closes no adopted window and signals no adopted process.
+        // `window` is the exact window and `stableID` its metadata identity, which a reused address does not share.
+        // `origin` is the workspace it came from, held so it is not destroyed while the window is away, and `hidden` the
+        // agent's workspace it was moved to, to tell whether the user has moved it since. A floating window's box is
+        // kept, since a move between monitors would shift it; its floating state is never changed.
+        struct SAdopted {
+            PHLWINDOWREF        window;
+            uint64_t            stableID = 0;
+            PHLWORKSPACE        origin, hidden;
+            std::optional<CBox> box;
+        };
+
         struct SAgent {
             SP<Desktop::Rule::CWindowRule> rule;
+            std::map<pid_t, SProcess>      processes;
+            std::vector<SAdopted>          adopted;
             // The process whose exit stops the agent; 0 stops it after IDLE instead.
             pid_t           owner = 0;
             Time::steady_tp used;
@@ -3033,6 +3501,140 @@ namespace {
             return "special:agent-" + name;
         }
 
+        // The process's start time, or nullopt when it is gone.
+        std::optional<uint64_t> birthOf(pid_t pid) {
+            std::ifstream file(std::format("/proc/{}/stat", pid));
+            std::string   line;
+            if (!std::getline(file, line))
+                return std::nullopt;
+            // The command name, in parentheses, may hold spaces and parentheses: fields follow the last ')'. The first
+            // is the state (field 3), so the start time (field 22) is the 20th.
+            const auto CLOSE = line.rfind(')');
+            if (CLOSE == std::string::npos)
+                return std::nullopt;
+            std::istringstream fields(line.substr(CLOSE + 1));
+            std::string        field;
+            for (int i = 0; i < 20; ++i) {
+                if (!(fields >> field))
+                    return std::nullopt;
+            }
+            uint64_t birth = 0;
+            const auto [END, ERROR] = std::from_chars(field.data(), field.data() + field.size(), birth);
+            if (ERROR != std::errc() || END != field.data() + field.size())
+                return std::nullopt;
+            return birth;
+        }
+
+        // The agent a process's environment names by token, if any.
+        std::optional<std::string> taggedAs(pid_t pid) {
+            const std::string PREFIX = std::format("{}={}", Desktop::Rule::EXEC_RULE_ENV_NAME, token(""));
+            std::ifstream     file(std::format("/proc/{}/environ", pid), std::ios::binary);
+            for (std::string entry; std::getline(file, entry, '\0');) {
+                if (entry.starts_with(PREFIX))
+                    return entry.substr(PREFIX.size());
+            }
+            return std::nullopt;
+        }
+
+        // Whether the agent launched this process: `launch` registered it and it is the same process (the start time
+        // still matches, so a pid reused since is refused), or its environment carries the agent's token, which the
+        // app's children inherit. A scrubbed environment loses the token; the registered main process still counts.
+        bool owns(const std::string& name, pid_t pid) {
+            const auto IT = g_agents.find(name);
+            if (IT != g_agents.end()) {
+                const auto PROCESS = IT->second.processes.find(pid);
+                if (PROCESS != IT->second.processes.end()) {
+                    const auto BIRTH = birthOf(pid);
+                    return BIRTH && *BIRTH == PROCESS->second.birth;
+                }
+            }
+            return taggedAs(pid) == name;
+        }
+
+        // SIGTERM to a process only if it is still the one that was registered: the pidfd holds the process, so the
+        // start time read through it cannot go to a reused pid between the check and the signal.
+        void terminate(pid_t pid, uint64_t birth) {
+            const int FD = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+            if (FD < 0)
+                return;
+            const auto BIRTH = birthOf(pid);
+            if (BIRTH && *BIRTH == birth)
+                syscall(SYS_pidfd_send_signal, FD, SIGTERM, nullptr, 0);
+            close(FD);
+        }
+
+        // Whether the user's input is in the window: it has keyboard focus or the pointer, or the app does on another
+        // surface. Moving it would take that away.
+        bool userIn(const PHLWINDOW& window) {
+            const auto SURFACE = window->wlSurface() ? window->wlSurface()->resource() : nullptr;
+            const auto POINTER = g_pSeatManager->m_state.pointerFocus.lock();
+            return window == Desktop::focusState()->window() || userKeyboardIn(SURFACE) || (SURFACE && POINTER && POINTER->client() == SURFACE->client());
+        }
+
+        // The adoption record of a window in AGENT's list, if any.
+        SAdopted* adoption(SAgent& agent, const PHLWINDOW& window) {
+            const auto IT = std::ranges::find_if(agent.adopted, [&](const SAdopted& a) { return a.window.lock() == window && a.stableID == window->metadata().stableID(); });
+            return IT == agent.adopted.end() ? nullptr : &*IT;
+        }
+
+        // The name of the agent that has adopted the window, if any.
+        std::optional<std::string> adopter(const PHLWINDOW& window) {
+            for (auto& [name, agent] : g_agents) {
+                if (adoption(agent, window))
+                    return name;
+            }
+            return std::nullopt;
+        }
+
+        // Whether some agent launched the process, ours or another's.
+        bool launched(pid_t pid) {
+            return taggedAs(pid) || std::ranges::any_of(g_agents, [pid](const auto& entry) { return owns(entry.first, pid); });
+        }
+
+        // Moves the window to the workspace as Hyprland's `movetoworkspacesilent` does, which refocuses only a window
+        // that has focus; callers keep out the ones the user is in.
+        void relocate(const PHLWINDOW& window, const PHLWORKSPACE& workspace) {
+            // A handoff must not auto-join the user's existing group in the destination workspace.
+            auto& rules = window->grouping().*member(SGroupRules{});
+            struct SRestoreRules {
+                uint16_t& rules;
+                uint16_t before;
+                ~SRestoreRules() {
+                    if (rules == (before | Desktop::View::GROUP_DENY))
+                        rules = before;
+                }
+            } restore{rules, rules};
+            rules |= Desktop::View::GROUP_DENY;
+            g_pHyprRenderer->damageWindow(window);
+            Desktop::globalWindowController()->moveWindowToWorkspace(window, workspace);
+        }
+
+        // Ends an adoption. The window goes back where it came from only while it is still where `adopt` put it and the
+        // user is not in it; one the user moved is theirs as it is, and so is one they are in, which a return would take
+        // from them.
+        void giveBack(const SAdopted& adopted) {
+            const auto WINDOW = adopted.window.lock();
+            if (!WINDOW || !WINDOW->mapped() || WINDOW->m_workspace != adopted.hidden || userIn(WINDOW) || WINDOW->grouping().group())
+                return;
+            relocate(WINDOW, adopted.origin);
+            if (adopted.box && WINDOW->isFloating())
+                WINDOW->layoutTarget()->setPositionGlobal(*adopted.box);
+        }
+
+        void giveBackAll(SAgent& agent) {
+            for (const auto& adopted : agent.adopted)
+                giveBack(adopted);
+            agent.adopted.clear();
+        }
+
+        // Forgets the adoptions whose window has closed.
+        void dropClosed(SAgent& agent) {
+            std::erase_if(agent.adopted, [](const SAdopted& a) {
+                const auto WINDOW = a.window.lock();
+                return !WINDOW || !WINDOW->mapped();
+            });
+        }
+
         SP<Desktop::Rule::CWindowRule> makeRule(const std::string& name) {
             auto rule = Desktop::Rule::CWindowRule::buildFromExecString(
                 std::format("workspace {} silent;no_initial_focus 1;suppress_event activate activatefocus fullscreen maximize", workspace(name)));
@@ -3046,18 +3648,32 @@ namespace {
             return *rule;
         }
 
+        // The rule for one registered process: the agent's token pattern, which Hyprland's matcher replaces by this pid
+        // when the window's process has no token in its environment. It is not an exec rule, since Hyprland consumes those
+        // at the first window; it is dropped here when the process ends.
+        SP<Desktop::Rule::CWindowRule> makePidRule(const std::string& name, pid_t pid) {
+            auto rule = makeRule(name);
+            if (rule)
+                rule->registerMatch(Desktop::Rule::RULE_PROP_EXEC_PID, std::to_string(pid));
+            return rule;
+        }
+
         // Each process this user may read, with the agent its environment names by token, if any.
-        void eachTagged(const std::function<void(pid_t, const std::string&)>& fn) {
+        void eachTagged(const std::function<void(pid_t, const std::string&, uint64_t)>& fn) {
             const std::string PREFIX = std::format("{}={}", Desktop::Rule::EXEC_RULE_ENV_NAME, token(""));
             std::error_code   error;
             for (const auto& dir : std::filesystem::directory_iterator("/proc", error)) {
                 const auto PID = number(dir.path().filename().string());
                 if (!PID || *PID <= 1 || *PID == getpid())
                     continue;
+                const auto BIRTH = birthOf(static_cast<pid_t>(*PID));
+                if (!BIRTH)
+                    continue;
                 std::ifstream file(dir.path() / "environ", std::ios::binary);
                 for (std::string entry; std::getline(file, entry, '\0');) {
                     if (entry.starts_with(PREFIX)) {
-                        fn(static_cast<pid_t>(*PID), entry.substr(PREFIX.size()));
+                        if (birthOf(static_cast<pid_t>(*PID)) == BIRTH)
+                            fn(static_cast<pid_t>(*PID), entry.substr(PREFIX.size()), *BIRTH);
                         break;
                     }
                 }
@@ -3084,33 +3700,62 @@ namespace {
             if (IT == g_agents.end())
                 return;
             dropTimer(IT->second.stopping);
+            giveBackAll(IT->second);
             if (IT->second.rule)
                 Desktop::Rule::ruleEngine()->unregisterRule(IT->second.rule);
+            for (auto& [pid, process] : IT->second.processes) {
+                if (process.rule)
+                    Desktop::Rule::ruleEngine()->unregisterRule(process.rule);
+            }
             g_agents.erase(IT);
         }
 
-        // Asks each of the agent's windows to close, as the user closing it would, and sends SIGTERM to its processes
-        // left after GRACE. The rule stays until then, so a window opened meanwhile still lands out of view.
+        // Asks each window of a process the agent launched to close, as the user closing it would, and sends SIGTERM to
+        // those processes left after GRACE: the registered ones, if still the same process, and any whose environment
+        // carries the agent's token. A window of the user's on the agent's workspace is left alone. The rules stay until
+        // then, so a window opened meanwhile still lands out of view.
         void stop(const std::string& name) {
             auto& agent = g_agents.at(name);
             if (agent.stopping)
                 return;
-            const auto WORKSPACE = workspace(name);
+            // Adopted windows are the user's own: they go back, and are not among those closed below.
+            giveBackAll(agent);
             for (const auto& window : Desktop::windowState()->windows()) {
-                if (window->mapped() && window->m_workspace && window->m_workspace->addressableName() == WORKSPACE)
+                if (window->mapped() && owns(name, window->backend().pid()))
                     window->sendClose();
             }
             agent.stopping = makeShared<CEventLoopTimer>(
                 GRACE,
                 [name](SP<CEventLoopTimer>, void*) {
-                    eachTagged([&name](pid_t pid, const std::string& agent) {
+                    if (const auto IT = g_agents.find(name); IT != g_agents.end()) {
+                        for (const auto& [pid, process] : IT->second.processes)
+                            terminate(pid, process.birth);
+                    }
+                    eachTagged([&name](pid_t pid, const std::string& agent, uint64_t birth) {
                         if (agent == name)
-                            kill(pid, SIGTERM);
+                            terminate(pid, birth);
                     });
                     forget(name);
                 },
                 nullptr);
             g_pEventLoopManager->addTimer(agent.stopping);
+        }
+
+        // Drops the rule of each registered process that has ended or whose pid was reused, so a later process with that
+        // pid is not placed on the agent's workspace. While stopping, they stay for the SIGTERM check.
+        void dropEnded(SAgent& agent) {
+            if (agent.stopping)
+                return;
+            for (auto it = agent.processes.begin(); it != agent.processes.end();) {
+                const auto BIRTH = birthOf(it->first);
+                if (BIRTH && *BIRTH == it->second.birth) {
+                    ++it;
+                    continue;
+                }
+                if (it->second.rule)
+                    Desktop::Rule::ruleEngine()->unregisterRule(it->second.rule);
+                it = agent.processes.erase(it);
+            }
         }
 
         void reap(SP<CEventLoopTimer> self, void*) {
@@ -3123,13 +3768,18 @@ namespace {
             }
             for (const auto& name : due)
                 stop(name);
+            for (auto& [name, agent] : g_agents) {
+                dropEnded(agent);
+                dropClosed(agent);
+            }
             self->updateTimeout(CHECK);
         }
 
         // A reloaded plugin starts with no agents, while their apps run on: it takes them back from the apps' tokens,
         // so their next window still opens out of view. Their owners are not known again until they next register.
+        // Adopted windows are not taken back: shutdown returns them first, so none is left to recover.
         void init() {
-            eachTagged([](pid_t, const std::string& name) {
+            eachTagged([](pid_t, const std::string& name, uint64_t) {
                 if (agentcursor::validName(name) && !g_agents.contains(name))
                     ensure(name);
             });
@@ -3139,6 +3789,10 @@ namespace {
                 for (auto& [name, agent] : g_agents) {
                     if (agent.rule)
                         Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(agent.rule));
+                    for (auto& [pid, process] : agent.processes) {
+                        if (process.rule)
+                            Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(process.rule));
+                    }
                 }
             });
         }
@@ -3150,41 +3804,209 @@ namespace {
             g_reaper.reset();
             for (auto& [name, agent] : g_agents) {
                 dropTimer(agent.stopping);
+                giveBackAll(agent);
                 if (agent.rule)
                     Desktop::Rule::ruleEngine()->unregisterRule(agent.rule);
+                for (auto& [pid, process] : agent.processes) {
+                    if (process.rule)
+                        Desktop::Rule::ruleEngine()->unregisterRule(process.rule);
+                }
             }
             g_agents.clear();
         }
 
+        bool busy() {
+            return g_op || g_keyOp || g_gliding || !g_queue.empty();
+        }
+
+        // The window at ADDRESS, if it is mapped, and whether STABLE_ID is its own: an address Hyprland reused for another
+        // window does not carry it. Sets the refusal otherwise.
+        PHLWINDOW exactWindow(const std::string& addr, const std::string& id, std::optional<IPC::Socket1::SResponse>& refusal) {
+            const auto ADDRESS = address(addr);
+            uint64_t   stable  = 0;
+            const auto [END, ERROR] = std::from_chars(id.data(), id.data() + id.size(), stable, 16);
+            if (!ADDRESS || id.empty() || ERROR != std::errc() || END != id.data() + id.size()) {
+                refusal = refuse("usage: deskpilot agent <name> <adopt|release> <address> <stable id, hexadecimal>", "invalid");
+                return nullptr;
+            }
+            const auto WINDOW = Desktop::viewState()->query().selector(std::format("address:0x{:x}", *ADDRESS)).runWindow();
+            if (!WINDOW || !WINDOW->mapped()) {
+                refusal = refuse("no mapped window " + addr, "gone");
+                return nullptr;
+            }
+            if (WINDOW->metadata().stableID() != stable) {
+                refusal = refuse(std::format("{} is not the window with identity {}: the address was reused", describe(WINDOW), id), "stale");
+                return nullptr;
+            }
+            return WINDOW;
+        }
+
+        // `agent NAME adopt ADDRESS STABLE_ID`: moves one window of the user's, on a normal workspace of a native
+        // Wayland app, onto the agent's workspace without moving anything of theirs, so hidden actions reach it. Adopting
+        // it again is fine. Refused: a window the user is in, one of an XWayland app (hidden input cannot reach it), one
+        // on a special workspace, one that is another agent's, and a process an agent launched.
+        IPC::Socket1::SResponse adopt(const std::string& name, const std::string& addr, const std::string& id) {
+            if (busy())
+                return refuse("an action is running: adopt when it has finished", "busy");
+            if (const auto IT = g_agents.find(name); IT != g_agents.end() && IT->second.stopping)
+                return refuse(std::format("agent {} is stopping; try again in {} seconds", name, GRACE.count()), "busy");
+            std::optional<IPC::Socket1::SResponse> refusal;
+            const auto                             WINDOW = exactWindow(addr, id, refusal);
+            if (!WINDOW)
+                return *refusal;
+            const auto HIDDEN = [&](const auto& adopted) { return WINDOW->m_workspace == adopted.hidden; };
+            if (const auto IT = g_agents.find(name); IT != g_agents.end()) {
+                if (const auto ADOPTED = adoption(IT->second, WINDOW); ADOPTED && HIDDEN(*ADOPTED))
+                    return IPC::Socket1::SResponse(okReply());
+                std::erase_if(IT->second.adopted, [&](const SAdopted& a) { return a.window.lock() == WINDOW; }); // the user moved it
+            }
+            if (const auto OTHER = adopter(WINDOW))
+                return refuse(std::format("{} is adopted by agent {}", describe(WINDOW), *OTHER));
+            if (WINDOW->backend().isX11())
+                return refuse("an XWayland window cannot be reached while hidden, so it cannot be adopted");
+            if (WINDOW->grouping().group() || (WINDOW->m_state & Desktop::View::WINDOW_STATE_PINNED))
+                return refuse("a grouped or pinned window cannot be handed off independently");
+            if (!WINDOW->m_workspace || WINDOW->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL)
+                return refuse(std::format("{} is not on a regular workspace", describe(WINDOW)));
+            if (launched(WINDOW->backend().pid()))
+                return refuse(std::format("{} belongs to an app an agent launched", describe(WINDOW)));
+            if (userIn(WINDOW))
+                return refuse(std::format("the user's focus or pointer is in {}, and moving it would take them from there", describe(WINDOW)));
+            const auto TARGET = State::Workspace::resolver()->getWorkspaceTargetFromString(workspace(name));
+            auto       hidden = State::Workspace::state()->find(TARGET);
+            if (!hidden) {
+                const auto MONITOR = WINDOW->m_monitor.lock() ? WINDOW->m_monitor.lock() : Desktop::focusState()->monitor();
+                hidden             = MONITOR ? State::Workspace::state()->create(TARGET, MONITOR) : nullptr;
+            }
+            if (!hidden || !ensure(name))
+                return refuse("could not get the workspace of agent " + name);
+            g_agents[name].adopted.push_back(
+                {WINDOW, WINDOW->metadata().stableID(), WINDOW->m_workspace, hidden, WINDOW->isFloating() ? std::optional(WINDOW->layoutTarget()->position()) : std::nullopt});
+            relocate(WINDOW, hidden);
+            if (WINDOW->m_workspace != hidden) {
+                g_agents[name].adopted.pop_back();
+                return refuse("the compositor did not move the window to the agent's workspace");
+            }
+            return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"workspace":{}}})", jsonString(workspace(name))));
+        }
+
+        // `agent NAME release ADDRESS STABLE_ID`: returns an adopted window to the workspace it came from. A window the
+        // user has moved since is theirs and only forgotten; one they are in is refused, as returning it would move it.
+        IPC::Socket1::SResponse release(const std::string& name, const std::string& addr, const std::string& id) {
+            if (busy())
+                return refuse("an action is running: release when it has finished", "busy");
+            std::optional<IPC::Socket1::SResponse> refusal;
+            const auto                             WINDOW = exactWindow(addr, id, refusal);
+            if (!WINDOW)
+                return *refusal;
+            const auto IT      = g_agents.find(name);
+            const auto ADOPTED = IT == g_agents.end() ? nullptr : adoption(IT->second, WINDOW);
+            if (!ADOPTED)
+                return refuse(std::format("{} is not adopted by agent {}", describe(WINDOW), name), "gone");
+            if (WINDOW->m_workspace == ADOPTED->hidden && userIn(WINDOW))
+                return refuse(std::format("the user's focus or pointer is in {}, and returning it would take them from there", describe(WINDOW)));
+            giveBack(*ADOPTED);
+            std::erase_if(IT->second.adopted, [&](const SAdopted& a) { return a.window.lock() == WINDOW; });
+            return IPC::Socket1::SResponse(okReply());
+        }
+
+        // `agent NAME windows ADDRESS...`: which of those windows the agent owns: one a process it launched opened, or one
+        // it adopted and the user has not moved. Another agent's adopted window is not, whatever its process.
+        IPC::Socket1::SResponse ownedWindows(const std::string& name, const std::vector<std::string>& addrs) {
+            std::string owned;
+            for (const auto& addr : addrs) {
+                const auto ADDRESS = address(addr);
+                if (!ADDRESS)
+                    return refuse("usage: deskpilot agent <name> windows <address>...", "invalid");
+                const auto WINDOW = Desktop::viewState()->query().selector(std::format("address:0x{:x}", *ADDRESS)).runWindow();
+                if (!WINDOW || !WINDOW->mapped())
+                    continue;
+                const auto IT      = g_agents.find(name);
+                const auto ADOPTED = IT == g_agents.end() ? nullptr : adoption(IT->second, WINDOW);
+                const bool OWNED   = ADOPTED ? WINDOW->m_workspace == ADOPTED->hidden : !adopter(WINDOW) && owns(name, WINDOW->backend().pid());
+                if (OWNED)
+                    owned += (owned.empty() ? "" : ",") + jsonString(addr);
+            }
+            return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"owned":[{}]}})", owned));
+        }
+
         // `agent NAME [owner=PID]` registers NAME's rule if it has none and marks it in use; an owner, once given, is
-        // kept. `agent NAME stop` stops it. Both answer at once.
+        // kept. `agent NAME pid=PID birth=TICKS` also registers the main process `launch` is holding at its gate, by its
+        // start time (refused if PID no longer has it), so its windows are placed by pid when it scrubs the token from
+        // its environment. `agent NAME owns PID...` answers which of those processes the agent launched.
+        // `agent NAME adopt|release|windows ...` hands a window of the user's to the agent and back, and asks which windows it
+        // owns (see SAdopted). `agent NAME stop` stops it. All answer at once.
         IPC::Socket1::SResponse command(const std::vector<std::string>& args) {
-            constexpr auto USAGE = "usage: deskpilot agent <name> [owner=PID] | agent <name> stop";
-            if (args.size() < 3 || args.size() > 4)
+            constexpr auto USAGE = "usage: deskpilot agent <name> [owner=PID | pid=PID birth=TICKS | owns PID... | adopt ADDRESS ID | release ADDRESS ID | windows ADDRESS... | stop]";
+            if (args.size() < 3)
                 return refuse(USAGE);
             const std::string& NAME = args[2];
             if (!agentcursor::validName(NAME))
                 return refuse(std::format("bad agent name '{}': use up to {} letters, digits, '-', '_' or '.'", NAME, agentcursor::NAME_MAX));
             const auto IT = g_agents.find(NAME);
-            // An agent the plugin no longer knows, as after it was reloaded, is stopped all the same.
             if (args.size() == 4 && args[3] == "stop") {
+                // An agent the plugin no longer knows, as after it was reloaded, is stopped all the same.
                 g_agents[NAME];
                 stop(NAME);
                 return IPC::Socket1::SResponse(okReply());
             }
-            pid_t owner = 0;
-            if (args.size() == 4) {
+            if (args.size() > 3 && args[3] == "owns") {
+                std::string owned;
+                for (size_t i = 4; i < args.size(); ++i) {
+                    const auto PID = number(args[i]);
+                    if (!PID || *PID <= 1)
+                        return refuse(USAGE);
+                    if (owns(NAME, static_cast<pid_t>(*PID)))
+                        owned += (owned.empty() ? "" : ",") + args[i];
+                }
+                return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"owned":[{}]}})", owned));
+            }
+            if (args.size() == 6 && args[3] == "adopt")
+                return adopt(NAME, args[4], args[5]);
+            if (args.size() == 6 && args[3] == "release")
+                return release(NAME, args[4], args[5]);
+            if (args.size() > 4 && args[3] == "windows")
+                return ownedWindows(NAME, {args.begin() + 4, args.end()});
+            pid_t    owner = 0;
+            pid_t    registered = 0;
+            uint64_t birth      = 0;
+            if (args.size() == 5 && args[3].starts_with("pid=") && args[4].starts_with("birth=")) {
+                const auto PID = number(args[3].substr(4)), BIRTH = number(args[4].substr(6));
+                if (!PID || *PID <= 1 || !BIRTH || *BIRTH < 0)
+                    return refuse(USAGE);
+                registered = static_cast<pid_t>(*PID);
+                birth      = static_cast<uint64_t>(*BIRTH);
+            } else if (args.size() == 4) {
                 const auto PID = args[3].starts_with("owner=") ? number(args[3].substr(6)) : std::nullopt;
                 if (!PID || *PID <= 1)
                     return refuse(USAGE);
                 owner = static_cast<pid_t>(*PID);
+            } else if (args.size() != 3) {
+                return refuse(USAGE);
             }
             if (IT != g_agents.end() && IT->second.stopping)
                 return refuse(std::format("agent {} is stopping; try again in {} seconds", NAME, GRACE.count()), "busy");
+            if (registered) {
+                const auto NOW = birthOf(registered);
+                if (!NOW || *NOW != birth)
+                    return refuse(std::format("process {} is not the one launched: it ended or its pid was reused", registered), "gone");
+            }
             if (!ensure(NAME))
                 return refuse("could not build the window rule for agent " + NAME);
             if (owner)
                 g_agents[NAME].owner = owner;
+            if (registered) {
+                auto& process = g_agents[NAME].processes[registered];
+                if (process.rule)
+                    Desktop::Rule::ruleEngine()->unregisterRule(process.rule);
+                process.birth = birth;
+                process.rule  = makePidRule(NAME, registered);
+                if (!process.rule) {
+                    g_agents[NAME].processes.erase(registered);
+                    return refuse("could not build the window rule for process " + std::to_string(registered));
+                }
+                Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(process.rule));
+            }
             return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"workspace":{},"token":{}}})", jsonString(workspace(NAME)), jsonString(token(NAME))));
         }
     }
@@ -3306,7 +4128,7 @@ namespace {
         if (VERB == "popups")
             return popupsCommand(args);
         return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>... | "
-                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|stop] | "
+                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|pid=PID birth=TICKS|owns PID...|adopt ADDRESS ID|release ADDRESS ID|windows ADDRESS...|stop] | "
                       "end <ticket> | wait <ticket> | status; a key event is +code, -code, pHEX, rHEX or tHEX, and a path step sX,Y or s (first), mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
 }
@@ -3367,10 +4189,17 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     agentcursor::init();
     startAgentSeat();
+    configureAgentKeymap(); // when a keyboard is already there; each agent stroke refreshes it
+    g_dataSelectionHook = hook(handle, "CWlDataDevice", "setSetSelection", reinterpret_cast<void*>(&hkSelectionHandler<CWlDataDevice, g_dataSelectionHook>));
+    g_primarySelectionHook = hook(handle, "CZwpPrimarySelectionDeviceV1", "setSetSelection", reinterpret_cast<void*>(&hkSelectionHandler<CZwpPrimarySelectionDeviceV1, g_primarySelectionHook>));
+    selectionGuards(true);
     agents::init();
     g_pumpTimer = makeShared<CEventLoopTimer>(std::nullopt, pumpTick, nullptr);
     g_pEventLoopManager->addTimer(g_pumpTimer);
 
+    g_popupLogger = wl_display_add_protocol_logger(g_pCompositor->m_wlDisplay, popupRequest, nullptr);
+    if (!g_popupLogger)
+        throw std::runtime_error("deskpilot: could not observe popup grab requests");
     HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{.name = "deskpilot", .match = IPC::Socket1::COMMAND_MATCH_PREFIX, .handler = onCommand});
     return {"deskpilot", "Clicks, scrolls and keys for agents that leave the user's pointer and focus in place", "cjber", VERSION};
 }
@@ -3399,6 +4228,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
     }
     g_tickets.clear();
     restorePaste();
+    if (g_popupLogger)
+        wl_protocol_logger_destroy(std::exchange(g_popupLogger, nullptr));
+    g_popupGrab.reset();
+    selectionGuards(false);
     stopAgentSeat();
     agents::shutdown();
     agentcursor::shutdown();

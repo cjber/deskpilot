@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 import pytest
 from PIL import Image
 
-from deskpilot import a11y, clipboard, keys, screen
+from deskpilot import a11y, clipboard, keys, screen, session
 from deskpilot import desk as desk_module
 from deskpilot import plugin as plugin_module
 from deskpilot.desk import Desk, NotVisible, error_code
@@ -174,7 +174,6 @@ def test_a_capture_that_gets_no_frame_is_a_timeout(tmp_path, monkeypatch):
 
 def test_a_hidden_shot_of_a_window_outside_its_monitor_is_refused_before_grim(tmp_path, monkeypatch):
     desk, fake, _, _ = make_desk(tmp_path, monkeypatch)
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
     shot = []
     monkeypatch.setattr(screen, "capture", lambda win, out, max_width: shot.append(win.address))
     fake.clients = [AGENT_CLIENT]
@@ -248,10 +247,27 @@ class FakePlugin:
     def __init__(self):
         self.calls = []
         self.mapped: list[dict] = []  # the window's popups
+        self.owned_addresses: set[str] | None = None
+        self.claim_error: Exception | None = None
 
     def register(self, owner=None):
         self.calls.append(("register", owner))
         return {"ok": True, "workspace": "special:agent-tester", "token": "deskpilot-agent-tester"}
+
+    def claim(self, pid, birth):
+        self.calls.append(("claim", pid, birth))
+        if self.claim_error:
+            raise self.claim_error
+        return {"ok": True}
+
+    def owned_windows(self, addresses):
+        return set(addresses) if self.owned_addresses is None else set(addresses) & self.owned_addresses
+
+    def adopt(self, address, stable_id):
+        self.calls.append(("adopt", address, stable_id))
+
+    def release(self, address, stable_id):
+        self.calls.append(("release", address, stable_id))
 
     def stop(self):
         self.calls.append(("stop",))
@@ -288,7 +304,18 @@ def remember_shot(client, scale):
     folder = screen.shots_dir()
     folder.mkdir(parents=True, exist_ok=True)
     w, h = client["size"]
-    shot = screen.Shot("abc-1", "", client["address"], round(w * scale), round(h * scale), scale, w, h)
+    shot = screen.Shot(
+        "abc-1",
+        "",
+        client["address"],
+        round(w * scale),
+        round(h * scale),
+        scale,
+        w,
+        h,
+        pid=client["pid"],
+        cls=client["class"],
+    )
     (folder / "abc-1.json").write_text(json.dumps(asdict(shot)))
 
 
@@ -311,7 +338,6 @@ def launched_desk(tmp_path, monkeypatch):
     """A desk whose one window the agent launched, for hidden actions."""
     desk, fake, inp, plugin = make_desk(tmp_path, monkeypatch)
     fake.clients = [AGENT_CLIENT]
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
     return desk, fake, inp, plugin
 
 
@@ -320,7 +346,7 @@ def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkey
     # A window the user moved onto the agent's workspace has no launch token.
     moved = {**CLIENT, "address": "0x123", "pid": 8, "workspace": {"name": "special:agent-tester"}}
     fake.clients += [AGENT_CLIENT, moved]
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: pid == 7 and token == "deskpilot-agent-tester")
+    plugin.owned_addresses = {"0xdef"}
     with pytest.raises(WindowNotFound, match="deskpilot launch"):
         desk.click("0x123", 100, 50, hidden=True)
     plugin.calls.clear()
@@ -337,30 +363,176 @@ def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkey
         desk.click("0xdef", 100, 50, hidden=True, take_focus=True)
 
 
-def test_launch_tags_the_app_for_the_agent_s_workspace_and_returns_its_window(tmp_path, monkeypatch):
+class Gate:
+    """What a launch's gate shell was started with and what reached its pipe, in order."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.made: list[FakePopen] = []
+        self.events: list = []
+        self.on_start = lambda: None
+
+
+GATE = Gate()
+
+
+class FakePopen:
+    def __init__(self, command, env, **kwargs):
+        self.command, self.env, self.kwargs = command, env, kwargs
+        self.pid = 5150
+        self.stdin = FakeGate()
+        self.ended = False
+        GATE.made.append(self)
+        GATE.on_start()
+
+    def poll(self):
+        return 1 if self.ended else None
+
+    def terminate(self):
+        GATE.events.append("terminate")
+        self.ended = True
+
+    def wait(self):
+        GATE.events.append("wait")
+
+
+class FakeGate:
+    def write(self, data):
+        GATE.events.append(("release", data))
+
+    def close(self):
+        GATE.events.append("close")
+
+
+def gated_launch(tmp_path, monkeypatch, birth=987654):
     desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    GATE.reset()
+    monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "the-terminal-s")
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(desk_module, "process_birth", lambda pid: birth if pid == 5150 else None)
+    monkeypatch.setattr(desk_module.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
+    # The plugin's claim and the release of the gate are one ordered sequence.
+    plugin_claim = plugin.claim
+    plugin.claim = lambda pid, b: GATE.events.append(("claim", pid, b)) or plugin_claim(pid, b)
+    return desk, fake, plugin
+
+
+def test_launch_holds_the_app_at_a_gate_until_the_plugin_has_its_pid_and_birth(tmp_path, monkeypatch):
+    desk, fake, plugin = gated_launch(tmp_path, monkeypatch)
     desk.owner = 4242
     fake.clients.append({**AGENT_CLIENT, "stableId": "1"})
-    monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "the-terminal-s")
-    started = []
-
-    class FakePopen:
-        def __init__(self, command, env, **kwargs):
-            started.append((command, env, kwargs))
-            # Hyprland gives the new window the address of one closed before, with a new stable id.
-            fake.clients[:] = [CLIENT, {**AGENT_CLIENT, "stableId": "2"}]
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(subprocess, "Popen", FakePopen)
-    assert desk.launch(["gnome-calculator"]).address == "0xdef"
-    ((command, env, kwargs),) = started
-    assert command == ["gnome-calculator"] and kwargs["start_new_session"]
-    assert env["HL_EXEC_RULE_TOKEN"] == "deskpilot-agent-tester" and "HL_INITIAL_WORKSPACE_TOKEN" not in env
-    assert plugin.calls == [("register", 4242)]
+    # Hyprland gives the new window the address of one closed before, with a new stable id.
+    GATE.on_start = lambda: fake.clients.__setitem__(slice(None), [CLIENT, {**AGENT_CLIENT, "stableId": "2"}])
+    assert desk.launch(["gnome-calculator", "--arg"]).address == "0xdef"
+    (gate,) = GATE.made
+    assert gate.command == ["sh", "-c", desk_module.LAUNCH_GATE, "deskpilot-launch", "gnome-calculator", "--arg"]
+    assert gate.kwargs["start_new_session"] and gate.kwargs["stdin"] == subprocess.PIPE
+    assert gate.env["HL_EXEC_RULE_TOKEN"] == "deskpilot-agent-tester" and "HL_INITIAL_WORKSPACE_TOKEN" not in gate.env
+    # The plugin has the process before the line that lets it become the app, and the pipe closes after the line.
+    assert GATE.events == [("claim", 5150, 987654), ("release", b"\n"), "close"]
+    assert plugin.calls == [("register", 4242), ("claim", 5150, 987654)]
     desk.stop()
     assert plugin.calls[-1] == ("stop",)
+
+
+def test_a_failed_registration_ends_the_waiting_app_without_releasing_it(tmp_path, monkeypatch):
+    desk, _, plugin = gated_launch(tmp_path, monkeypatch)
+    plugin.claim_error = PluginError("process 5150 is not the one launched", "gone")
+    with pytest.raises(PluginError, match="not the one launched"):
+        desk.launch(["gnome-calculator"])
+    assert GATE.events == [("claim", 5150, 987654), "terminate", "wait"], "the app was never released"
+
+
+def test_a_process_that_ended_before_its_birth_was_read_is_not_released(tmp_path, monkeypatch):
+    desk, _, plugin = gated_launch(tmp_path, monkeypatch, birth=None)
+    with pytest.raises(RuntimeError, match="before it could be registered"):
+        desk.launch(["gnome-calculator"])
+    assert GATE.events == ["terminate", "wait"] and not any(c[0] == "claim" for c in plugin.calls)
+
+
+def test_an_app_the_system_cannot_find_is_refused_before_anything_starts(tmp_path, monkeypatch):
+    desk, _, _ = gated_launch(tmp_path, monkeypatch)
+    monkeypatch.setattr(desk_module.shutil, "which", lambda name, path=None: None)
+    with pytest.raises(ValueError, match="cannot start nope"):
+        desk.launch(["nope"])
+    assert GATE.made == []
+
+
+def test_process_birth_is_the_start_time_even_with_parentheses_in_the_name(tmp_path, monkeypatch):
+    fields = ["S", *["0"] * 18, "424242", "0"]  # state is field 3, so the start time is the 20th after the name
+    stat = tmp_path / "stat"
+    stat.write_text(f"5150 (a b) c) {' '.join(fields)}\n")
+    real = pathlib.Path.read_text
+    monkeypatch.setattr(
+        pathlib.Path,
+        "read_text",
+        lambda self, *a, **k: real(stat) if self == pathlib.Path("/proc/5150/stat") else real(self, *a, **k),
+    )
+    assert desk_module.process_birth(5150) == 424242
+    assert desk_module.process_birth(2**22 + 1) is None
+
+
+def test_plugin_claims_and_asks_which_processes_are_owned():
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        return '{"ok":true,"owned":[7]}' if "owns" in args else '{"ok":true}'
+
+    plugin = Plugin(run, agent="tester")
+    plugin.claim(5150, 987654)
+    assert plugin.owned([7, 8]) == {7} and plugin.owned([]) == set()
+    assert calls == [
+        ["deskpilot", "agent", "tester", "pid=5150", "birth=987654"],
+        ["deskpilot", "agent", "tester", "owns", "7", "8"],
+    ]
+
+
+def test_hidden_ownership_is_per_window_even_when_the_browser_process_is_shared(tmp_path, monkeypatch):
+    desk, fake, _, plugin = launched_desk(tmp_path, monkeypatch)
+    fake.clients.append({**AGENT_CLIENT, "address": "0x123"})
+    plugin.owned_addresses = {"0xdef"}
+    assert desk._target("0xdef", False, True).pid == fake.clients[1]["pid"]
+    with pytest.raises(WindowNotFound, match="deskpilot adopt"):
+        desk._target("0x123", False, True)
+
+
+@pytest.mark.parametrize("method", ["adopt", "release"])
+def test_handoff_requires_exact_address_and_stable_window_identity(tmp_path, monkeypatch, method):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    handoff = getattr(desk, method)
+    with pytest.raises(ValueError, match="exact window address"):
+        handoff("Chrome")
+    with pytest.raises(PluginError, match="stable window identity") as error:
+        handoff("0xabc")
+    assert error.value.code == "unavailable"
+    assert not plugin.calls
+    fake.clients[0] = {**fake.clients[0], "stableId": "127"}
+    assert handoff("0xabc").address == "0xabc"
+    assert (method, "0xabc", "127") in plugin.calls
+
+
+def test_handoff_keeps_compositor_identity_refusals(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients[0] = {**fake.clients[0], "stableId": "127"}
+
+    def replaced(address, stable_id):
+        raise PluginError("window identity changed before adoption", "stale")
+
+    monkeypatch.setattr(plugin, "adopt", replaced)
+    with pytest.raises(PluginError) as error:
+        desk.adopt("0xabc")
+    assert error_code(error.value) == "stale"
+
+
+def test_handoff_never_resolves_a_stale_address_as_title_text(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients[0] = {**fake.clients[0], "title": "terminal showing 0xdead", "stableId": "127"}
+    with pytest.raises(WindowNotFound, match="exact address"):
+        desk.adopt("0xdead")
+    assert not plugin.calls
 
 
 def test_cursor_off_sends_plain_paths(tmp_path, monkeypatch):
@@ -431,7 +603,6 @@ def test_plugin_puts_the_key_mode_after_the_window():
 def test_hidden_keys_name_the_mode_and_never_focus(tmp_path, monkeypatch):
     desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
     fake.clients.append(AGENT_CLIENT)
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
     desk.key("Return", "0xdef", hidden=True)
     desk.type("x", "0xdef", hidden=True)
     desk.paste("hi", "0xdef", hidden=True)
@@ -977,3 +1148,153 @@ def test_the_mcp_server_reports_the_package_version():
     from deskpilot import mcp_server
 
     assert mcp_server.mcp.version == version("deskpilot") != ""
+
+
+def test_capture_uses_the_targets_compositor(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-user")
+    envs = []
+
+    def run(cmd, **kwargs):
+        envs.append(kwargs["env"])
+        Image.new("RGB", (100, 50)).save(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(screen.subprocess, "run", run)
+    screen.capture(replace(win(w=100, h=50), wayland="wayland-nested", instance="nested"))
+    assert envs[0]["WAYLAND_DISPLAY"] == "wayland-nested"
+
+
+@pytest.mark.parametrize("changed", [{"pid": 99}, {"cls": "other"}, {"stable_id": "new"}, {"instance": "other"}])
+def test_shot_refuses_reused_addresses(tmp_path, monkeypatch, changed):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake_grim(monkeypatch, (100, 50))
+    window = win(w=100, h=50)
+    shot = screen.capture(window)
+    with pytest.raises(screen.StaleShot, match="has changed"):
+        shot.check(replace(window, **changed))
+    shot.check(replace(window, title="A title changed by navigation"))
+
+
+def test_keys_and_explicit_scale_refuse_reused_address(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients[0] = {**CLIENT, "pid": 999}
+    for action in (
+        lambda: desk.key("Return", "battle"),
+        lambda: desk.type("text", "battle"),
+        lambda: desk.paste("text", "battle"),
+        lambda: desk.click("battle", 1, 1, scale=1),
+    ):
+        with pytest.raises(screen.StaleShot, match="has changed"):
+            action()
+    assert plugin.calls == []
+
+
+def test_isolated_paste_uses_only_private_xwayland_clipboard(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "private")
+    monkeypatch.setenv("DESKPILOT_ISOLATED", "private")
+    monkeypatch.setattr(session, "verify_current", lambda: "private")
+    written = []
+    monkeypatch.setattr(clipboard, "write", written.append)
+    desk.paste("private text", "0xabc", hidden=True)
+    assert written == ["private text"]
+    assert plugin.calls == [("keys", "0xabc", keys.chord_words("ctrl+v"), {"mode": "plain"})]
+
+
+def test_isolation_marker_cannot_enable_private_clipboard_on_another_compositor(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "user")
+    monkeypatch.setenv("DESKPILOT_ISOLATED", "private")
+    monkeypatch.setattr(clipboard, "write", lambda text: pytest.fail("user clipboard changed"))
+    with pytest.raises(HyprctlError):
+        desk.paste("text", "0xabc")
+    assert plugin.calls == []
+
+
+@pytest.mark.parametrize("lua", [True, False])
+def test_isolated_launch_forwards_private_bus_and_profile_without_parent_tokens(tmp_path, monkeypatch, lua):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.lua = lua
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "private")
+    monkeypatch.setenv("DESKPILOT_ISOLATED", "private")
+    monkeypatch.setattr(session, "verify_current", lambda: "private")
+    monkeypatch.setenv("AT_SPI_BUS_ADDRESS", "unix:path=/private/a11y")
+    monkeypatch.setenv("CHROME_CONFIG_HOME", "/private/config")
+    monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "user-token")
+    working = tmp_path / "working directory 'quoted'"
+    working.mkdir()
+    (working / "probe.py").write_text("from pathlib import Path; Path('seen').write_text(str(Path.cwd()))")
+    monkeypatch.chdir(working)
+    original = desk.hypr._dispatch
+
+    def opened(*args):
+        original(*args)
+        fake.clients.append({**AGENT_CLIENT, "stableId": "new"})
+
+    monkeypatch.setattr(desk.hypr, "_dispatch", opened)
+    assert desk.launch(["python3", "probe.py"]).address == AGENT_CLIENT["address"]
+    command = next(c[-1] for c in reversed(fake.calls) if c[0] == "dispatch")
+    assert "AT_SPI_BUS_ADDRESS=unix:path=/private/a11y" in command
+    assert "CHROME_CONFIG_HOME=/private/config" in command
+    assert "user-token" not in command
+    shell_command = json.loads(command.removeprefix("hl.dsp.exec_cmd(").removesuffix(")")) if lua else command
+    subprocess.run(shell_command, shell=True, cwd=tmp_path, check=True)
+    assert (working / "seen").read_text() == str(working)
+    assert plugin.calls == []
+
+
+def test_latest_shot_is_scoped_to_compositor(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    window = replace(win(), stable_id="same", instance="first")
+    fake_grim(monkeypatch, (window.width, window.height))
+    first = screen.capture(window)
+    other = replace(first, id="1-newer", instance="second")
+    (screen.shots_dir() / f"{other.id}.json").write_text(json.dumps(asdict(other)))
+    assert screen.latest(window.address, instance="first") == first
+    assert screen.latest(window.address, instance="second") == other
+    assert screen.latest(window.address, instance="third") is None
+
+
+@pytest.mark.parametrize("hidden,expected", [(False, "agent"), (True, "agent-hidden")])
+def test_independent_keyboard_is_explicit_and_preserves_hidden_ownership(tmp_path, monkeypatch, hidden, expected):
+    desk, fake, _, plugin = launched_desk(tmp_path, monkeypatch)
+    if not hidden:
+        fake.special = "special:agent-tester"
+    desk.key("ctrl+a", "0xdef", hidden=hidden, agent_keyboard=True)
+    desk.type("Text()", "0xdef", hidden=hidden, agent_keyboard=True)
+    assert [call[-1]["mode"] for call in plugin.calls if call[0] == "keys"] == [expected, expected]
+    with pytest.raises(WindowNotFound):
+        desk.type("Text", "user-window", hidden=True, agent_keyboard=True)
+
+
+def test_independent_keyboard_requires_an_explicit_target(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="named window"):
+        desk.key("a", agent_keyboard=True)
+    with pytest.raises(ValueError, match="named window"):
+        desk.type("a", agent_keyboard=True)
+    assert plugin.calls == []
+
+
+@pytest.mark.parametrize("command,value", [("key", "ctrl+a"), ("type", "Text()")])
+def test_cli_exposes_independent_keyboard(command, value):
+    from deskpilot.cli import build_parser
+
+    args = build_parser().parse_args([command, value, "--window", "0x1", "--agent-keyboard"])
+    assert args.agent_keyboard is True
+
+
+def test_window_snapshot_pins_one_compositor_across_queries(monkeypatch):
+    from deskpilot import hypr
+
+    selected = []
+    monkeypatch.setattr(hypr, "current_instance", lambda: "chosen")
+
+    def run(args, *, instance=None):
+        selected.append(instance)
+        return json.dumps([{"instance": "chosen", "wl_socket": "wayland-chosen"}]) if args[-1] == "instances" else "[]"
+
+    monkeypatch.setattr(hypr, "run_hyprctl", run)
+    assert hypr.Hyprland(run).windows() == []
+    assert selected == ["chosen"] * 4

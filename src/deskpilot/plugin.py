@@ -221,6 +221,33 @@ class Plugin:
         the token `launch` puts in the app's environment."""
         return self._call("agent", self._named(), *([f"owner={owner}"] if owner else []))
 
+    def claim(self, pid: int, birth: int) -> dict:
+        """Register the main process of a launch held at its gate, so its windows open on the hidden workspace even if
+        the app scrubs the launch token from its environment. `birth` is its Linux start time (`process_birth`), which
+        tells it from a later process reusing the pid; the plugin refuses with code `gone` if `pid` no longer has it."""
+        return self._call("agent", self._named(), f"pid={pid}", f"birth={birth}")
+
+    def owned(self, pids: list[int]) -> set[int]:
+        """Which of these processes the agent launched: a claimed one still the same process, or one whose environment
+        carries the agent's token (an app's children inherit it)."""
+        if not pids:
+            return set()
+        return set(self._call("agent", self._named(), "owns", *map(str, pids))["owned"])
+
+    def owned_windows(self, addresses: list[str]) -> set[str]:
+        """Launched windows and individually adopted windows, without claiming their shared process."""
+        if not addresses:
+            return set()
+        return set(self._call("agent", self._named(), "windows", *addresses)["owned"])
+
+    def adopt(self, address: str, stable_id: str) -> None:
+        """Hand one exact window to this agent, retaining its original workspace for release."""
+        self._call("agent", self._named(), "adopt", address, stable_id)
+
+    def release(self, address: str, stable_id: str) -> None:
+        """Return an adopted window without closing its client or its other windows."""
+        self._call("agent", self._named(), "release", address, stable_id)
+
     def stop(self) -> None:
         """Close this agent's windows, and end its apps' processes left five seconds later."""
         self._call("agent", self._named(), "stop")

@@ -21,12 +21,18 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    focuses it and moves the user's view, so ask the user before `--show`.
    To work out of the user's sight, set `DESKPILOT_AGENT` to a name and start your own copy of the app with
    `deskpilot launch CMD...`: it and every window it opens later stay on your hidden workspace, and `--hidden` acts
-   on them (only on them, never the user's windows) on `shot`, `click`, `scroll`, `drag`, `hover`, `elements`, `key`,
+   on them, or windows explicitly handed to you with `adopt ADDRESS`, on `shot`, `click`, `scroll`, `drag`, `hover`,
+   `elements`, `key`,
    `type`, `paste` and `wait-for --changed`. An XWayland window is refused hidden. Hidden keys need `--window` and
    are refused while the user's keyboard focus is in that window's app. A hidden `shot`, `hover` or
    `wait-for --changed` of a window scrolled outside its monitor's area is refused, since Hyprland sends no frame of
    it. `deskpilot stop` closes your apps when you are done; `deskpilot show` lets the user see them. For web pages
    and browsers use fastbrowse instead.
+   For an existing native app, `deskpilot adopt ADDRESS` hands only the exact window from `windows` to your agent.
+   It refuses XWayland, grouped or pinned windows, a client receiving the user's input, or another agent's window. Never infer a forwarded
+   launch's window from its title or timing. `deskpilot release ADDRESS`, stop and plugin unload return adopted
+   windows to their original workspace without closing their shared process. A user-moved or regrouped window stays where
+   the user put it. Adoption is unavailable inside `--session`.
 3. Run `deskpilot shot WINDOW`, read the image at the `path` it prints, and choose a point in that image. Note its
    `shot` id.
 4. Act with that point as given, passing the id: `deskpilot click WINDOW X Y --shot ID` (`--button right`,
@@ -57,13 +63,27 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
 
 Done when a fresh `shot` shows the state the user asked for.
 
+## Isolated desktops
+
+For an app that needs its own X server or clipboard, set `DESKPILOT_AGENT=NAME` and use
+`deskpilot --session launch CMD...`. Put `--session` before every later command for that desktop, including
+`shot`, `key`, `elements` and `stop`. Its compositor, clipboard, accessibility bus and application profiles are
+separate from the user's desktop. `--hidden` may focus a window inside it without changing the user's view.
+Use a stable agent name to reuse its persistent profile. Stop it with `deskpilot --session stop` when done.
+For browsers, prefer fastbrowse. A new isolated profile does not contain the user's signed-in browser sessions.
+
+For native GTK 4 apps, `key` and `type` support `--agent-keyboard` (`agent_keyboard` over MCP). This uses the
+independent seat's keyboard and the active keymap, including while the user's keyboard focus is in the same app.
+It requires a named window and a client that bound the keyboard. Confirm the result: Qt can bind it and discard
+the events. Use the regular route for Qt, Chromium, XWayland and paste.
+
 ## Chaining known steps
 
 Use `deskpilot batch WINDOW [FILE] --final-shot` or MCP `batch` to run 1 to 32 known actions in one request.
 The CLI reads a JSON array from the file or stdin. For example, after inspecting the focused text field in
 that window, `[{"action":"key","combo":"ctrl+a"},{"action":"type","text":"Hello"}]` replaces its contents.
 Supported steps are `click`, `move`, `scroll`, `drag`, `key`, `type` and `paste`, with element and shot IDs
-on the matching pointer steps. Pass `--hidden` at the batch level for your launched window; hidden `move`
+on the matching pointer steps. Pass `--hidden` at the batch level for your launched or adopted window; hidden `move`
 is refused. The MCP fields are `window`, `actions`, `hidden`, `final_shot` and `max_width`.
 
 The batch validates all step shapes before acting, pins one window, and checks live targets on each step.
@@ -93,7 +113,7 @@ Each error starts with a code: `deskpilot: CODE: message`, or in MCP the result'
 
 - "is not on screen": the window is on a hidden workspace or scrolled off. Ask the user before passing `--show`,
   or `deskpilot launch` your own copy of the app and act on it with `--hidden`.
-- `not_found` with `--hidden`: hidden acts only on apps you started with `deskpilot launch`.
+- `not_found` with `--hidden`: hidden acts only on windows you launched or explicitly adopted.
 - "take a new shot": the window changed size since the shot. Shoot again and pick the point anew.
 - A plugin build failure names the missing headers or compiler.
 - A stale `HYPRLAND_INSTANCE_SIGNATURE` is handled: deskpilot finds the live Hyprland, and stops with a list when
@@ -110,3 +130,7 @@ Each error starts with a code: `deskpilot: CODE: message`, or in MCP the result'
   again without invalidating the ids you hold, use `elements --peek`.
 - `offscreen`: the element is not showing, as in a collapsed menu or a scrolled-away row.
 - `no_tree`: the app exposes no accessibility tree. Use a shot and points instead.
+
+For a popup-grab regression in this checkout, run `scripts/popup_calibration.py --output /path/to/results.json`
+with an explicit parent `HYPRLAND_INSTANCE_SIGNATURE`. It uses and cleans up its own private desktop. The optional
+`--plugin /path/to/build.so` tests a baseline build there without loading it into the user's compositor.

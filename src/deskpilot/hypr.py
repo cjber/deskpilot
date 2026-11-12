@@ -55,11 +55,15 @@ def pick_instance(signature: str | None, hypr_dir: Path, alive: Callable[[Path],
 def current_instance() -> str:
     """Chosen per call, not once: a long-lived MCP server outlives a Hyprland restart. It costs one connect."""
     runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if os.environ.get("DESKPILOT_ISOLATED"):
+        from .session import verify_current
+
+        return verify_current()
     return pick_instance(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"), Path(runtime) / "hypr")
 
 
-def run_hyprctl(args: list[str]) -> str:
-    cmd = ["hyprctl", "-i", current_instance(), *args]
+def run_hyprctl(args: list[str], *, instance: str | None = None) -> str:
+    cmd = ["hyprctl", "-i", instance or current_instance(), *args]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
     if result.returncode != 0:
         detail = (result.stderr.strip() or result.stdout.strip() or "no output").splitlines()[0]
@@ -81,6 +85,8 @@ class Window:
     xwayland: bool
     pid: int
     focused: bool = False
+    instance: str = ""
+    wayland: str = ""
     # The ext-foreign-toplevel identifier, which `grim -T` captures by. Empty on a Hyprland too old to report it.
     stable_id: str = ""
     # Some of the window lies on a monitor showing its workspace. False for a hidden workspace and for a column a
@@ -154,10 +160,26 @@ class Hyprland:
         return json.loads(out) if out.strip() else None
 
     def windows(self) -> list[Window]:
-        active = self._json("activewindow") or {}
-        monitors = [Monitor.from_json(m) for m in self._json("monitors") or [] if not m.get("disabled")]
+        instance, wayland = "", ""
+        real = self._run is run_hyprctl
+        if real:
+            instance = current_instance()
+
+        def query(name: str):
+            if not real:
+                return self._json(name)
+            out = run_hyprctl(["-j", name], instance=instance)
+            return json.loads(out) if out.strip() else None
+
+        if real:
+            listed = query("instances") or []
+            wayland = next((i["wl_socket"] for i in listed if i["instance"] == instance), "")
+            if not wayland:
+                raise HyprctlError(f"no Wayland socket for Hyprland {instance}")
+        active = query("activewindow") or {}
+        monitors = [Monitor.from_json(m) for m in query("monitors") or [] if not m.get("disabled")]
         found = []
-        for c in self._json("clients") or []:
+        for c in query("clients") or []:
             if not c.get("mapped", True) or c.get("hidden"):
                 continue
             x, y = c["at"]
@@ -179,6 +201,8 @@ class Hyprland:
                     pid=c.get("pid", 0),
                     focused=c["address"] == active.get("address"),
                     stable_id=str(c.get("stableId") or ""),
+                    instance=instance,
+                    wayland=wayland,
                     visible=any(m.shows(workspace, x, y, w, h) for m in monitors),
                     on_monitor=any(m.id == monitor and m.overlaps(x, y, w, h) for m in monitors),
                 )

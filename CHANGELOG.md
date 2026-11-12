@@ -7,6 +7,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-12
+
+- `adopt ADDRESS` hands one unfocused native window to an agent for hidden actions; `release ADDRESS`, stop and plugin unload return it without closing its shared application.
+
+- Identify popup grabs by their input serial so concurrent user input cannot give an agent-opened popup the user’s pointer or keyboard.
+
+- Keep held user modifiers out of XWayland pointer actions and preserve keyboard state when replaying input received during an action.
+
+- Unfocused native keyboard sequences wait for serial-matched client replies before advancing, so Chrome shortcuts are not discarded as a single event batch.
+- GTK 3 menu items use the reported popup layer to distinguish menus at the window origin.
+
+- Hidden launches also recognize registered processes that erase their launch environment.
+
+- Private launches resolve relative commands and paths from the caller's working directory.
+
+- `key` and `type` accept `--agent-keyboard` for native applications that support an independent keyboard seat.
+- Typing parentheses in Wine uses number-row chords instead of extended duplicate keys Wine cannot translate.
+
+- `--session` runs an agent's applications in a private desktop with a separate clipboard, accessibility bus and persistent profile, including XWayland applications.
+- Paste reaches every clipboard device of a multi-seat client, including GTK after an agent pointer click.
+- Hidden selection shortcuts preserve the user's clipboard and primary selection.
+
+- Nested test shutdown removes its owned runtime sockets and logs after verifying process exit, and refuses recycled process ids.
+
+- Captures use the same compositor as the target window, even when the inherited Wayland display differs.
+- Recorded shots detect reused window addresses before keys, typing, paste and pointer actions; take a new shot to select the replacement window.
+
 - Run up to 32 known actions against one pinned window with CLI and MCP `batch`, with partial results on failure and an optional final screenshot.
 
 - Show Deskpilot operating a local demo app with its real cursor and click feedback, a shorter README and linked command and input-routing guides.

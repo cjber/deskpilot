@@ -7,8 +7,8 @@ screenshot, pick a point, click it. Pass --scale 1 to give window pixels instead
 Clicks, scrolls, drags, hovers, keys and text run inside the compositor through the deskpilot Hyprland plugin
 (`deskpilot plugin load`), so the user's pointer and keyboard focus stay where they are, and text arrives as written on
 the user's keymap; a marker the plugin draws shows where the agent acts, one per DESKPILOT_AGENT name. A window that
-is not on screen is refused unless --show brings it into view. --hidden acts on an app the agent started with
-`deskpilot launch`, on its own hidden workspace, with nothing shown; hidden keys need --window. --take-pointer and
+is not on screen is refused unless --show brings it into view. --hidden acts on a window the agent launched or
+explicitly adopted, on its own hidden workspace, with nothing shown; hidden keys need --window. --take-pointer and
 --take-focus move the user's own pointer or focus instead.
 """
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -47,7 +48,7 @@ def _view_args(s: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--hidden",
         action="store_true",
-        help="act on a window this agent started with `deskpilot launch`, on its hidden workspace, with no agent "
+        help="act on a window this agent launched or explicitly adopted, on its hidden workspace, with no agent "
         "cursor and the user's pointer, focus and view untouched (not for XWayland windows' pointer input or keys)",
     )
 
@@ -177,7 +178,17 @@ def _wait_command(sub) -> None:
         "--region", type=int, nargs=4, metavar=("X", "Y", "W", "H"), help="with --changed, only this part of the shot"
     )
     s.add_argument(
-        "--hidden", action="store_true", help="with --changed, watch a window this agent launched (deskpilot launch)"
+        "--hidden", action="store_true", help="with --changed, watch a window this agent launched or adopted"
+    )
+
+
+def _keyboard_args(parser: argparse.ArgumentParser, focus_help: str) -> None:
+    parser.add_argument("--window", help="send keys to this window")
+    parser.add_argument("--take-focus", action="store_true", help=focus_help)
+    parser.add_argument(
+        "--agent-keyboard",
+        action="store_true",
+        help="use the independent keyboard in an app that supports multiple seats",
     )
 
 
@@ -191,14 +202,20 @@ def _batch_command(sub) -> None:
     s.add_argument("file", nargs="?", default="-", help="the JSON array of steps, or - for stdin (the default)")
     s.add_argument("--final-shot", action="store_true", help="screenshot the window after the last step succeeds")
     s.add_argument("--max-width", type=int, default=1400, help="scale down a wider final shot to this width")
-    s.add_argument("--hidden", action="store_true", help="act on a window this agent launched, out of view")
+    s.add_argument("--hidden", action="store_true", help="act on a window this agent launched or adopted, out of view")
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deskpilot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    p.add_argument("--session", action="store_true", help="use this agent's private compositor, clipboard and bus")
     p.add_argument("--json", action="store_true", help="print JSON")
+    return p
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = _parser()
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("windows", help="list mapped windows with geometry")
@@ -232,15 +249,13 @@ def build_parser() -> argparse.ArgumentParser:
     focus_help = "focus the window first and leave it focused, for an app that ignores keys while unfocused"
     s = sub.add_parser("key", help="press a key or chord, e.g. Return, ctrl+a, alt+F4")
     s.add_argument("combo")
-    s.add_argument("--window", help="press it in this window; without it the keys go to the focused window")
-    s.add_argument("--take-focus", action="store_true", help=focus_help)
+    _keyboard_args(s, focus_help)
     s.add_argument("--hold", type=float, default=0.0, help="seconds to hold each key down (up to 10)")
     _view_args(s)
 
     s = sub.add_parser("type", help="type text as written, on the user's keymap")
     s.add_argument("text")
-    s.add_argument("--window", help="type into this window; without it the keys go to the focused window")
-    s.add_argument("--take-focus", action="store_true", help=focus_help)
+    _keyboard_args(s, focus_help)
     s.add_argument(
         "--delay",
         type=float,
@@ -270,8 +285,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("command", nargs=argparse.REMAINDER, help="the app and its arguments")
     s.add_argument("--timeout", type=float, default=30, help="seconds to wait for its first window")
+    for name, description in (
+        ("adopt", "hand one unfocused native window to this agent for hidden actions"),
+        ("release", "return one adopted window to its original workspace without closing it"),
+    ):
+        s = sub.add_parser(name, help=description)
+        s.add_argument("address", help="exact address from deskpilot windows")
     sub.add_parser("show", help="show this agent's hidden workspace on the focused monitor, or hide it again")
-    sub.add_parser("stop", help="close this agent's launched apps")
+    sub.add_parser("stop", help="close this agent's launched apps and return its adopted windows")
 
     sub.add_parser("cursor", help="print the cursor's global position")
     sub.add_parser("mcp", help="run the MCP server on stdio")
@@ -301,13 +322,12 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             )
             return {"x": gx, "y": gy}
         case "click":
-            count = 2 if args.double else 1
             gx, gy = desk.click(
                 args.window,
                 args.x,
                 args.y,
                 args.button,
-                count,
+                2 if args.double else 1,
                 args.scale,
                 args.take_pointer,
                 shot=args.shot,
@@ -368,10 +388,26 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 return tree
             return [f"snapshot {tree['snapshot']}", *_tree(tree)] if "snapshot" in tree else _tree(tree)
         case "key":
-            desk.key(args.combo, args.window, args.take_focus, args.hold, show=args.show, hidden=args.hidden)
+            desk.key(
+                args.combo,
+                args.window,
+                args.take_focus,
+                args.hold,
+                show=args.show,
+                hidden=args.hidden,
+                agent_keyboard=args.agent_keyboard,
+            )
             return "ok"
         case "type":
-            desk.type(args.text, args.window, args.delay, args.take_focus, show=args.show, hidden=args.hidden)
+            desk.type(
+                args.text,
+                args.window,
+                args.delay,
+                args.take_focus,
+                show=args.show,
+                hidden=args.hidden,
+                agent_keyboard=args.agent_keyboard,
+            )
             return "ok"
         case "paste":
             desk.paste(_text(args.text), args.window, args.take_focus, args.keys, show=args.show, hidden=args.hidden)
@@ -401,6 +437,8 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
             return desk.plugin.status()
         case "launch":
             return desk.launch(args.command, args.timeout).to_dict()
+        case "adopt" | "release":
+            return getattr(desk, args.cmd)(args.address).to_dict()
         case "show":
             desk.show_agent()
             return "ok"
@@ -415,6 +453,20 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.session:
+        from . import session
+
+        try:
+            if args.cmd == "mcp" and not os.environ.get("DESKPILOT_OWNER_PID"):
+                os.environ["DESKPILOT_OWNER_PID"] = str(os.getpid())
+            if args.cmd == "stop":
+                session.stop()
+                _print("ok", args.json)
+                return 0
+            os.environ.update(session.environment())
+        except EXPECTED as error:
+            print(f"deskpilot: {error_code(error)}: {error}", file=sys.stderr)
+            return 2
     if args.cmd == "mcp":
         from .mcp_server import serve
 

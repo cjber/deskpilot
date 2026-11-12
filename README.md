@@ -116,10 +116,16 @@ Replace `APP` with an installed app and use the window it reports. Add `--hidden
 including `batch`; hidden keys and text also need `--window`. `deskpilot stop` closes your agent's apps.
 `deskpilot show` intentionally brings the agent workspace into view for you to watch or step in.
 
-Hidden actions preserve your view, pointer and focus and only reach apps that agent launched. XWayland targets
+For an existing unfocused native window, `deskpilot adopt ADDRESS` explicitly hands only that exact window to
+the agent. `deskpilot release ADDRESS` returns it without closing its shared application.
+
+Hidden actions preserve your view, pointer and focus and only reach windows that agent launched or adopted. XWayland targets
 are refused hidden. For browser tasks, use [fastbrowse](https://github.com/agent-labs-dev/fastbrowse).
 
-[Hidden-window behaviour and client compatibility](docs/input-routing.md)
+For a private desktop with separate profiles, clipboard and X server, put `--session` before every command,
+starting with `DESKPILOT_AGENT=NAME deskpilot --session launch APP`. End it with `deskpilot --session stop`.
+
+[Hidden-window behaviour, adoption and private desktops](docs/input-routing.md)
 
 ## Your input stays yours
 
@@ -145,6 +151,7 @@ user input. A private paste preserves your clipboard; apps that cannot receive o
 
 - [Command guide](docs/reference.md): actions, screenshots, accessibility, MCP and error codes.
 - [Input routing](docs/input-routing.md): dedicated seats, keymaps, agent cursors and hidden windows.
+- [Live calibration](docs/calibration.md): isolated input checks and cleanup verification.
 - [Contributing](CONTRIBUTING.md): setup, checks and bug reports.
 - [Security](SECURITY.md): report a vulnerability privately.
 - [Changelog](CHANGELOG.md): changes by release.

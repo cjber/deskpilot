@@ -121,7 +121,7 @@ Action = Annotated[Click | Move | Scroll | Drag | Key | Type | Paste, Field(disc
 class BatchRequest(_Step):
     window: str = Field(min_length=1, description="the one window every step acts on: address, class or title")
     actions: list[Action] = Field(min_length=1, max_length=MAX_ACTIONS)
-    hidden: bool = Field(False, description="act on a window the agent launched, out of view")
+    hidden: bool = Field(False, description="act on a window the agent launched or adopted, out of view")
     final_shot: bool = Field(False, description="screenshot the window after the last step succeeds")
     max_width: int = Field(screen.DEFAULT_MAX_WIDTH, ge=1, description="scale a wider final shot down to this width")
 

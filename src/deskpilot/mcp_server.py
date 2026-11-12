@@ -62,7 +62,7 @@ def focus(window: str) -> dict:
 def shot(window: str, max_width: int = 1400, show: bool = False, hidden: bool = False) -> list:
     """Screenshot a window, returning the image and its shot id. Later move/click/scroll points are pixels in this
     image; pass its id as `shot` to refuse the action if the window has changed size since. A window that is not on
-    screen is an error unless show is set, which focuses it; hidden captures a window the agent launched (launch)."""
+    screen is an error unless show is set, which focuses it; hidden captures a window the agent launched or adopted."""
     taken = desk.shot(window, max_width=max_width, show=show, hidden=hidden)
     return [Image(path=taken.path), taken.to_dict()]
 
@@ -84,7 +84,7 @@ def click(
     """Click a point given in pixels of `shot`, or of the window's latest screenshot, or the centre of an element id
     from `elements`. The user's pointer and keyboard focus stay put unless take_pointer is set, or take_focus, which
     focuses the window first and leaves it focused: use it for a menu or dropdown that closes as soon as it opens.
-    hidden clicks a window the agent launched (see launch) on its hidden workspace, with no agent cursor shown (not
+    hidden clicks a window the agent launched or adopted on its hidden workspace, with no agent cursor shown (not
     XWayland windows)."""
     gx, gy = desk.click(
         window,
@@ -131,7 +131,7 @@ def scroll(
     hidden: bool = False,
 ) -> dict:
     """Scroll at a point of `shot` or the window's latest screenshot, or at an element; positive dy scrolls up.
-    hidden scrolls a window the agent launched, out of view."""
+    hidden scrolls a window the agent launched or adopted, out of view."""
     gx, gy = desk.scroll(
         window, x, y, dy, take_pointer=take_pointer, shot=shot, show=show, element=element, hidden=hidden
     )
@@ -154,7 +154,7 @@ def hover(
     """Rest the pointer on a point (or element) for `wait` seconds, up to 5, without moving the user's pointer, and
     return a screenshot taken while it rests there: tooltips and hover states show in it. With then_click, a point
     in the same pixels, click there next before the pointer leaves, as a menu that opens on hover needs. hidden
-    hovers a window the agent launched, out of view."""
+    hovers a window the agent launched or adopted, out of view."""
     result = desk.hover(
         window,
         x,
@@ -187,7 +187,7 @@ def drag(
 ) -> dict:
     """Press at (x1, y1), move to (x2, y2) over duration seconds (up to 5) and release, in pixels of `shot` or the
     window's latest screenshot: sliders, text selection, drawing and drag and drop within the window. The user's
-    pointer stays put. hidden drags in a window the agent launched, out of view; no drag and drop there."""
+    pointer stays put. hidden drags in a window the agent launched or adopted, out of view; no drag and drop there."""
     gx, gy = desk.drag(window, (x1, y1), (x2, y2), button, duration, shot=shot, show=show, hidden=hidden)
     return {"x": gx, "y": gy}
 
@@ -211,13 +211,16 @@ def key(
     hold: float = 0.0,
     show: bool = False,
     hidden: bool = False,
+    agent_keyboard: bool = False,
 ) -> str:
     """Press a key or chord such as Return, ctrl+a or alt+F4 in a window without focusing it. take_focus focuses
     the window first instead; with no window the keys go to the focused one. hold keeps each key down that many
     seconds, up to 10, for auto-repeat or a game's movement. A window not on screen is refused unless show brings it
-    into view. hidden sends the keys to a window the agent launched (see launch), out of view; it needs a window and
-    refuses XWayland windows and the app with the user's keyboard focus."""
-    desk.key(combo, window, take_focus, hold, show=show, hidden=hidden)
+    into view. hidden sends the keys to a window the agent launched or adopted, out of view; it needs a window and
+    refuses XWayland windows and the app with the user's keyboard focus. agent_keyboard opts into the independent
+    keyboard for native apps that support multiple seats, including GTK; it needs a window. Qt can silently discard
+    that seat's keys, so verify the result. The default route remains appropriate for Qt and Chromium."""
+    desk.key(combo, window, take_focus, hold, show=show, hidden=hidden, agent_keyboard=agent_keyboard)
     return "ok"
 
 
@@ -229,12 +232,13 @@ def type_text(
     take_focus: bool = False,
     show: bool = False,
     hidden: bool = False,
+    agent_keyboard: bool = False,
 ) -> str:
     """Type text as written, on the user's keymap, into a window without focusing it. Keys go as fast as the
     app reads them by default. Games read keys once per frame: for them, each key is held `delay` seconds, 0.1 or
     more, and the next follows after the same gap. For long text, paste_text is faster still. show and hidden work
-    as for key."""
-    desk.type(text, window, delay, take_focus, show=show, hidden=hidden)
+    as for key, including the explicit agent_keyboard option for native apps that support multiple seats."""
+    desk.type(text, window, delay, take_focus, show=show, hidden=hidden, agent_keyboard=agent_keyboard)
     return "ok"
 
 
@@ -339,8 +343,27 @@ def launch(command: list[str], timeout: float = 30) -> dict:
 
 
 @_tool()
+def adopt(address: str) -> dict:
+    """Explicitly hand one unfocused native Wayland window to this agent for hidden actions, by its exact address
+    from windows. Refuses a client receiving the user's input, XWayland, grouped or pinned windows, and windows
+    owned by another agent.
+    Claims this window alone, not its process or sibling windows. Release, stop and plugin unload return it to its
+    original workspace without closing it. Not available in a private --session."""
+    return desk.adopt(address).to_dict()
+
+
+@_tool()
+def release(address: str) -> dict:
+    """Return one individually adopted window to its original workspace, without closing its process.
+    Give its exact address from windows. Refuses while the user's input is in its client."""
+    return desk.release(address).to_dict()
+
+
+@_tool()
 def stop() -> str:
-    """Close every app this agent launched, as the user closing its windows would."""
+    """Close every app this agent launched. In isolated mode this ends the desktop; restart the MCP server to start
+    another. Adopted windows return without closing. Later calls refuse the ended session rather than falling back
+    to the user's desktop."""
     desk.stop()
     return "ok"
 

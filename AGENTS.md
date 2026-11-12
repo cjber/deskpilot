@@ -47,7 +47,10 @@ window on the hidden `special:dptest` workspace, with a headless output to act o
   holds the user's input, except where the target can only be reached through the seat (an XWayland window, or the
   app the user's pointer or keyboard focus is in): there it must restore both and replay input the user made
   meanwhile. A window that is not on screen is an error unless the action is hidden, never a reason to focus it. A hidden
-  action reaches only the windows its agent launched, on `special:agent-NAME`, never the user's own.
+  action reaches only the windows its agent launched or explicitly adopted by exact address, on `special:agent-NAME`.
+  Adoption claims one stable window identity, never its shared process; it refuses a client receiving user input,
+  XWayland, grouped or pinned windows, and another agent's windows. Release, stop and plugin unload return adopted windows without closing
+  them. A window the user moved out or grouped is left where they put it.
 - A point is resolved against a recorded shot. A shot is of one window at one size; any other use is refused.
 - A plugin build loads only into the Hyprland it was built against. Builds are named after the Hyprland commit and
   the plugin source hash, so a changed source or an upgrade rebuilds rather than reusing a stale build.

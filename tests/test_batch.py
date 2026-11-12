@@ -7,7 +7,6 @@ import pytest
 from test_core import AGENT_CLIENT, CLIENT, fake_grim, launched_desk, make_desk, remember_shot
 
 from deskpilot import batch, cli, screen
-from deskpilot import desk as desk_module
 
 CLICK = {"action": "click", "x": 100, "y": 50}
 
@@ -129,7 +128,7 @@ def test_hidden_batches_reach_only_launched_windows_and_keep_the_pin(tmp_path, m
     assert {c[1] for c in plugin.calls if c[0] in ("path", "keys")} == {"0xdef"}
     assert {c[2] for c in plugin.calls if c[0] == "path"} == {"hidden"}
     assert not any(c[0] == "dispatch" for c in fake.calls)
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: False)
+    plugin.owned_addresses = set()
     plugin.calls.clear()
     failed = run(desk, [CLICK], hidden=True)
     assert failed["failed"]["code"] == "not_found" and failed["failed"]["index"] is None and failed["results"] == []

@@ -2,7 +2,7 @@
 
 [Back to the README](../README.md)
 
-Clicks, scrolls, drags and keys run inside the compositor through the deskpilot
+Deskpilot never blocks the user. Clicks, scrolls, drags and keys run inside the compositor through the deskpilot
 Hyprland plugin, which sends them straight to the target app's own pointer and keyboard: the user's pointer, cursor,
 keyboard focus and input are left alone while they keep working, and the target is not raised, even with
 `focus_on_activate` set. Two cases cannot work that way, and there the plugin briefly holds the user's mouse input,
@@ -36,7 +36,27 @@ agent's apps. They also close when the process named by `DESKPILOT_OWNER_PID` ex
 or with no owner after 30 minutes unused. For web pages and signed-in browsers use
 [fastbrowse](https://github.com/agent-labs-dev/fastbrowse), which drives Chrome over CDP.
 
-`--hidden` acts on one of the agent's launched windows, never the user's own, fully out of the user's view: no
+For an isolated desktop, use `DESKPILOT_AGENT=NAME deskpilot --session launch CMD...`, then put `--session`
+before each command that acts on it. This starts a private nested Hyprland with its own clipboard, keyboard,
+accessibility bus and persistent application profile. XWayland applications can run there without sharing the
+user's X server. Regular keyboard actions focus their target inside this private desktop, so application shortcuts
+work there. `--hidden` can bring a window into view inside that desktop without changing the user's view.
+`deskpilot --session stop` closes the desktop and its applications. With no owner it closes after 30 minutes unused;
+an MCP server started with `--session mcp` owns its desktop until it exits. Starting a desktop requires 2 GB of
+available memory, plus Hyprland, D-Bus, at-spi2-core, wayland-scanner, a C compiler and xkbcommon development files.
+Profiles, including a private home directory and Wine prefix, remain under deskpilot's data directory for the same agent name.
+The private desktop starts with a US keyboard layout.
+
+For an application already running, `DESKPILOT_AGENT=NAME deskpilot adopt ADDRESS` explicitly hands one existing
+native Wayland window to the agent. Use the exact address from `deskpilot windows`. Adoption refuses a client
+receiving the user's keyboard or pointer input, XWayland, grouped or pinned windows, and another agent's windows. It claims that
+window alone, even when a browser process also owns the user's other windows. `deskpilot release ADDRESS`,
+`deskpilot stop` and plugin unload return it to its original workspace without closing the application.
+A window the user moves out of the agent workspace or adds to a group is left where they put it. Adoption is for the regular
+desktop; a private `--session` already owns its applications. Launch does not guess which window an existing
+browser opened: use a private profile or explicitly adopt the chosen window.
+
+`--hidden` acts on one of the agent's launched or explicitly adopted windows, fully out of the user's view: no
 workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
 sends pointer input straight to that window's own client, and lets it draw while off screen so a screenshot after the
 action shows the result. Tooltips and menus it opens show in that screenshot and take its clicks, and they never
@@ -45,12 +65,17 @@ since X clients read the one X pointer only the user's pointer moves; so is a wi
 on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled. A single-instance
 app that hands its window to a copy the user already runs opens nothing for the agent.
 
-Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched windows, go to that window's own
-client and never hold the user's input: keys never use the `deskpilot` seat, so an XWayland window is refused, and so
+Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched or adopted windows, go to that window's own
+client and never hold the user's input. By default keys use the regular keyboard, so an XWayland window is refused, and so
 is a keystroke while the user's keyboard focus is in the window's app. A hidden `shot`, `hover` or
 `wait-for --changed` of a window that lies outside its monitor's area, such as a column of the agent's workspace that
 a scrolling layout puts off screen, is refused with `not_visible`: Hyprland sends no frame of it. A capture that gets
 no frame in 5 seconds fails with `timeout`.
+
+`key` and `type` offer `--agent-keyboard` for native apps that support independent seats. It sends keys through
+the `deskpilot` seat, using the active keyboard's keymap, without holding or entering the user's keyboard. It requires
+`--window` and a client that bound that seat's keyboard. GTK 4 supports it; Qt can bind the keyboard while discarding
+its events, so confirm the result with a fresh capture or accessibility tree. XWayland and paste use the regular route.
 
 Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
 the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
@@ -65,3 +90,14 @@ error rather than skipped.
 `--take-pointer` uses a virtual mouse made with `/dev/uinput` instead, which the compositor treats as real
 hardware. Tools that synthesize input another way, such as `xdotool` (XTest), are ignored by some clients:
 Battle.net drops `xdotool` clicks.
+
+## Requirements
+
+- Hyprland, with `hyprctl` on `PATH`. Version 0.57's Lua dispatchers and the older string ones both work.
+- The plugin build tools: a C++26 compiler, `make`, Hyprland's headers (`pkg-config hyprland`, shipped with
+  Arch's `hyprland` package), `libxcb`, `libxkbcommon` and `cairo`.
+- `grim` for screenshots.
+- `wl-clipboard` for `clipboard`.
+- For `--take-pointer`: write access to `/dev/uinput`, usually through the `input` group or a udev ACL. Check with
+  `test -w /dev/uinput`.
+- Python 3.12 or later and `uv`.

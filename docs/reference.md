@@ -1,6 +1,6 @@
 # Command guide
 
-[Quickstart](../README.md#quickstart) · [Input routing and hidden windows](input-routing.md)
+[Back to the README](../README.md)
 
 ## Use
 
@@ -99,9 +99,9 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
 id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`, `key`, `type_text`, `paste_text`,
-`clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
+`clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch`, `adopt`, `release` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
 `take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements`,
-`key`, `type_text`, `paste_text` and `wait_changed` take `hidden`, for windows from `launch`, and `key`, `type_text` and
+`key`, `type_text`, `paste_text` and `wait_changed` take `hidden`, for windows from `launch` or `adopt`, and `key`, `type_text` and
 `paste_text` take `show`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
 keeps one input device open for the session, and the apps it launched close when it exits.
 
@@ -129,7 +129,7 @@ claude mcp add deskpilot -- deskpilot mcp
 ## Batch
 
 `deskpilot batch WINDOW [FILE]` reads a JSON array from `FILE`, or from stdin when omitted or `-`.
-Use `--json` before `batch` for JSON output, `--hidden` for your own launched window, and `--final-shot`
+Use `--json` before `batch` for JSON output, `--hidden` for your launched or adopted window, and `--final-shot`
 for a capture after all steps succeed. `--max-width` controls that capture's maximum width, 1400 by default.
 
 Each of the 1 to 32 objects has an `action` and its fields:
