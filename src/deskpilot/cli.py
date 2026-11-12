@@ -18,8 +18,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .desk import EXPECTED, Desk, error_code
+
+if TYPE_CHECKING:
+    from .batch import BatchRequest
 
 
 def _print(data, as_json: bool) -> None:
@@ -91,6 +95,23 @@ def _text(arg: str) -> str:
     return sys.stdin.read() if arg == "-" else arg
 
 
+def _batch_request(args: argparse.Namespace) -> BatchRequest:
+    """The batch from its JSON array, read whole and validated before anything runs."""
+    from . import batch  # pydantic loads only for this command
+
+    try:
+        text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+        actions = json.loads(text)
+    except OSError as error:
+        raise ValueError(f"cannot read {args.file}: {error.strerror}") from error
+    except ValueError as error:  # bad JSON, or bytes that are not UTF-8
+        raise ValueError(f"the steps are not valid JSON: {error}") from error
+    return batch.parse(
+        {"window": args.window, "actions": actions, "hidden": args.hidden, "final_shot": args.final_shot,
+         "max_width": args.max_width}
+    )  # fmt: skip
+
+
 def _size(text: str) -> tuple[int, int]:
     w, _, h = text.partition("x")
     try:
@@ -100,7 +121,7 @@ def _size(text: str) -> tuple[int, int]:
 
 
 def _path_commands(sub) -> None:
-    """hover, drag and elements: pointer paths and the accessibility tree that names their targets."""
+    """hover, drag, elements and batch: pointer paths, the tree that names their targets, and runs of steps."""
     s = _point_parser(
         sub,
         "hover",
@@ -136,6 +157,7 @@ def _path_commands(sub) -> None:
         help="read the tree without replacing the latest snapshot, whose ids stay good; a peek's ids name nothing",
     )
     _view_args(s)
+    _batch_command(sub)
 
 
 def _wait_command(sub) -> None:
@@ -157,6 +179,19 @@ def _wait_command(sub) -> None:
     s.add_argument(
         "--hidden", action="store_true", help="with --changed, watch a window this agent launched (deskpilot launch)"
     )
+
+
+def _batch_command(sub) -> None:
+    s = sub.add_parser(
+        "batch",
+        help="run a JSON array of click, move, scroll, drag, key, type and paste steps on one window in order, "
+        "stopping at the first failure (not atomic)",
+    )
+    s.add_argument("window", help="the one window every step acts on")
+    s.add_argument("file", nargs="?", default="-", help="the JSON array of steps, or - for stdin (the default)")
+    s.add_argument("--final-shot", action="store_true", help="screenshot the window after the last step succeeds")
+    s.add_argument("--max-width", type=int, default=1400, help="scale down a wider final shot to this width")
+    s.add_argument("--hidden", action="store_true", help="act on a window this agent launched, out of view")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -341,6 +376,8 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
         case "paste":
             desk.paste(_text(args.text), args.window, args.take_focus, args.keys, show=args.show, hidden=args.hidden)
             return "ok"
+        case "batch":
+            return desk.batch(_batch_request(args)).to_dict()
         case "clipboard":
             if args.set is None:
                 return desk.clipboard()
@@ -385,7 +422,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     desk = Desk()
     try:
-        _print(run(args, desk), args.json)
+        output = run(args, desk)
+        _print(output, args.json)
+        if args.cmd == "batch" and isinstance(output, dict) and not output["ok"]:
+            failed = output["failed"]
+            print(f"deskpilot: {failed['code']}: {failed['message']} ({failed['action']})", file=sys.stderr)
+            return 2
     except EXPECTED as error:
         print(f"deskpilot: {error_code(error)}: {error}", file=sys.stderr)
         return 2

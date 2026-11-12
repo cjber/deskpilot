@@ -7,7 +7,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Cillian Berragan", email = "cjberragan@gmail.com" }]
 requires-python = ">=3.12"
-dependencies = ["evdev>=1.7", "jeepney>=0.8", "pillow>=10", "mcp>=2.3"]
+dependencies = ["evdev>=1.7", "jeepney>=0.8", "pillow>=10", "mcp>=2.3", "pydantic>=2.8"]
 
 [project.urls]
 Homepage = "https://github.com/cjber/deskpilot"

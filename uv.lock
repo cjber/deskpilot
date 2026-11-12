@@ -212,6 +212,7 @@ dependencies = [
     { name = "jeepney" },
     { name = "mcp" },
     { name = "pillow" },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -228,6 +229,7 @@ requires-dist = [
     { name = "jeepney", specifier = ">=0.8" },
     { name = "mcp", specifier = ">=2.3" },
     { name = "pillow", specifier = ">=10" },
+    { name = "pydantic", specifier = ">=2.8" },
 ]
 
 [package.metadata.requires-dev]
