@@ -307,7 +307,7 @@ namespace {
     bool               g_gliding = false; // a SHOWN action waits for the agent cursor to land
 
     struct SKeyOp {
-        enum ePhase { ENTER, AWAIT_FOCUS, KEY, AWAIT_KEY, RESTORE, AWAIT_RESTORE, DONE } phase = ENTER;
+        enum ePhase { ENTER, AWAIT_FOCUS, KEY, AWAIT_KEY, AWAIT_CLIENT, RESTORE, AWAIT_RESTORE, DONE } phase = ENTER;
         PHLWINDOWREF                       window;
         WP<CWLSurfaceResource>             surface;
         bool                               x11 = false;
@@ -336,6 +336,10 @@ namespace {
         // which flickers its title bar. It is left when the sequence ends or the user focuses its app, and entered again
         // when a focus change between other apps has left it.
         bool                               lingering = false;
+        bool                               clientPong = false;
+        SP<CXdgWmBase>                     clientBarrier;
+        std::function<void(CXdgWmBase*, uint32_t)> originalPong;
+        uint32_t                           clientSerial = 0;
         // A keyboard focus change Hyprland asked for mid-stroke, applied when the stroke ends.
         std::optional<WP<CWLSurfaceResource>> deferredFocus;
         std::optional<std::chrono::steady_clock::time_point> clientDeadline;
@@ -2367,6 +2371,46 @@ namespace {
     };
     template struct SAccess<&CWLKeyboardResource::m_currentSurface, SKeyboardSurface>;
 
+    struct SXdgBaseResource { friend constexpr auto member(SXdgBaseResource); };
+    template struct SAccess<&CXDGWMBase::m_resource, SXdgBaseResource>;
+    struct SXdgBaseRequests { friend constexpr auto member(SXdgBaseRequests); };
+    template struct SAccess<&CXdgWmBase::requests, SXdgBaseRequests>;
+
+    // A serial-matched protocol round trip separates keyboard events at the client's dispatcher. In particular,
+    // Chromium can discard a shortcut when its complete chord and leave arrive in one batch.
+    bool clientBarrier(SKeyOp& op) {
+        if (!op.clientBarrier) {
+            const auto SURFACE = op.surface.lock();
+            const auto ROLE = SURFACE ? dynamicPointerCast<CXDGSurfaceRole>(SURFACE->m_role) : nullptr;
+            const auto XDG = ROLE ? ROLE->m_xdgSurface.lock() : nullptr;
+            const auto BASE = XDG ? XDG->m_owner.lock() : nullptr;
+            if (!BASE)
+                return false;
+            op.clientBarrier = (*BASE).*member(SXdgBaseResource{});
+            auto& handler = ((*op.clientBarrier).*member(SXdgBaseRequests{})).pong;
+            op.originalPong = handler;
+            handler = [original = handler](CXdgWmBase* resource, uint32_t serial) {
+                if (g_keyOp && g_keyOp->clientBarrier.get() == resource && g_keyOp->clientSerial == serial) {
+                    g_keyOp->clientPong = true;
+                    return;
+                }
+                original(resource, serial);
+            };
+        }
+        op.clientPong = false;
+        op.clientSerial = agentSerial(op.surface.lock()->client());
+        op.clientBarrier->sendPing(op.clientSerial);
+        wl_client_flush(op.surface.lock()->client());
+        return true;
+    }
+
+    void restoreClientBarrier(SKeyOp& op) {
+        if (op.clientBarrier) {
+            ((*op.clientBarrier).*member(SXdgBaseRequests{})).pong = std::move(op.originalPong);
+            op.clientBarrier.reset();
+        }
+    }
+
     // Whether every keyboard of the stroke is still entered on the surface.
     bool stillEntered(const SKeyOp& op, const SP<CWLSurfaceResource>& surface) {
         return std::ranges::all_of(op.keyboards, [&](const auto& weak) {
@@ -2506,6 +2550,7 @@ namespace {
         if (g_keyOp->inStroke)
             endStroke(*g_keyOp);
         endLinger(*g_keyOp);
+        restoreClientBarrier(*g_keyOp);
         auto op = std::move(*g_keyOp);
         g_keyOp.reset();
         dropTimer(op.timer);
@@ -2764,12 +2809,36 @@ namespace {
                 sendKey(op, EVENT.code, EVENT.press);
                 if (EVENT.locks && !EVENT.press)
                     setLocks(op, op.locked);
+                if (!op.x11 && !op.agent && op.entered) {
+                    if (!clientBarrier(op)) {
+                        op.error = "the window has no protocol acknowledgement for keyboard events";
+                        return restoreStroke(op);
+                    }
+                    op.phase = SKeyOp::AWAIT_CLIENT;
+                    op.deadline = std::chrono::steady_clock::now() + CLIENT_WAIT;
+                    return X_POLL;
+                }
                 if (!(op.x11 && op.entered))
                     return afterKey(op);
                 op.phase    = SKeyOp::AWAIT_KEY;
                 op.deadline = std::chrono::steady_clock::now() + X_WAIT;
                 return X_POLL;
             }
+            case SKeyOp::AWAIT_CLIENT:
+                if (const auto WINDOW = op.window.lock(); !WINDOW || !WINDOW->mapped() || !op.surface.lock()) {
+                    op.error = "the window closed mid-sequence";
+                    op.code = "gone";
+                    return restoreStroke(op);
+                }
+                if (op.clientPong) {
+                    return afterKey(op);
+                }
+                if (EXPIRED) {
+                    op.error = "the window did not acknowledge its keyboard events";
+                    op.code = "unavailable";
+                    return restoreStroke(op);
+                }
+                return X_POLL;
             case SKeyOp::AWAIT_KEY:
                 if (xKeyDown(op.events[op.next].code) == op.events[op.next].press)
                     return afterKey(op);

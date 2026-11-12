@@ -16,7 +16,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from deskpilot import clipboard, session
+from deskpilot import clipboard, keys, session
 from deskpilot.a11y import A11yError
 from deskpilot.desk import Desk
 from deskpilot.hypr import AmbiguousWindow
@@ -234,6 +234,18 @@ def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration wit
             desk.key("Return", browser.address)
             expect_text("chrome_private_chord_type", browser.address, "AFTER")
             verify("chrome_private_focus", desk.window(browser.address).focused)
+            # Exercise the ordinary unfocused route inside the private compositor, without the session's focus helper.
+            desk.focus(target.address)
+            desk.plugin.keys(browser.address, keys.chord_words("ctrl+l"))
+            desk.plugin.keys(
+                browser.address, keys.text_words("data:text/html,<textarea autofocus>UNFOCUSED</textarea>")
+            )
+            desk.plugin.keys(browser.address, keys.chord_words("Return"))
+            expect_text("chrome_unfocused_chord_navigation", browser.address, "UNFOCUSED")
+            desk.plugin.keys(browser.address, keys.chord_words("ctrl+a"))
+            desk.plugin.keys(browser.address, keys.chord_words("BackSpace"))
+            expect_text("chrome_unfocused_select_delete", browser.address, "")
+            verify("chrome_unfocused_focus_preserved", desk.window(target.address).focused)
             calibrate_x11_pointer(desk, chrome, target.address, verify)
         if args.wine:
             calibrate_wine(desk, args.output, verify)

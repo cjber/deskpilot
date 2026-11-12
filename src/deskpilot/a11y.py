@@ -454,10 +454,19 @@ def _root_offset(bus: _Bus, root: tuple[str, str]) -> Key:
 def _popup_key(bus: _Bus, element: tuple[str, str], bounds: tuple[int, int, int, int], root_offset: Key) -> Key | None:
     """GTK 3: the first-level key of the popup an element is on, its offset over the toplevel's, or None when it has
     the toplevel's own offset: it is on the window's own surface, or on a popup at the window's origin, which reports
-    the same and which `resolve` refuses. Snapshot placement and live lookup both classify through this."""
+    the same. The popup layer distinguishes those when the app supplies it. Snapshot placement and live lookup
+    both classify through this."""
     offset = _offset(bus, *element, bounds)
     key = (offset[0] - root_offset[0], offset[1] - root_offset[1])
-    return None if key == (0, 0) else key
+    if key != (0, 0):
+        return key
+    # AT-SPI Layer.POPUP is 5. GTK 3 reports it for menus and their items, including a popup whose position is
+    # identical to the toplevel's. Without that explicit distinction the origin stays ambiguous.
+    try:
+        layer = _reply_value(_call(bus, *element, COMPONENT_INTERFACE, "GetLayer"))
+    except A11yError:
+        return None
+    return key if layer == 5 else None
 
 
 def _text(bus: _Bus, destination: str, object_path: str, interfaces: tuple[str, ...]) -> str | None:

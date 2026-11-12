@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Unfocused native keyboard sequences wait for serial-matched client replies before advancing, so Chrome shortcuts are not discarded as a single event batch.
+- GTK 3 menu items use the reported popup layer to distinguish menus at the window origin.
+
 - Hidden launches also recognize registered processes that erase their launch environment.
 
 - Private launches resolve relative commands and paths from the caller's working directory.

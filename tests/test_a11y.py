@@ -46,6 +46,7 @@ class FakeBus:
         self.toolkit: tuple[str, str] | None = None
         self.screen: dict[str, tuple[int, int, int, int]] = {}
         self.parents: dict[str, str] = {}
+        self.layers: dict[str, int] = {}
 
     def call(self, destination, object_path, interface, method, signature, body):
         self.calls.append((destination, object_path, interface, method, signature, body))
@@ -77,6 +78,8 @@ class FakeBus:
                 return (("(so)", ("app.bus", self.parents[object_path])),)
         if (interface, method) == (a11y.SELECTION_INTERFACE, "GetSelectedChild"):
             return (self.selected[object_path][body[0]],)
+        if (interface, method) == (a11y.COMPONENT_INTERFACE, "GetLayer"):
+            return (self.layers.get(object_path, 3),)
         if (interface, method) == (a11y.COMPONENT_INTERFACE, "GetExtents"):
             if body == (a11y.COORDINATE_SCREEN,):
                 return (self.screen.get(object_path, self.bounds[object_path]),)
@@ -340,3 +343,17 @@ def test_a_popup_is_resolved_exactly_or_refused():
     with pytest.raises(a11y.A11yError) as error:
         a11y.resolve(POPUPS[:1], ((20, 188), (162, 124)))
     assert error.value.code == "stale"
+
+
+def test_popup_layer_distinguishes_a_menu_at_the_window_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake = gtk3_bus()
+    fake.screen.update({"/menu": (0, 0, 100, 200), "/item": (6, 9, 80, 20)})
+    fake.layers.update({"/menu": 5, "/item": 5})
+    popup = a11y.Popup(0, -1, 0, 0, -6, -5, 100, 200)
+    tree = a11y.snapshot(window(), bus=fake, popups=lambda: [popup])
+    item = tree.children[1].children[0]
+    assert (item.x, item.y, item.width, item.height) == (0, 4, 80, 20)
+    located = a11y.locate(window(), item.id, bus=fake)
+    assert located == a11y.Located(6, 9, 80, 20, ((0, 0),), True)
+    assert a11y.resolve([popup], located.keys) == popup
