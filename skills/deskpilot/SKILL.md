@@ -77,6 +77,21 @@ independent seat's keyboard and the active keymap, including while the user's ke
 It requires a named window and a client that bound the keyboard. Confirm the result: Qt can bind it and discard
 the events. Use the regular route for Qt, Chromium, XWayland and paste.
 
+## Chaining known steps
+
+Use `deskpilot batch WINDOW [FILE] --final-shot` or MCP `batch` to run 1 to 32 known actions in one request.
+The CLI reads a JSON array from the file or stdin. For example, after inspecting the focused text field in
+that window, `[{"action":"key","combo":"ctrl+a"},{"action":"type","text":"Hello"}]` replaces its contents.
+Supported steps are `click`, `move`, `scroll`, `drag`, `key`, `type` and `paste`, with element and shot IDs
+on the matching pointer steps. Pass `--hidden` at the batch level for your launched or adopted window; hidden `move`
+is refused. The MCP fields are `window`, `actions`, `hidden`, `final_shot` and `max_width`.
+
+The batch validates all step shapes before acting, pins one window, and checks live targets on each step.
+It stops at the first failure and reports partial completion with a zero-based failing index and stable
+code. Earlier actions remain done and other agents can act between steps. Use batches for known steps,
+not to guess what an earlier action will reveal. If the next target depends on new app state, return for
+an observation first. Inspect the final image to verify the requested result.
+
 ## Taking the user's pointer or focus
 
 By default the user's pointer and keyboard focus stay where they are, so the user can keep working. Two flags take

@@ -16,12 +16,16 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PIL import Image, ImageChops
 
 from . import a11y, clipboard, keys, screen
 from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound, find_window
 from .plugin import BUTTON_CODES, Plugin, PluginError
+
+if TYPE_CHECKING:
+    from .batch import BatchRequest, BatchResult
 
 
 class NotVisible(LookupError):
@@ -693,6 +697,13 @@ class Desk:
         if not hidden and self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
             self._register()
         return win
+
+    def batch(self, request: BatchRequest) -> BatchResult:
+        """Run a validated batch of actions on one window in order, stopping at the first expected failure (see
+        `batch`)."""
+        from . import batch
+
+        return batch.run(self, request)
 
     def wait_for(
         self,

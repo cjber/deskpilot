@@ -5,11 +5,14 @@ from __future__ import annotations
 import functools
 import os
 from importlib.metadata import version
-from typing import Literal
+from typing import Annotated, Literal
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.types import CallToolResult, TextContent
+from pydantic import Field
 
+from . import batch as batching
+from .batch import MAX_ACTIONS, Action
 from .desk import EXPECTED, Desk, error_code, owner_from_env
 
 mcp = MCPServer("deskpilot", version=version("deskpilot"))
@@ -255,6 +258,36 @@ def paste_text(
     show and hidden work as for key."""
     desk.paste(text, window, take_focus, keys, show=show, hidden=hidden)
     return "ok"
+
+
+@_tool(structured_output=False)
+def batch(
+    window: str,
+    actions: Annotated[list[Action], Field(min_length=1, max_length=MAX_ACTIONS)],
+    hidden: bool = False,
+    final_shot: bool = False,
+    max_width: int = 1400,
+) -> list | CallToolResult:
+    """Run click, move, scroll, drag, key, type and paste steps on one window in order, in one call. The whole list
+    is checked before anything runs. It is sequential, not atomic: it stops at the first failed step and undoes
+    nothing, and other agents may act between steps. Steps act on the pinned window with its own pointer and
+    keyboard (no take_pointer, take_focus or show); hidden applies to all of them. Points are pixels of the window's
+    latest screenshot, or of a step's `shot`; prefer `element` ids from `elements`. Returns {ok, window, completed,
+    results, failed, shot}: a failure carries the 0-based index, action, code and message of the step (index = the
+    step count for final_shot) and is an error result. With final_shot, the window's screenshot follows the last
+    step."""
+    request = batching.parse(
+        {"window": window, "actions": actions, "hidden": hidden, "final_shot": final_shot, "max_width": max_width}
+    )
+    result = desk.batch(request)
+    if (failed := result.failed) is not None:
+        where = "the window" if failed.index is None else f"step {failed.index} ({failed.action})"
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"{failed.code}: {failed.message} at {where}")],
+            structured_content=result.to_dict(),
+            is_error=True,
+        )
+    return [Image(path=result.shot.path), result.to_dict()] if result.shot else [result.to_dict()]
 
 
 @_tool()
