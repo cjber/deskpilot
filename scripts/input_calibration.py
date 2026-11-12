@@ -68,7 +68,39 @@ def calibrate_wine(desk, output, verify):
     verify("wine_raw_pointer_buttons", "RAW_DOWN" in rows and "RAW_UP" in rows)
 
 
-def calibrate_x11_pointer(desk, chrome, background, verify):
+def keyboard_control(output):
+    scratch = output.parent / "keyboard-calibration"
+    scratch.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["keeper", "claim", str(scratch)], check=True, capture_output=True)
+    xml = ROOT / "scripts/protocols/virtual-keyboard.xml"
+    for mode, name in (("client-header", "virtual-keyboard.h"), ("private-code", "virtual-keyboard.c")):
+        subprocess.run(["wayland-scanner", mode, str(xml), str(scratch / name)], check=True, capture_output=True)
+    binary = scratch / "keyboard-control"
+    subprocess.run(
+        [
+            "cc",
+            str(ROOT / "scripts/keyboard_control.c"),
+            str(scratch / "virtual-keyboard.c"),
+            "-I",
+            str(scratch),
+            "-lwayland-client",
+            "-lxkbcommon",
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert process.stdout is not None
+    if process.stdout.readline().strip() != "ready":
+        process.kill()
+        process.wait()
+        raise RuntimeError("private virtual keyboard did not start")
+    return process
+
+
+def calibrate_x11_pointer(desk, chrome, background, verify, output):  # noqa: PLR0915 - sequential live input probe
     html = """<title>Deskpilot X11 pointer calibration</title>
 <button id=t onpointerdown="events.value=JSON.stringify({type:event.type,
 button:event.button,pointerType:event.pointerType,ctrlKey:event.ctrlKey});
@@ -107,6 +139,73 @@ if(event.button===0&&event.pointerType==='mouse'&&!event.ctrlKey)result.value='O
             break
         time.sleep(0.05)
     verify("chrome_x11_unfocused_pointerdown", any(e.name == "result" and e.text == "OPEN" for e in tree))
+    companion = desk.launch(
+        [
+            chrome,
+            "--new-window",
+            "--ozone-platform=x11",
+            "--force-renderer-accessibility",
+            f"--user-data-dir={os.environ['HOME']}/chrome-x11",
+            "data:text/html,<title>Keyboard companion</title><textarea autofocus>UNCHANGED</textarea>",
+        ]
+    )
+    desk.focus(companion.address)
+    desk.key("End", companion.address)
+    control = keyboard_control(output)
+    assert control.stdin is not None and control.stdout is not None
+
+    def send(command):
+        control.stdin.write(command + "\n")
+        control.stdin.flush()
+        if control.stdout.readline().strip() != "done":
+            raise RuntimeError("private virtual keyboard command failed")
+
+    try:
+        send("key 29 1")
+        send("mods 4")
+        desk.click(browser.address, None, None, element=trigger.id)
+        tree = list(descendants(desk.elements(browser.address)))
+        verify(
+            "chrome_x11_held_ctrl_isolated",
+            any(e.name == "events" and '"ctrlKey":false' in (e.text or "") for e in tree),
+        )
+        win, gx, gy, surface = desk._aim(browser.address, None, None, None, None, False, trigger.id, False)
+
+        # `n` acknowledges the running path before the dwell, so input cannot race ahead of the hold.
+        desk.plugin.path(win.address, "plain", [*surface, f"m{gx},{gy}", "n", "d3000", "p272", "r272"])
+        for command in (
+            "key 30 1",
+            "key 30 0",
+            "mods 0",
+            "key 29 0",
+            "key 45 1",
+            "key 45 0",
+            "key 21 1",
+            "key 21 0",
+            "key 44 1",
+            "key 44 0",
+        ):
+            send(command)
+        verify("chrome_x11_user_chord_held", desk.plugin.status()["busy"])
+        # A queued path is a completion barrier for the held action and its replay.
+        desk.plugin.path(win.address, "plain", [*surface, f"m{gx},{gy}"])
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            tree = list(descendants(desk.elements(companion.address)))
+            if any(e.text == "xyz" and "editable" in e.states for e in tree):
+                break
+            time.sleep(0.05)
+        verify("chrome_x11_user_chord_exact", any(e.text == "xyz" and "editable" in e.states for e in tree))
+        verify("chrome_x11_companion_focus_preserved", desk.window(companion.address).focused)
+    finally:
+        if control.poll() is None:
+            control.stdin.write("mods 0\nkey 29 0\nquit\n")
+            control.stdin.flush()
+            try:
+                control.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                control.kill()
+                control.wait()
 
 
 def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration with one cleanup boundary
@@ -246,7 +345,7 @@ def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration wit
             desk.plugin.keys(browser.address, keys.chord_words("BackSpace"))
             expect_text("chrome_unfocused_select_delete", browser.address, "")
             verify("chrome_unfocused_focus_preserved", desk.window(target.address).focused)
-            calibrate_x11_pointer(desk, chrome, target.address, verify)
+            calibrate_x11_pointer(desk, chrome, target.address, verify, args.output)
         if args.wine:
             calibrate_wine(desk, args.output, verify)
     except Exception as error:

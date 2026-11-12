@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Keep held user modifiers out of XWayland pointer actions and preserve keyboard state when replaying input received during an action.
+
 - Unfocused native keyboard sequences wait for serial-matched client replies before advancing, so Chrome shortcuts are not discarded as a single event batch.
 - GTK 3 menu items use the reported popup layer to distinguish menus at the window origin.
 

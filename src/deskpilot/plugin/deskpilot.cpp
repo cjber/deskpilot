@@ -274,6 +274,7 @@ namespace {
         // focus and input alone. Otherwise the seat's pointer is moved onto the window and the user's input is held:
         // for an XWayland window, which reads the one X pointer, and for a window of the app the user's pointer is on.
         bool                               direct = false;
+        std::vector<WP<CWLKeyboardResource>> modifierKeyboards;
         // The window's client bound the agent seat, so the input goes to its agent pointer (see "agent seat").
         bool                               agentSeat = false;
         // A direct action: the surface its pointer is on and the pointers entered there, the client's own wl_pointer
@@ -468,15 +469,32 @@ namespace {
     }
 
 
+    std::function<void()> keyboardReplay(std::function<void()> replay);
+
     void hkOnKeyboardKey(CInputManager* self, const IKeyboard::SKeyEvent& e, SP<IKeyboard> keyboard) {
         auto replay = [self, e, keyboard] { reinterpret_cast<KeyFn>(g_keyHook->m_original)(self, e, keyboard); };
-        if (!holdForStroke(replay))
+        if ((g_op && !g_op->direct) || (g_keyOp && g_keyOp->holding)) {
+            // The pointer or agent stroke may have replaced the client's modifiers. Deliver the event's own
+            // modifiers first, including when they were already held before the action began.
+            auto held = keyboardReplay([self, keyboard, replay] {
+                reinterpret_cast<ModFn>(g_modHook->m_original)(self, keyboard);
+                replay();
+            });
+            if (g_op && !g_op->direct)
+                g_op->heldInput.emplace_back(std::move(held));
+            else
+                holdForStroke(std::move(held));
+        } else
             replay();
     }
 
     void hkOnKeyboardMod(CInputManager* self, SP<IKeyboard> keyboard) {
         auto replay = [self, keyboard] { reinterpret_cast<ModFn>(g_modHook->m_original)(self, keyboard); };
-        if (!holdForStroke(replay))
+        if (g_op && !g_op->direct)
+            g_op->heldInput.emplace_back(keyboardReplay(replay));
+        else if (g_keyOp && g_keyOp->holding)
+            holdForStroke(keyboardReplay(replay));
+        else
             replay();
     }
 
@@ -1385,6 +1403,9 @@ namespace {
         g_op->answered = true;
     }
 
+    void clearPointerMods(SOp& op);
+    void restorePointerMods(SOp& op);
+
     void finish() {
         SInputOwner agent;
         auto        op = std::move(*g_op);
@@ -1426,6 +1447,7 @@ namespace {
             g_pHyprRenderer->ensureCursorRenderingMode();
         }
 
+        restorePointerMods(op);
         replayHeld(op.heldInput);
 
         if (!op.answered)
@@ -1468,6 +1490,7 @@ namespace {
             op.focusWindow  = Desktop::focusState()->window();
             op.focusSurface = Desktop::focusState()->surface();
             op.hadFocus     = op.focusWindow || op.focusSurface;
+            clearPointerMods(op);
         }
         g_op.emplace(std::move(op));
 
@@ -1589,6 +1612,104 @@ namespace {
                 out.emplace_back(keyboard);
         }
         return out;
+    }
+
+    struct SKeyboardPressed { friend constexpr auto member(SKeyboardPressed); };
+    template struct SAccess<&IKeyboard::m_pressed, SKeyboardPressed>;
+
+    // Input devices advance before the input-manager hooks run. Keep the state each queued event observed,
+    // including other keyboards used by Hyprland's merged modifier and key-release checks.
+    std::function<void()> keyboardReplay(std::function<void()> replay) {
+        using Mask = std::array<uint32_t, 6>;
+        const auto readMask = [](xkb_state* state) -> Mask {
+            if (!state)
+                return {};
+            return {xkb_state_serialize_mods(state, XKB_STATE_MODS_DEPRESSED),
+                    xkb_state_serialize_mods(state, XKB_STATE_MODS_LATCHED),
+                    xkb_state_serialize_mods(state, XKB_STATE_MODS_LOCKED),
+                    xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_DEPRESSED),
+                    xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_LATCHED),
+                    xkb_state_serialize_layout(state, XKB_STATE_LAYOUT_LOCKED)};
+        };
+        const auto applyMask = [](xkb_state* state, const Mask& mask) {
+            if (state)
+                xkb_state_update_mask(state, mask[0], mask[1], mask[2], mask[3], mask[4], mask[5]);
+        };
+        struct SState {
+            SP<IKeyboard> keyboard;
+            decltype(IKeyboard::m_modifiersState) mods;
+            std::vector<uint32_t> pressed;
+            Mask state, symState;
+        };
+        const auto read = [readMask](SP<IKeyboard> keyboard) -> SState {
+            return {keyboard, keyboard->m_modifiersState, (*keyboard).*member(SKeyboardPressed{}),
+                    readMask(keyboard->m_xkbState), readMask(keyboard->m_xkbSymState)};
+        };
+        std::vector<SState> states;
+        for (const auto& keyboard : g_pInputManager->m_keyboards)
+            states.push_back(read(keyboard));
+        return [replay = std::move(replay), states = std::move(states), read, readMask, applyMask] {
+            std::vector<SState> live;
+            std::vector<xkb_state*> resources;
+            for (const auto& state : states) {
+                live.push_back(read(state.keyboard));
+                resources.push_back(state.keyboard->m_xkbState);
+                state.keyboard->m_modifiersState = state.mods;
+                (*state.keyboard).*member(SKeyboardPressed{}) = state.pressed;
+                applyMask(state.keyboard->m_xkbState, state.state);
+                applyMask(state.keyboard->m_xkbSymState, state.symState);
+            }
+            replay();
+            for (size_t i = 0; i < states.size(); ++i) {
+                const auto& state = states[i];
+                const auto& saved = live[i];
+                const auto& keyboard = state.keyboard;
+                // A replayed binding may switch layout or replace the keymap. Preserve those deliberate changes.
+                if (keyboard->m_xkbState != resources[i])
+                    continue;
+                auto& mods = keyboard->m_modifiersState;
+                if (mods.depressed == state.mods.depressed && mods.latched == state.mods.latched &&
+                    mods.locked == state.mods.locked && mods.group == state.mods.group)
+                    mods = saved.mods;
+                auto& pressed = (*keyboard).*member(SKeyboardPressed{});
+                if (pressed == state.pressed)
+                    pressed = saved.pressed;
+                if (readMask(keyboard->m_xkbState) == state.state)
+                    applyMask(keyboard->m_xkbState, saved.state);
+                if (readMask(keyboard->m_xkbSymState) == state.symState)
+                    applyMask(keyboard->m_xkbSymState, saved.symState);
+            }
+        };
+    }
+
+    // XWayland pointer events carry its shared X keyboard modifiers, even when another X window has focus.
+    // Pointer actions have no modifier argument, so isolate their buttons from the user's held modifiers.
+    void clearPointerMods(SOp& op) {
+        SInputOwner agent;
+        const auto WINDOW = windowOf(op);
+        const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
+        if (!WINDOW || !WINDOW->backend().isX11() || !KEYBOARD)
+            return;
+        const auto SURFACE = WINDOW->wlSurface()->resource();
+        op.modifierKeyboards = keyboardsOf(SURFACE->client());
+        for (const auto& weak : op.modifierKeyboards) {
+            if (const auto resource = weak.lock())
+                resource->sendMods(0, 0, KEYBOARD->m_modifiersState.locked, KEYBOARD->m_modifiersState.group);
+        }
+    }
+
+    void restorePointerMods(SOp& op) {
+        const auto KEYBOARD = g_pSeatManager->m_keyboard.lock();
+        if (!KEYBOARD)
+            return;
+        const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+        const auto& MODS = KEYBOARD->m_modifiersState;
+        for (const auto& weak : op.modifierKeyboards) {
+            if (const auto resource = weak.lock()) {
+                const bool FOCUSED = FOCUS && resource->m_owner && resource->m_owner->client() == FOCUS->client();
+                resource->sendMods(FOCUSED ? MODS.depressed : 0, FOCUSED ? MODS.latched : 0, MODS.locked, MODS.group);
+            }
+        }
     }
 
     // ---- agent seat ----
