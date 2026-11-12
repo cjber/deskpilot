@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Captures use the same compositor as the target window, even when the inherited Wayland display differs.
+- Recorded shots detect reused window addresses before keys, typing, paste and pointer actions; take a new shot to select the replacement window.
+
 - **A logo, a wordmark, and the README opens with them.** The mark is a flight-path ring with wings locked on a
   cursor, the same shapes the agent cursor draws on screen; the wordmark sets it beside "deskpilot" and follows the
   reader's dark mode. A 1280×640 social preview is in `assets/` for the repository card, and the README also

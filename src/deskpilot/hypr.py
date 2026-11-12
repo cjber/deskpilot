@@ -81,6 +81,8 @@ class Window:
     xwayland: bool
     pid: int
     focused: bool = False
+    instance: str = ""
+    wayland: str = ""
     # The ext-foreign-toplevel identifier, which `grim -T` captures by. Empty on a Hyprland too old to report it.
     stable_id: str = ""
     # Some of the window lies on a monitor showing its workspace. False for a hidden workspace and for a column a
@@ -154,6 +156,13 @@ class Hyprland:
         return json.loads(out) if out.strip() else None
 
     def windows(self) -> list[Window]:
+        instance, wayland = "", ""
+        if self._run is run_hyprctl:
+            instance = current_instance()
+            listed = self._json("instances") or []
+            wayland = next((i["wl_socket"] for i in listed if i["instance"] == instance), "")
+            if not wayland:
+                raise HyprctlError(f"no Wayland socket for Hyprland {instance}")
         active = self._json("activewindow") or {}
         monitors = [Monitor.from_json(m) for m in self._json("monitors") or [] if not m.get("disabled")]
         found = []
@@ -179,6 +188,8 @@ class Hyprland:
                     pid=c.get("pid", 0),
                     focused=c["address"] == active.get("address"),
                     stable_id=str(c.get("stableId") or ""),
+                    instance=instance,
+                    wayland=wayland,
                     visible=any(m.shows(workspace, x, y, w, h) for m in monitors),
                     on_monitor=any(m.id == monitor and m.overlaps(x, y, w, h) for m in monitors),
                 )

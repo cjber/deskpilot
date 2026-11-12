@@ -59,6 +59,10 @@ class Shot:
     scale: float  # image pixels per window pixel
     window_width: int
     window_height: int
+    stable_id: str = ""
+    pid: int = 0
+    cls: str = ""
+    instance: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -74,17 +78,35 @@ class Shot:
         """Refuse the shot for a point in `window` if it is of another window or the window has changed size."""
         if window.address != self.address:
             raise StaleShot(f"shot {self.id} is of window {self.address}, not {window.address}")
+        self.check_identity(window)
         if (window.width, window.height) != (self.window_width, self.window_height):
             raise StaleShot(
                 f"{window.cls} is {window.width}x{window.height} now, {self.window_width}x{self.window_height} in "
                 f"shot {self.id}: take a new shot"
             )
 
+    def check_identity(self, window: Window) -> None:
+        """Titles may change during navigation; stable ids, process ids and instances identify the target."""
+        if (self.stable_id, self.pid, self.cls, self.instance) != (
+            window.stable_id,
+            window.pid,
+            window.cls,
+            window.instance,
+        ):
+            raise StaleShot(f"window {window.address} has changed since shot {self.id}: take a new shot")
+
 
 def _grim(window: Window, path: Path) -> None:
     cmd = ["grim", "-T", window.stable_id] if window.stable_id else ["grim", "-s", "1", "-g", _geometry(window)]
     try:
-        result = subprocess.run([*cmd, str(path)], capture_output=True, text=True, check=False, timeout=GRIM_TIMEOUT)
+        result = subprocess.run(
+            [*cmd, str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GRIM_TIMEOUT,
+            env={**os.environ, "WAYLAND_DISPLAY": window.wayland} if window.wayland else None,
+        )
     except subprocess.TimeoutExpired as error:
         raise NoFrame(
             f"grim got no frame of {window.cls} ({window.address}) from the compositor within {GRIM_TIMEOUT}s"
@@ -110,7 +132,20 @@ def capture(window: Window, out: Path | None = None, max_width: int = DEFAULT_MA
             height = round(height * max_width / width)
             width = max_width
             image.resize((width, height), Image.Resampling.LANCZOS).save(path)
-    shot = Shot(shot_id, str(path), window.address, width, height, width / window.width, window.width, window.height)
+    shot = Shot(
+        shot_id,
+        str(path),
+        window.address,
+        width,
+        height,
+        width / window.width,
+        window.width,
+        window.height,
+        window.stable_id,
+        window.pid,
+        window.cls,
+        window.instance,
+    )
     (folder / f"{shot_id}.json").write_text(json.dumps(asdict(shot)))
     _prune(folder, window.address)
     return shot

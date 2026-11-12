@@ -288,7 +288,18 @@ def remember_shot(client, scale):
     folder = screen.shots_dir()
     folder.mkdir(parents=True, exist_ok=True)
     w, h = client["size"]
-    shot = screen.Shot("abc-1", "", client["address"], round(w * scale), round(h * scale), scale, w, h)
+    shot = screen.Shot(
+        "abc-1",
+        "",
+        client["address"],
+        round(w * scale),
+        round(h * scale),
+        scale,
+        w,
+        h,
+        pid=client["pid"],
+        cls=client["class"],
+    )
     (folder / "abc-1.json").write_text(json.dumps(asdict(shot)))
 
 
@@ -977,3 +988,43 @@ def test_the_mcp_server_reports_the_package_version():
     from deskpilot import mcp_server
 
     assert mcp_server.mcp.version == version("deskpilot") != ""
+
+
+def test_capture_uses_the_targets_compositor(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-user")
+    envs = []
+
+    def run(cmd, **kwargs):
+        envs.append(kwargs["env"])
+        Image.new("RGB", (100, 50)).save(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(screen.subprocess, "run", run)
+    screen.capture(replace(win(w=100, h=50), wayland="wayland-nested", instance="nested"))
+    assert envs[0]["WAYLAND_DISPLAY"] == "wayland-nested"
+
+
+@pytest.mark.parametrize("changed", [{"pid": 99}, {"cls": "other"}, {"stable_id": "new"}, {"instance": "other"}])
+def test_shot_refuses_reused_addresses(tmp_path, monkeypatch, changed):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    fake_grim(monkeypatch, (100, 50))
+    window = win(w=100, h=50)
+    shot = screen.capture(window)
+    with pytest.raises(screen.StaleShot, match="has changed"):
+        shot.check(replace(window, **changed))
+    shot.check(replace(window, title="A title changed by navigation"))
+
+
+def test_keys_and_explicit_scale_refuse_reused_address(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients[0] = {**CLIENT, "pid": 999}
+    for action in (
+        lambda: desk.key("Return", "battle"),
+        lambda: desk.type("text", "battle"),
+        lambda: desk.paste("text", "battle"),
+        lambda: desk.click("battle", 1, 1, scale=1),
+    ):
+        with pytest.raises(screen.StaleShot, match="has changed"):
+            action()
+    assert plugin.calls == []

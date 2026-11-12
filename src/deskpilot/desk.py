@@ -130,7 +130,7 @@ class Desk:
         use."""
         return self.plugin.register(self.owner)
 
-    def _target(self, query: str, show: bool, hidden: bool) -> Window:
+    def _target(self, query: str, show: bool, hidden: bool, refresh: bool = False) -> Window:
         """The window to act on. A hidden action reaches only the agent's own launched windows, on its hidden
         workspace. A visible action reaches only what is showing, so a window off screen is an error unless `show`,
         which focuses it, since that switches the user's workspace or scrolls their layout."""
@@ -145,13 +145,18 @@ class Desk:
                 if w.workspace == agent["workspace"] and launched_by(w.pid, agent["token"])
             ]
             try:
-                return find_window(mine, query)
+                win = find_window(mine, query)
+                if not refresh:
+                    self._check_identity(win)
+                return win
             except WindowNotFound:
                 raise WindowNotFound(
                     f"no window of agent {self.plugin.agent} matches '{query}': hidden acts only on the apps the agent "
                     "started with `deskpilot launch` (launch over MCP), never on the user's own windows"
                 ) from None
         win = self.window(query)
+        if not refresh:
+            self._check_identity(win)
         if win.visible:
             return win
         if not show:
@@ -167,6 +172,12 @@ class Desk:
                 return win
             time.sleep(0.05)
         raise NotVisible(f"{win.cls} ({win.address}) did not come on screen within {SHOW_TIMEOUT}s of focusing it")
+
+    @staticmethod
+    def _check_identity(win: Window) -> None:
+        taken = screen.latest(win.address)
+        if taken:
+            taken.check_identity(win)
 
     def launch(self, command: list[str], timeout: float = LAUNCH_TIMEOUT) -> Window:
         """Start an app for this agent and return its first window. It and every window its processes open later are
@@ -225,7 +236,7 @@ class Desk:
         show: bool = False,
         hidden: bool = False,
     ) -> screen.Shot:
-        return screen.capture(self._shootable(self._target(query, show, hidden)), out, max_width)
+        return screen.capture(self._shootable(self._target(query, show, hidden, refresh=True)), out, max_width)
 
     @staticmethod
     def _shootable(win: Window) -> Window:
@@ -275,10 +286,10 @@ class Desk:
         if element is not None:
             return win, *self._element_point(win, element)
         assert x is not None and y is not None
+        taken = screen.load(shot) if shot else screen.latest(win.address)
+        if taken and (shot or scale is None):
+            taken.check(win)
         if scale is None:
-            taken = screen.load(shot) if shot else screen.latest(win.address)
-            if taken:
-                taken.check(win)
             scale = taken.scale if taken else 1.0
         gx, gy = screen.to_global(win, x, y, scale)
         return win, gx, gy, []
@@ -548,7 +559,9 @@ class Desk:
             if focused is None:
                 raise WindowNotFound("no window has keyboard focus; name one with a window query")
             return focused
-        win = self.focus(query) if take_focus else self._target(query, show, hidden)
+        win = self._target(query, show or take_focus, hidden)
+        if take_focus:
+            self.hypr.focus(win)
         # A hidden target registered the agent already; keys to its window shown on screen mark it in use too.
         if not hidden and self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":
             self._register()
