@@ -1,9 +1,11 @@
 #include "xdg-shell-client-protocol.h"
+#include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -149,9 +151,17 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t w, int32_t h,
 static void top_close(void *d, struct xdg_toplevel *t) { exit(0); }
 static const struct xdg_toplevel_listener tops = {top_configure, top_close};
 int main(void) {
-  events = fopen(getenv("PROBE_EVENTS"), "w");
-  if (!events)
+  const char *path = getenv("PROBE_EVENTS");
+  if (!path)
     return 2;
+  int log_fd =
+      open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (log_fd < 0)
+    return 2;
+  if (fchmod(log_fd, 0600) < 0 || !(events = fdopen(log_fd, "w"))) {
+    close(log_fd);
+    return 2;
+  }
   struct wl_display *display = wl_display_connect(NULL);
   if (!display)
     return 3;

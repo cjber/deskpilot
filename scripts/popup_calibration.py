@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -63,10 +64,15 @@ def probe(desk, binary, output, background, user, verify, unload=False):
     name = "unloaded_user" if unload else "user" if user else "agent"
     events = output.parent / f"popup-{name}-events.log"
     trigger = output.parent / f"popup-{name}-trigger-{os.getpid()}"
-    command = ["env", f"PROBE_EVENTS={events}", f"PROBE_GRAB_FILE={trigger}"]
-    if user:
-        command.append("PROBE_USER_KEY=1")
-    target = desk.launch([*command, str(binary)])
+    target = desk.launch(
+        [
+            "env",
+            f"PROBE_EVENTS={events}",
+            f"PROBE_GRAB_FILE={trigger}",
+            *(["PROBE_USER_KEY=1"] if user else []),
+            str(binary),
+        ]
+    )
     desk.focus(target.address)
     background = desk.window(background)
     desk.hypr.move_cursor(background.x + background.width // 2 + 1, background.y + background.height // 2 + 1)
@@ -102,6 +108,7 @@ def probe(desk, binary, output, background, user, verify, unload=False):
             not succeeded and isinstance(error, PluginError) and error.code == "refused" if user else succeeded,
         )
         verify(f"{name}_cursor_preserved", desk.hypr.cursor() == cursor)
+        verify(f"{name}_log_private", stat.S_IMODE(events.stat().st_mode) == 0o600)
     finally:
         if control.poll() is None:
             control.stdin.write("mods 0\nkey 29 0\nquit\n")
@@ -169,13 +176,19 @@ def main():
         os.environ["DESKPILOT_AGENT"] = args.agent
         session.stop()
         if private_pid:
-            verify("private_compositor_stopped", session.birth(private_pid) != private_birth)
-            verify("owned_processes_stopped", not session._tagged(token))
+            checks.update(
+                private_compositor_stopped=session.birth(private_pid) != private_birth,
+                owned_processes_stopped=not session._tagged(token),
+            )
         after = parent_state()
-        verify("parent_cursor_preserved", before["cursorpos"] == after["cursorpos"])
-        verify("parent_focus_preserved", before["activewindow"].get("address") == after["activewindow"].get("address"))
+        checks.update(
+            parent_cursor_preserved=before["cursorpos"] == after["cursorpos"],
+            parent_focus_preserved=before["activewindow"].get("address") == after["activewindow"].get("address"),
+        )
         args.output.write_text(json.dumps({"checks": checks}, indent=2) + "\n")
         print(args.output.read_text())
+    if not all(checks.values()):
+        raise RuntimeError("popup calibration checks failed")
 
 
 if __name__ == "__main__":
