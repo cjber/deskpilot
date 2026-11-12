@@ -456,13 +456,7 @@ namespace {
         SInputOwner& operator=(const SInputOwner&) = delete;
     };
 
-    // Whether the latest input event each client got was deskpilot's. A client keeps its entry after it disconnects; a
-    // new client at its address overwrites it with its first event.
-    std::map<wl_client*, bool> g_agentLast;
-
     uint32_t hkNextSerial(CSeatManager* self, SP<CWLSeatResource> seat, bool enter) {
-        if (seat)
-            g_agentLast[seat->client()] = g_agentInput;
         if (g_agentInput && seat)
             return wl_display_next_serial(g_pCompositor->m_wlDisplay);
         return reinterpret_cast<NextSerialFn>(g_serialHook->m_original)(self, seat, enter);
@@ -1724,12 +1718,11 @@ namespace {
     //   - A move, resize, pointer warp or activation that names the agent seat is ignored, as Hyprland finds no record of
     //     it, and its events carry serials Hyprland never records, so they earn nothing, as for hkNextSerial.
     //   - A popup it opens asks for its grab on the client's first seat (GTK 4 always grabs with the default seat), so
-    //     the grab is told from the user's by the client's latest input (hkAddOrStartGrab).
+    //     its grab is told from the user's by the input serial (hkAddOrStartGrab).
     void*             g_agentLibrary = nullptr;
     const SAgentSeat* g_agentSeat    = nullptr;
 
-    uint32_t agentSerial(wl_client* client) {
-        g_agentLast[client] = true;
+    uint32_t agentSerial(wl_client*) {
         return wl_display_next_serial(g_pCompositor->m_wlDisplay);
     }
 
@@ -2163,11 +2156,40 @@ namespace {
     using GrabFn = void (*)(CXDGShellProtocol*, SP<CXDGPopupResource>);
     CFunctionHook* g_grabHook = nullptr;
 
+    struct SSeatResources { friend constexpr auto member(SSeatResources); };
+    template struct SAccess<&CWLSeatProtocol::m_seatResources, SSeatResources>;
+    bool userSerialValid(wl_client* client, uint32_t serial) {
+        for (const auto& seat : (*PROTO::seat).*member(SSeatResources{})) {
+            if (seat->client() == client && g_pSeatManager->serialValid(seat, serial, false))
+                return true;
+        }
+        return false;
+    }
+
+    struct SPopupResource { friend constexpr auto member(SPopupResource); };
+    template struct SAccess<&CXDGPopupResource::m_resource, SPopupResource>;
+
+    wl_protocol_logger* g_popupLogger = nullptr;
+    std::optional<std::pair<wl_resource*, bool>> g_popupGrab;
+
+    // Wayland logs a request immediately before invoking its handler. Hyprland discards the grab serial in that
+    // handler, so capture its provenance here, against the real seat's existing serial history. Agent serials are
+    // deliberately absent from that history (hkNextSerial/agentSerial), even if GTK names the regular seat.
+    void popupRequest(void*, wl_protocol_logger_type direction, const wl_protocol_logger_message* message) {
+        if (direction != WL_PROTOCOL_LOGGER_REQUEST || message->arguments_count != 2 ||
+            std::string_view(wl_resource_get_class(message->resource)) != "xdg_popup" ||
+            std::string_view(message->message->name) != "grab")
+            return;
+        const auto SERIAL = message->arguments[1].u;
+        const bool user = userSerialValid(wl_resource_get_client(message->resource), SERIAL);
+        g_popupGrab = std::pair{message->resource, user};
+    }
+
     void hkAddOrStartGrab(CXDGShellProtocol* self, SP<CXDGPopupResource> popup) {
-        // A popup is opened by the latest input its client got. The seat its grab names does not say whose that was:
-        // GTK 4 names its first seat for a popup the agent seat opened.
         const auto SURFACE = popup && popup->m_surface ? popup->m_surface->m_surface.lock() : nullptr;
-        if (SURFACE && g_agentLast[SURFACE->client()]) {
+        const auto REQUEST = std::exchange(g_popupGrab, std::nullopt);
+        const auto RESOURCE = popup ? (*popup).*member(SPopupResource{}) : nullptr;
+        if (SURFACE && REQUEST && RESOURCE && REQUEST->first == RESOURCE->resource() && !REQUEST->second) {
             g_ungrabbed[SURFACE->client()].emplace_back(popup);
             return;
         }
@@ -2399,8 +2421,6 @@ namespace {
 
     // Selection protocols accept an input serial but Hyprland does not validate it. Agent events deliberately
     // have unrecorded serials, so validate at the request boundary, before either selection can be replaced.
-    struct SSeatResources { friend constexpr auto member(SSeatResources); };
-    template struct SAccess<&CWLSeatProtocol::m_seatResources, SSeatResources>;
     struct SDataResource { friend constexpr auto member(SDataResource); };
     template struct SAccess<&CWLDataDeviceResource::m_resource, SDataResource>;
     struct SPrimaryDevices { friend constexpr auto member(SPrimaryDevices); };
@@ -2412,13 +2432,6 @@ namespace {
     struct SPrimaryRequests { friend constexpr auto member(SPrimaryRequests); };
     template struct SAccess<&CZwpPrimarySelectionDeviceV1::requests, SPrimaryRequests>;
 
-    bool selectionSerialValid(wl_client* client, uint32_t serial) {
-        for (const auto& seat : (*PROTO::seat).*member(SSeatResources{})) {
-            if (seat->client() == client && g_pSeatManager->serialValid(seat, serial, false))
-                return true;
-        }
-        return false;
-    }
 
     template <typename T> using SelectionHandler = std::function<void(T*, wl_resource*, uint32_t)>;
     template <typename T> std::map<T*, SelectionHandler<T>> g_selectionHandlers;
@@ -2442,7 +2455,7 @@ namespace {
         });
         g_selectionHandlers<T>[self] = handler;
         SelectionHandler<T> guarded = [original = std::move(handler)](T* resource, wl_resource* source, uint32_t serial) {
-            if (selectionSerialValid(resource->client(), serial)) {
+            if (userSerialValid(resource->client(), serial)) {
                 original(resource, source, serial);
                 return;
             }
@@ -3958,6 +3971,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     g_pumpTimer = makeShared<CEventLoopTimer>(std::nullopt, pumpTick, nullptr);
     g_pEventLoopManager->addTimer(g_pumpTimer);
 
+    g_popupLogger = wl_display_add_protocol_logger(g_pCompositor->m_wlDisplay, popupRequest, nullptr);
+    if (!g_popupLogger)
+        throw std::runtime_error("deskpilot: could not observe popup grab requests");
     HyprlandAPI::registerHyprCtlCommand(handle, IPC::Socket1::SCommand{.name = "deskpilot", .match = IPC::Socket1::COMMAND_MATCH_PREFIX, .handler = onCommand});
     return {"deskpilot", "Clicks, scrolls and keys for agents that leave the user's pointer and focus in place", "cjber", VERSION};
 }
@@ -3986,6 +4002,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
     }
     g_tickets.clear();
     restorePaste();
+    if (g_popupLogger)
+        wl_protocol_logger_destroy(std::exchange(g_popupLogger, nullptr));
+    g_popupGrab.reset();
     selectionGuards(false);
     stopAgentSeat();
     agents::shutdown();

@@ -260,5 +260,11 @@ desktop and checks for surviving owned processes. Omit `--chrome` or `--wine` wh
 Wine checks require `winegcc`. GTK checks require system Python with GTK 3 and GTK 4 introspection. For a
 deterministic preservation check, use a parent created by `scripts/nested.py` so other desktop activity cannot
 change the measured cursor or focus.
+
+`scripts/popup_calibration.py --output /path/to/popups.json`, with the same explicit parent, checks a delayed
+agent popup after concurrent user input, genuine user popup grabs, and plugin unload/reload. It stops its private
+desktop and verifies owned-process cleanup and parent pointer/focus preservation. `--plugin /path/to/build.so`
+loads a baseline build in that private desktop for a red/green comparison.
+
 `scripts/containment_calibration.py SIGNATURE` and its `--negative` and `--negative-constraints` controls run only against a compositor owned by
 `scripts/nested.py`, testing agent-seat relative motion and pointer constraints.

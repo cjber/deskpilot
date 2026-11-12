@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Identify popup grabs by their input serial so concurrent user input cannot give an agent-opened popup the user’s pointer or keyboard.
+
 - Keep held user modifiers out of XWayland pointer actions and preserve keyboard state when replaying input received during an action.
 
 - Unfocused native keyboard sequences wait for serial-matched client replies before advancing, so Chrome shortcuts are not discarded as a single event batch.

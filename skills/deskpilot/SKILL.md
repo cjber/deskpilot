@@ -109,3 +109,7 @@ Each error starts with a code: `deskpilot: CODE: message`, or in MCP the result'
   again without invalidating the ids you hold, use `elements --peek`.
 - `offscreen`: the element is not showing, as in a collapsed menu or a scrolled-away row.
 - `no_tree`: the app exposes no accessibility tree. Use a shot and points instead.
+
+For a popup-grab regression in this checkout, run `scripts/popup_calibration.py --output /path/to/results.json`
+with an explicit parent `HYPRLAND_INSTANCE_SIGNATURE`. It uses and cleans up its own private desktop. The optional
+`--plugin /path/to/build.so` tests a baseline build there without loading it into the user's compositor.
