@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Nested test shutdown removes its owned runtime sockets and logs after verifying process exit, and refuses recycled process ids.
+
 - Captures use the same compositor as the target window, even when the inherited Wayland display differs.
 - Recorded shots detect reused window addresses before keys, typing, paste and pointer actions; take a new shot to select the replacement window.
 

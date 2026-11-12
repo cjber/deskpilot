@@ -117,6 +117,7 @@ def started(parent: str, events: socket.socket, run: Path, before: set[str]) -> 
     if not (placed and signature):
         sys.exit(f"the nested Hyprland did not come up; see {log}")
     (run / "signature").write_text(signature)
+    (run / "birth").write_text(process_birth(int(pidfile.read_text())) or "")
 
     hyprctl(signature, "output", "create", "headless", OUTPUT)
     for _ in range(50):
@@ -139,23 +140,37 @@ def started(parent: str, events: socket.socket, run: Path, before: set[str]) -> 
     }
 
 
+def process_birth(pid: int) -> str | None:
+    """A process's kernel start time, or None after exit, including a zombie waiting for its parent."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] == "Z" else fields[19]
+    except (OSError, IndexError):
+        return None
+
+
 def kill(pidfile: Path) -> None:
-    """SIGTERM the run's compositor, then SIGKILL it if it is still up after five seconds."""
+    """Stop only the recorded process, waiting for its exit before allowing cleanup."""
     try:
         pid = int(pidfile.read_text())
     except (OSError, ValueError):
         return
+    birth = process_birth(pid)
+    if birth is None:
+        return
+    recorded_birth = pidfile.with_name("birth")
+    if recorded_birth.exists() and recorded_birth.read_text() != birth:
+        sys.exit(f"pid {pid} has been reused; refusing to signal it")
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.kill(pid, sig)
         except ProcessLookupError:
             return
         for _ in range(50):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if process_birth(pid) != birth:
                 return
             time.sleep(0.1)
+    sys.exit(f"pid {pid} did not exit; keeping its run directory")
 
 
 def recorded(run: Path) -> str | None:
@@ -178,14 +193,24 @@ def stop(signature: str) -> None:
         if not any(i["instance"] == signature and i["pid"] == pid for i in listed):
             sys.exit(f"{signature} does not belong to the run in {run}; refusing to stop it")
         hyprctl(signature, "dispatch", "hl.dsp.exit()")
-    for _ in range(50):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
-    else:
-        kill(run / "pid")
+    birth = process_birth(pid)
+    if birth is not None:
+        recorded_birth = run / "birth"
+        if not recorded_birth.exists() or recorded_birth.read_text() != birth:
+            sys.exit(f"cannot verify pid {pid}; keeping the run directory")
+        for _ in range(50):
+            if process_birth(pid) != birth:
+                break
+            time.sleep(0.1)
+        else:
+            kill(run / "pid")
+    if alive(signature):
+        sys.exit(f"{signature} still accepts connections; keeping its runtime directory")
+    runtime = RUNTIME / signature
+    if runtime.parent != RUNTIME or runtime.is_symlink():
+        sys.exit(f"invalid runtime directory {runtime}")
+    if runtime.exists():
+        shutil.rmtree(runtime)
     shutil.rmtree(run)
     print(json.dumps({"stopped": signature}))
 
