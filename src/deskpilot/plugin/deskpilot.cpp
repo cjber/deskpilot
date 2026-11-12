@@ -156,6 +156,7 @@
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <format>
 #include <functional>
 #include <map>
@@ -3242,8 +3243,17 @@ namespace {
         constexpr auto GRACE = std::chrono::seconds(5);
         constexpr auto CHECK = std::chrono::seconds(30);
 
+        // A process `launch` registered: its Linux start time (clock ticks since boot, field 22 of /proc/PID/stat) tells
+        // it from a later process that reuses the pid. `rule` places its windows by pid when the app scrubbed the token
+        // from its environment; it is the main process alone, since its children do not carry the pid.
+        struct SProcess {
+            uint64_t                       birth = 0;
+            SP<Desktop::Rule::CWindowRule> rule;
+        };
+
         struct SAgent {
             SP<Desktop::Rule::CWindowRule> rule;
+            std::map<pid_t, SProcess>      processes;
             // The process whose exit stops the agent; 0 stops it after IDLE instead.
             pid_t           owner = 0;
             Time::steady_tp used;
@@ -3263,6 +3273,68 @@ namespace {
             return "special:agent-" + name;
         }
 
+        // The process's start time, or nullopt when it is gone.
+        std::optional<uint64_t> birthOf(pid_t pid) {
+            std::ifstream file(std::format("/proc/{}/stat", pid));
+            std::string   line;
+            if (!std::getline(file, line))
+                return std::nullopt;
+            // The command name, in parentheses, may hold spaces and parentheses: fields follow the last ')'. The first
+            // is the state (field 3), so the start time (field 22) is the 20th.
+            const auto CLOSE = line.rfind(')');
+            if (CLOSE == std::string::npos)
+                return std::nullopt;
+            std::istringstream fields(line.substr(CLOSE + 1));
+            std::string        field;
+            for (int i = 0; i < 20; ++i) {
+                if (!(fields >> field))
+                    return std::nullopt;
+            }
+            uint64_t birth = 0;
+            const auto [END, ERROR] = std::from_chars(field.data(), field.data() + field.size(), birth);
+            if (ERROR != std::errc() || END != field.data() + field.size())
+                return std::nullopt;
+            return birth;
+        }
+
+        // The agent a process's environment names by token, if any.
+        std::optional<std::string> taggedAs(pid_t pid) {
+            const std::string PREFIX = std::format("{}={}", Desktop::Rule::EXEC_RULE_ENV_NAME, token(""));
+            std::ifstream     file(std::format("/proc/{}/environ", pid), std::ios::binary);
+            for (std::string entry; std::getline(file, entry, '\0');) {
+                if (entry.starts_with(PREFIX))
+                    return entry.substr(PREFIX.size());
+            }
+            return std::nullopt;
+        }
+
+        // Whether the agent launched this process: `launch` registered it and it is the same process (the start time
+        // still matches, so a pid reused since is refused), or its environment carries the agent's token, which the
+        // app's children inherit. A scrubbed environment loses the token; the registered main process still counts.
+        bool owns(const std::string& name, pid_t pid) {
+            const auto IT = g_agents.find(name);
+            if (IT != g_agents.end()) {
+                const auto PROCESS = IT->second.processes.find(pid);
+                if (PROCESS != IT->second.processes.end()) {
+                    const auto BIRTH = birthOf(pid);
+                    return BIRTH && *BIRTH == PROCESS->second.birth;
+                }
+            }
+            return taggedAs(pid) == name;
+        }
+
+        // SIGTERM to a process only if it is still the one that was registered: the pidfd holds the process, so the
+        // start time read through it cannot go to a reused pid between the check and the signal.
+        void terminate(pid_t pid, uint64_t birth) {
+            const int FD = static_cast<int>(syscall(SYS_pidfd_open, pid, 0));
+            if (FD < 0)
+                return;
+            const auto BIRTH = birthOf(pid);
+            if (BIRTH && *BIRTH == birth)
+                syscall(SYS_pidfd_send_signal, FD, SIGTERM, nullptr, 0);
+            close(FD);
+        }
+
         SP<Desktop::Rule::CWindowRule> makeRule(const std::string& name) {
             auto rule = Desktop::Rule::CWindowRule::buildFromExecString(
                 std::format("workspace {} silent;no_initial_focus 1;suppress_event activate activatefocus fullscreen maximize", workspace(name)));
@@ -3276,18 +3348,32 @@ namespace {
             return *rule;
         }
 
+        // The rule for one registered process: the agent's token pattern, which Hyprland's matcher replaces by this pid
+        // when the window's process has no token in its environment. It is not an exec rule, since Hyprland consumes those
+        // at the first window; it is dropped here when the process ends.
+        SP<Desktop::Rule::CWindowRule> makePidRule(const std::string& name, pid_t pid) {
+            auto rule = makeRule(name);
+            if (rule)
+                rule->registerMatch(Desktop::Rule::RULE_PROP_EXEC_PID, std::to_string(pid));
+            return rule;
+        }
+
         // Each process this user may read, with the agent its environment names by token, if any.
-        void eachTagged(const std::function<void(pid_t, const std::string&)>& fn) {
+        void eachTagged(const std::function<void(pid_t, const std::string&, uint64_t)>& fn) {
             const std::string PREFIX = std::format("{}={}", Desktop::Rule::EXEC_RULE_ENV_NAME, token(""));
             std::error_code   error;
             for (const auto& dir : std::filesystem::directory_iterator("/proc", error)) {
                 const auto PID = number(dir.path().filename().string());
                 if (!PID || *PID <= 1 || *PID == getpid())
                     continue;
+                const auto BIRTH = birthOf(static_cast<pid_t>(*PID));
+                if (!BIRTH)
+                    continue;
                 std::ifstream file(dir.path() / "environ", std::ios::binary);
                 for (std::string entry; std::getline(file, entry, '\0');) {
                     if (entry.starts_with(PREFIX)) {
-                        fn(static_cast<pid_t>(*PID), entry.substr(PREFIX.size()));
+                        if (birthOf(static_cast<pid_t>(*PID)) == BIRTH)
+                            fn(static_cast<pid_t>(*PID), entry.substr(PREFIX.size()), *BIRTH);
                         break;
                     }
                 }
@@ -3316,31 +3402,57 @@ namespace {
             dropTimer(IT->second.stopping);
             if (IT->second.rule)
                 Desktop::Rule::ruleEngine()->unregisterRule(IT->second.rule);
+            for (auto& [pid, process] : IT->second.processes) {
+                if (process.rule)
+                    Desktop::Rule::ruleEngine()->unregisterRule(process.rule);
+            }
             g_agents.erase(IT);
         }
 
-        // Asks each of the agent's windows to close, as the user closing it would, and sends SIGTERM to its processes
-        // left after GRACE. The rule stays until then, so a window opened meanwhile still lands out of view.
+        // Asks each window of a process the agent launched to close, as the user closing it would, and sends SIGTERM to
+        // those processes left after GRACE: the registered ones, if still the same process, and any whose environment
+        // carries the agent's token. A window of the user's on the agent's workspace is left alone. The rules stay until
+        // then, so a window opened meanwhile still lands out of view.
         void stop(const std::string& name) {
             auto& agent = g_agents.at(name);
             if (agent.stopping)
                 return;
-            const auto WORKSPACE = workspace(name);
             for (const auto& window : Desktop::windowState()->windows()) {
-                if (window->mapped() && window->m_workspace && window->m_workspace->addressableName() == WORKSPACE)
+                if (window->mapped() && owns(name, window->backend().pid()))
                     window->sendClose();
             }
             agent.stopping = makeShared<CEventLoopTimer>(
                 GRACE,
                 [name](SP<CEventLoopTimer>, void*) {
-                    eachTagged([&name](pid_t pid, const std::string& agent) {
+                    if (const auto IT = g_agents.find(name); IT != g_agents.end()) {
+                        for (const auto& [pid, process] : IT->second.processes)
+                            terminate(pid, process.birth);
+                    }
+                    eachTagged([&name](pid_t pid, const std::string& agent, uint64_t birth) {
                         if (agent == name)
-                            kill(pid, SIGTERM);
+                            terminate(pid, birth);
                     });
                     forget(name);
                 },
                 nullptr);
             g_pEventLoopManager->addTimer(agent.stopping);
+        }
+
+        // Drops the rule of each registered process that has ended or whose pid was reused, so a later process with that
+        // pid is not placed on the agent's workspace. While stopping, they stay for the SIGTERM check.
+        void dropEnded(SAgent& agent) {
+            if (agent.stopping)
+                return;
+            for (auto it = agent.processes.begin(); it != agent.processes.end();) {
+                const auto BIRTH = birthOf(it->first);
+                if (BIRTH && *BIRTH == it->second.birth) {
+                    ++it;
+                    continue;
+                }
+                if (it->second.rule)
+                    Desktop::Rule::ruleEngine()->unregisterRule(it->second.rule);
+                it = agent.processes.erase(it);
+            }
         }
 
         void reap(SP<CEventLoopTimer> self, void*) {
@@ -3353,13 +3465,15 @@ namespace {
             }
             for (const auto& name : due)
                 stop(name);
+            for (auto& [name, agent] : g_agents)
+                dropEnded(agent);
             self->updateTimeout(CHECK);
         }
 
         // A reloaded plugin starts with no agents, while their apps run on: it takes them back from the apps' tokens,
         // so their next window still opens out of view. Their owners are not known again until they next register.
         void init() {
-            eachTagged([](pid_t, const std::string& name) {
+            eachTagged([](pid_t, const std::string& name, uint64_t) {
                 if (agentcursor::validName(name) && !g_agents.contains(name))
                     ensure(name);
             });
@@ -3369,6 +3483,10 @@ namespace {
                 for (auto& [name, agent] : g_agents) {
                     if (agent.rule)
                         Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(agent.rule));
+                    for (auto& [pid, process] : agent.processes) {
+                        if (process.rule)
+                            Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(process.rule));
+                    }
                 }
             });
         }
@@ -3382,39 +3500,84 @@ namespace {
                 dropTimer(agent.stopping);
                 if (agent.rule)
                     Desktop::Rule::ruleEngine()->unregisterRule(agent.rule);
+                for (auto& [pid, process] : agent.processes) {
+                    if (process.rule)
+                        Desktop::Rule::ruleEngine()->unregisterRule(process.rule);
+                }
             }
             g_agents.clear();
         }
 
         // `agent NAME [owner=PID]` registers NAME's rule if it has none and marks it in use; an owner, once given, is
-        // kept. `agent NAME stop` stops it. Both answer at once.
+        // kept. `agent NAME pid=PID birth=TICKS` also registers the main process `launch` is holding at its gate, by its
+        // start time (refused if PID no longer has it), so its windows are placed by pid when it scrubs the token from
+        // its environment. `agent NAME owns PID...` answers which of those processes the agent launched.
+        // `agent NAME stop` stops it. All answer at once.
         IPC::Socket1::SResponse command(const std::vector<std::string>& args) {
-            constexpr auto USAGE = "usage: deskpilot agent <name> [owner=PID] | agent <name> stop";
-            if (args.size() < 3 || args.size() > 4)
+            constexpr auto USAGE = "usage: deskpilot agent <name> [owner=PID | pid=PID birth=TICKS | owns PID... | stop]";
+            if (args.size() < 3)
                 return refuse(USAGE);
             const std::string& NAME = args[2];
             if (!agentcursor::validName(NAME))
                 return refuse(std::format("bad agent name '{}': use up to {} letters, digits, '-', '_' or '.'", NAME, agentcursor::NAME_MAX));
             const auto IT = g_agents.find(NAME);
-            // An agent the plugin no longer knows, as after it was reloaded, is stopped all the same.
             if (args.size() == 4 && args[3] == "stop") {
+                // An agent the plugin no longer knows, as after it was reloaded, is stopped all the same.
                 g_agents[NAME];
                 stop(NAME);
                 return IPC::Socket1::SResponse(okReply());
             }
-            pid_t owner = 0;
-            if (args.size() == 4) {
+            if (args.size() > 3 && args[3] == "owns") {
+                std::string owned;
+                for (size_t i = 4; i < args.size(); ++i) {
+                    const auto PID = number(args[i]);
+                    if (!PID || *PID <= 1)
+                        return refuse(USAGE);
+                    if (owns(NAME, static_cast<pid_t>(*PID)))
+                        owned += (owned.empty() ? "" : ",") + args[i];
+                }
+                return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"owned":[{}]}})", owned));
+            }
+            pid_t    owner = 0;
+            pid_t    registered = 0;
+            uint64_t birth      = 0;
+            if (args.size() == 5 && args[3].starts_with("pid=") && args[4].starts_with("birth=")) {
+                const auto PID = number(args[3].substr(4)), BIRTH = number(args[4].substr(6));
+                if (!PID || *PID <= 1 || !BIRTH || *BIRTH < 0)
+                    return refuse(USAGE);
+                registered = static_cast<pid_t>(*PID);
+                birth      = static_cast<uint64_t>(*BIRTH);
+            } else if (args.size() == 4) {
                 const auto PID = args[3].starts_with("owner=") ? number(args[3].substr(6)) : std::nullopt;
                 if (!PID || *PID <= 1)
                     return refuse(USAGE);
                 owner = static_cast<pid_t>(*PID);
+            } else if (args.size() != 3) {
+                return refuse(USAGE);
             }
             if (IT != g_agents.end() && IT->second.stopping)
                 return refuse(std::format("agent {} is stopping; try again in {} seconds", NAME, GRACE.count()), "busy");
+            if (registered) {
+                const auto NOW = birthOf(registered);
+                if (!NOW || *NOW != birth)
+                    return refuse(std::format("process {} is not the one launched: it ended or its pid was reused", registered), "gone");
+            }
             if (!ensure(NAME))
                 return refuse("could not build the window rule for agent " + NAME);
             if (owner)
                 g_agents[NAME].owner = owner;
+            if (registered) {
+                auto& process = g_agents[NAME].processes[registered];
+                if (process.rule)
+                    Desktop::Rule::ruleEngine()->unregisterRule(process.rule);
+                process.birth = birth;
+                process.rule  = makePidRule(NAME, registered);
+                if (!process.rule) {
+                    g_agents[NAME].processes.erase(registered);
+                    return refuse("could not build the window rule for process " + std::to_string(registered));
+                }
+                Desktop::Rule::ruleEngine()->registerRule(SP<Desktop::Rule::IRule>(process.rule));
+            }
             return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"workspace":{},"token":{}}})", jsonString(workspace(NAME)), jsonString(token(NAME))));
         }
     }
@@ -3536,7 +3699,7 @@ namespace {
         if (VERB == "popups")
             return popupsCommand(args);
         return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>... | "
-                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|stop] | "
+                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|pid=PID birth=TICKS|owns PID...|stop] | "
                       "end <ticket> | wait <ticket> | status; a key event is +code, -code, pHEX, rHEX or tHEX, and a path step sX,Y or s (first), mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
 }

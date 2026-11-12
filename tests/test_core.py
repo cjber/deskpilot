@@ -174,7 +174,6 @@ def test_a_capture_that_gets_no_frame_is_a_timeout(tmp_path, monkeypatch):
 
 def test_a_hidden_shot_of_a_window_outside_its_monitor_is_refused_before_grim(tmp_path, monkeypatch):
     desk, fake, _, _ = make_desk(tmp_path, monkeypatch)
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
     shot = []
     monkeypatch.setattr(screen, "capture", lambda win, out, max_width: shot.append(win.address))
     fake.clients = [AGENT_CLIENT]
@@ -248,10 +247,22 @@ class FakePlugin:
     def __init__(self):
         self.calls = []
         self.mapped: list[dict] = []  # the window's popups
+        self.owns: set[int] | None = None
+        self.claim_error: Exception | None = None
 
     def register(self, owner=None):
         self.calls.append(("register", owner))
         return {"ok": True, "workspace": "special:agent-tester", "token": "deskpilot-agent-tester"}
+
+    def claim(self, pid, birth):
+        self.calls.append(("claim", pid, birth))
+        if self.claim_error:
+            raise self.claim_error
+        return {"ok": True}
+
+    def owned(self, pids):
+        """The pids the plugin says the agent launched: all of them unless a test names which."""
+        return set(pids) if self.owns is None else set(pids) & self.owns
 
     def stop(self):
         self.calls.append(("stop",))
@@ -322,7 +333,6 @@ def launched_desk(tmp_path, monkeypatch):
     """A desk whose one window the agent launched, for hidden actions."""
     desk, fake, inp, plugin = make_desk(tmp_path, monkeypatch)
     fake.clients = [AGENT_CLIENT]
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
     return desk, fake, inp, plugin
 
 
@@ -331,7 +341,7 @@ def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkey
     # A window the user moved onto the agent's workspace has no launch token.
     moved = {**CLIENT, "address": "0x123", "pid": 8, "workspace": {"name": "special:agent-tester"}}
     fake.clients += [AGENT_CLIENT, moved]
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: pid == 7 and token == "deskpilot-agent-tester")
+    plugin.owns = {7}
     with pytest.raises(WindowNotFound, match="deskpilot launch"):
         desk.click("0x123", 100, 50, hidden=True)
     plugin.calls.clear()
@@ -348,30 +358,131 @@ def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkey
         desk.click("0xdef", 100, 50, hidden=True, take_focus=True)
 
 
-def test_launch_tags_the_app_for_the_agent_s_workspace_and_returns_its_window(tmp_path, monkeypatch):
+class Gate:
+    """What a launch's gate shell was started with and what reached its pipe, in order."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.made: list[FakePopen] = []
+        self.events: list = []
+        self.on_start = lambda: None
+
+
+GATE = Gate()
+
+
+class FakePopen:
+    def __init__(self, command, env, **kwargs):
+        self.command, self.env, self.kwargs = command, env, kwargs
+        self.pid = 5150
+        self.stdin = FakeGate()
+        self.ended = False
+        GATE.made.append(self)
+        GATE.on_start()
+
+    def poll(self):
+        return 1 if self.ended else None
+
+    def terminate(self):
+        GATE.events.append("terminate")
+        self.ended = True
+
+    def wait(self):
+        GATE.events.append("wait")
+
+
+class FakeGate:
+    def write(self, data):
+        GATE.events.append(("release", data))
+
+    def close(self):
+        GATE.events.append("close")
+
+
+def gated_launch(tmp_path, monkeypatch, birth=987654):
     desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    GATE.reset()
+    monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "the-terminal-s")
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(desk_module, "process_birth", lambda pid: birth if pid == 5150 else None)
+    monkeypatch.setattr(desk_module.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
+    # The plugin's claim and the release of the gate are one ordered sequence.
+    plugin_claim = plugin.claim
+    plugin.claim = lambda pid, b: GATE.events.append(("claim", pid, b)) or plugin_claim(pid, b)
+    return desk, fake, plugin
+
+
+def test_launch_holds_the_app_at_a_gate_until_the_plugin_has_its_pid_and_birth(tmp_path, monkeypatch):
+    desk, fake, plugin = gated_launch(tmp_path, monkeypatch)
     desk.owner = 4242
     fake.clients.append({**AGENT_CLIENT, "stableId": "1"})
-    monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "the-terminal-s")
-    started = []
-
-    class FakePopen:
-        def __init__(self, command, env, **kwargs):
-            started.append((command, env, kwargs))
-            # Hyprland gives the new window the address of one closed before, with a new stable id.
-            fake.clients[:] = [CLIENT, {**AGENT_CLIENT, "stableId": "2"}]
-
-        def poll(self):
-            return None
-
-    monkeypatch.setattr(subprocess, "Popen", FakePopen)
-    assert desk.launch(["gnome-calculator"]).address == "0xdef"
-    ((command, env, kwargs),) = started
-    assert command == ["gnome-calculator"] and kwargs["start_new_session"]
-    assert env["HL_EXEC_RULE_TOKEN"] == "deskpilot-agent-tester" and "HL_INITIAL_WORKSPACE_TOKEN" not in env
-    assert plugin.calls == [("register", 4242)]
+    # Hyprland gives the new window the address of one closed before, with a new stable id.
+    GATE.on_start = lambda: fake.clients.__setitem__(slice(None), [CLIENT, {**AGENT_CLIENT, "stableId": "2"}])
+    assert desk.launch(["gnome-calculator", "--arg"]).address == "0xdef"
+    (gate,) = GATE.made
+    assert gate.command == ["sh", "-c", desk_module.LAUNCH_GATE, "deskpilot-launch", "gnome-calculator", "--arg"]
+    assert gate.kwargs["start_new_session"] and gate.kwargs["stdin"] == subprocess.PIPE
+    assert gate.env["HL_EXEC_RULE_TOKEN"] == "deskpilot-agent-tester" and "HL_INITIAL_WORKSPACE_TOKEN" not in gate.env
+    # The plugin has the process before the line that lets it become the app, and the pipe closes after the line.
+    assert GATE.events == [("claim", 5150, 987654), ("release", b"\n"), "close"]
+    assert plugin.calls == [("register", 4242), ("claim", 5150, 987654)]
     desk.stop()
     assert plugin.calls[-1] == ("stop",)
+
+
+def test_a_failed_registration_ends_the_waiting_app_without_releasing_it(tmp_path, monkeypatch):
+    desk, _, plugin = gated_launch(tmp_path, monkeypatch)
+    plugin.claim_error = PluginError("process 5150 is not the one launched", "gone")
+    with pytest.raises(PluginError, match="not the one launched"):
+        desk.launch(["gnome-calculator"])
+    assert GATE.events == [("claim", 5150, 987654), "terminate", "wait"], "the app was never released"
+
+
+def test_a_process_that_ended_before_its_birth_was_read_is_not_released(tmp_path, monkeypatch):
+    desk, _, plugin = gated_launch(tmp_path, monkeypatch, birth=None)
+    with pytest.raises(RuntimeError, match="before it could be registered"):
+        desk.launch(["gnome-calculator"])
+    assert GATE.events == ["terminate", "wait"] and not any(c[0] == "claim" for c in plugin.calls)
+
+
+def test_an_app_the_system_cannot_find_is_refused_before_anything_starts(tmp_path, monkeypatch):
+    desk, _, _ = gated_launch(tmp_path, monkeypatch)
+    monkeypatch.setattr(desk_module.shutil, "which", lambda name, path=None: None)
+    with pytest.raises(ValueError, match="cannot start nope"):
+        desk.launch(["nope"])
+    assert GATE.made == []
+
+
+def test_process_birth_is_the_start_time_even_with_parentheses_in_the_name(tmp_path, monkeypatch):
+    fields = ["S", *["0"] * 18, "424242", "0"]  # state is field 3, so the start time is the 20th after the name
+    stat = tmp_path / "stat"
+    stat.write_text(f"5150 (a b) c) {' '.join(fields)}\n")
+    real = pathlib.Path.read_text
+    monkeypatch.setattr(
+        pathlib.Path,
+        "read_text",
+        lambda self, *a, **k: real(stat) if self == pathlib.Path("/proc/5150/stat") else real(self, *a, **k),
+    )
+    assert desk_module.process_birth(5150) == 424242
+    assert desk_module.process_birth(2**22 + 1) is None
+
+
+def test_plugin_claims_and_asks_which_processes_are_owned():
+    calls = []
+
+    def run(args):
+        calls.append(args)
+        return '{"ok":true,"owned":[7]}' if "owns" in args else '{"ok":true}'
+
+    plugin = Plugin(run, agent="tester")
+    plugin.claim(5150, 987654)
+    assert plugin.owned([7, 8]) == {7} and plugin.owned([]) == set()
+    assert calls == [
+        ["deskpilot", "agent", "tester", "pid=5150", "birth=987654"],
+        ["deskpilot", "agent", "tester", "owns", "7", "8"],
+    ]
 
 
 def test_cursor_off_sends_plain_paths(tmp_path, monkeypatch):
@@ -442,7 +553,6 @@ def test_plugin_puts_the_key_mode_after_the_window():
 def test_hidden_keys_name_the_mode_and_never_focus(tmp_path, monkeypatch):
     desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
     fake.clients.append(AGENT_CLIENT)
-    monkeypatch.setattr(desk_module, "launched_by", lambda pid, token: True)
     desk.key("Return", "0xdef", hidden=True)
     desk.type("x", "0xdef", hidden=True)
     desk.paste("hi", "0xdef", hidden=True)

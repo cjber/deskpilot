@@ -221,6 +221,19 @@ class Plugin:
         the token `launch` puts in the app's environment."""
         return self._call("agent", self._named(), *([f"owner={owner}"] if owner else []))
 
+    def claim(self, pid: int, birth: int) -> dict:
+        """Register the main process of a launch held at its gate, so its windows open on the hidden workspace even if
+        the app scrubs the launch token from its environment. `birth` is its Linux start time (`process_birth`), which
+        tells it from a later process reusing the pid; the plugin refuses with code `gone` if `pid` no longer has it."""
+        return self._call("agent", self._named(), f"pid={pid}", f"birth={birth}")
+
+    def owned(self, pids: list[int]) -> set[int]:
+        """Which of these processes the agent launched: a claimed one still the same process, or one whose environment
+        carries the agent's token (an app's children inherit it)."""
+        if not pids:
+            return set()
+        return set(self._call("agent", self._named(), "owns", *map(str, pids))["owned"])
+
     def stop(self) -> None:
         """Close this agent's windows, and end its apps' processes left five seconds later."""
         self._call("agent", self._named(), "stop")

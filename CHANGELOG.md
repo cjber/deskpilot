@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Hidden launches also recognize registered processes that erase their launch environment.
+
 - Private launches resolve relative commands and paths from the caller's working directory.
 
 - `key` and `type` accept `--agent-keyboard` for native applications that support an independent keyboard seat.

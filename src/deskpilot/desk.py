@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -74,13 +75,21 @@ HOVER_SHOT_MS = 5000
 LAUNCH_TIMEOUT = 30.0
 
 
-def launched_by(pid: int, token: str) -> bool:
-    """Whether the process carries an agent's launch token, which `launch` set and the app's children inherit."""
+# What the launch gate's shell does: wait for one line, then become the app, so the app keeps the shell's pid. The line
+# comes once the plugin has the pid and its start time; a closed pipe with no line makes the shell exit instead.
+LAUNCH_GATE = 'IFS= read -r _ || exit 125; exec "$@"'
+
+
+def process_birth(pid: int) -> int | None:
+    """The process's Linux start time in clock ticks since boot (field 22 of /proc/PID/stat), which stays the same
+    through `exec` and differs for a later process that reuses the pid. None once the process is gone."""
     try:
-        environ = Path(f"/proc/{pid}/environ").read_bytes()
+        stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
-        return False
-    return f"HL_EXEC_RULE_TOKEN={token}".encode() in environ.split(b"\0")
+        return None
+    # The command name, in parentheses, may hold spaces: the fields follow the last ')', starting with the state (3).
+    fields = stat[stat.rfind(")") + 1 :].split()
+    return int(fields[19]) if len(fields) > 19 and fields[19].isdigit() else None
 
 
 def owner_from_env() -> int | None:
@@ -143,12 +152,10 @@ class Desk:
             show = True
         if hidden:
             agent = self._register()
-            # A window the user moved there is still theirs: only the agent's launched apps carry its token.
-            mine = [
-                w
-                for w in self.hypr.windows()
-                if w.workspace == agent["workspace"] and launched_by(w.pid, agent["token"])
-            ]
+            # A window the user moved there is still theirs: the plugin says which processes the agent launched.
+            there = [w for w in self.hypr.windows() if w.workspace == agent["workspace"]]
+            owned = self.plugin.owned(sorted({w.pid for w in there}))
+            mine = [w for w in there if w.pid in owned]
             try:
                 win = find_window(mine, query)
                 if not refresh:
@@ -241,11 +248,16 @@ class Desk:
         # Hyprland places a window carrying this on the workspace its launcher was started from, ahead of rules.
         env.pop("HL_INITIAL_WORKSPACE_TOKEN", None)
         self._launched = [p for p in self._launched if p.poll() is None]
+        if shutil.which(command[0], path=env.get("PATH")) is None:
+            raise ValueError(f"cannot start {command[0]}: No such file or directory")
+        # The app's main process is held at a gate until the plugin has its pid and start time, so a window it opens
+        # with the launch token scrubbed from its environment is still placed by pid. Closing the pipe after the line
+        # leaves the app a stdin at end of file, as /dev/null was.
         try:
             proc = subprocess.Popen(
-                command,
+                ["sh", "-c", LAUNCH_GATE, "deskpilot-launch", *command],
                 env=env,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -253,6 +265,19 @@ class Desk:
         except OSError as error:
             raise ValueError(f"cannot start {command[0]}: {error.strerror}") from error
         self._launched.append(proc)
+        try:
+            birth = process_birth(proc.pid)
+            if birth is None:
+                raise RuntimeError(f"{command[0]} ended before it could be registered")
+            self.plugin.claim(proc.pid, birth)
+            assert proc.stdin is not None
+            proc.stdin.write(b"\n")
+            proc.stdin.close()
+        except BaseException:
+            # Nothing was released: end the waiting shell rather than leave it holding a pipe.
+            proc.terminate()
+            proc.wait()
+            raise
         deadline = time.monotonic() + timeout
         while True:
             new = [
