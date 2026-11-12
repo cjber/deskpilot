@@ -11,6 +11,7 @@ def test_atomic_write_never_leaves_partial_json(tmp_path):
     target = tmp_path / "owners.json"
     session._atomic_write(target, json.dumps({"123": "birth"}))
     assert json.loads(target.read_text()) == {"123": "birth"}
+    assert target.stat().st_mode & 0o777 == 0o600
     assert not list(tmp_path.glob(".*owners.json.*"))
 
 

@@ -251,10 +251,14 @@ claude mcp add deskpilot -- deskpilot mcp
 For live input calibration, use an explicit parent compositor and a private desktop:
 
 ```sh
-HYPRLAND_INSTANCE_SIGNATURE=... uv run python scripts/input_calibration.py --chrome --output /path/to/results.json
+HYPRLAND_INSTANCE_SIGNATURE=... uv run python scripts/input_calibration.py --chrome --wine --output /path/to/results.json
 ```
 
-This checks GTK 3 pointer and paste input, GTK 4 independent keyboards, native Chrome, selections and parent
-focus/cursor preservation, then stops its desktop. It requires system Python with GTK 3 and GTK 4 introspection.
-`scripts/containment_calibration.py SIGNATURE` and its `--negative` control run only against a compositor owned by
+This checks GTK 3 pointer and paste input, GTK 4 independent keyboards, native and XWayland Chrome, Wine
+punctuation and ordinary/raw button events, selections and parent focus/cursor preservation. It then stops its
+desktop and checks for surviving owned processes. Omit `--chrome` or `--wine` when those clients are unavailable;
+Wine checks require `winegcc`. GTK checks require system Python with GTK 3 and GTK 4 introspection. For a
+deterministic preservation check, use a parent created by `scripts/nested.py` so other desktop activity cannot
+change the measured cursor or focus.
+`scripts/containment_calibration.py SIGNATURE` and its `--negative` and `--negative-constraints` controls run only against a compositor owned by
 `scripts/nested.py`, testing agent-seat relative motion and pointer constraints.

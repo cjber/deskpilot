@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -341,9 +342,14 @@ def _reap_services(path: Path) -> bool:
 
 
 def _atomic_write(path: Path, value: str) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    temporary.write_text(value)
-    os.replace(temporary, path)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(value)
+            stream.close()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _prune_owners(path: Path) -> dict[str, str]:

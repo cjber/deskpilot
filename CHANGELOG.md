@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Private launches resolve relative commands and paths from the caller's working directory.
+
 - `key` and `type` accept `--agent-keyboard` for native applications that support an independent keyboard seat.
 - Typing parentheses in Wine uses number-row chords instead of extended duplicate keys Wine cannot translate.
 

@@ -7,6 +7,7 @@ this checkout. Optional Chrome checks use the private profile, not a signed-in b
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import json
 import os
@@ -67,6 +68,47 @@ def calibrate_wine(desk, output, verify):
     verify("wine_raw_pointer_buttons", "RAW_DOWN" in rows and "RAW_UP" in rows)
 
 
+def calibrate_x11_pointer(desk, chrome, background, verify):
+    html = """<title>Deskpilot X11 pointer calibration</title>
+<button id=t onpointerdown="events.value=JSON.stringify({type:event.type,
+button:event.button,pointerType:event.pointerType,ctrlKey:event.ctrlKey});
+if(event.button===0&&event.pointerType==='mouse'&&!event.ctrlKey)result.value='OPEN'">Trigger</button>
+<input id=result aria-label=result value=CLOSED><textarea id=events aria-label=events></textarea>"""
+    url = "data:text/html;base64," + base64.b64encode(html.encode()).decode()
+    browser = desk.launch(
+        [
+            chrome,
+            "--ozone-platform=x11",
+            "--force-renderer-accessibility",
+            "--no-first-run",
+            "--no-default-browser-check",
+            f"--user-data-dir={os.environ['HOME']}/chrome-x11",
+            url,
+        ]
+    )
+    verify("chrome_x11_window", browser.xwayland)
+    desk.focus(background)
+    deadline = time.monotonic() + 5
+    trigger = None
+    while time.monotonic() < deadline:
+        tree = list(descendants(desk.elements(browser.address)))
+        trigger = next((e for e in tree if e.name == "Trigger" and e.role == "button"), None)
+        if trigger is not None:
+            break
+        time.sleep(0.05)
+    if trigger is None:
+        raise RuntimeError("XWayland calibration page did not expose its Trigger button")
+    desk.shot(browser.address)
+    desk.click(browser.address, None, None, element=trigger.id)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        tree = list(descendants(desk.elements(browser.address)))
+        if any(e.name == "result" and e.text == "OPEN" for e in tree):
+            break
+        time.sleep(0.05)
+    verify("chrome_x11_unfocused_pointerdown", any(e.name == "result" and e.text == "OPEN" for e in tree))
+
+
 def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration with one cleanup boundary
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agent", default=f"calibration-{os.getpid()}")
@@ -82,7 +124,8 @@ def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration wit
     checks = {}
     processes = []
     desk = None
-    private_pid, private_birth = 0, None
+    private_pid, private_birth, token = 0, None, None
+    after = {}
 
     def parent_state():
         return {
@@ -115,7 +158,7 @@ def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration wit
         private_env = session.environment()
         os.environ.update(private_env)
         record = session._read(session._directory() / "ready.json")
-        private_pid, private_birth = record["pid"], record["birth"]
+        private_pid, private_birth, token = record["pid"], record["birth"], record["token"]
         verify("private_session_identity", session.verify_current() != parent)
         desk = Desk()
         desk.plugin.load()
@@ -191,11 +234,9 @@ def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration wit
             desk.key("Return", browser.address)
             expect_text("chrome_private_chord_type", browser.address, "AFTER")
             verify("chrome_private_focus", desk.window(browser.address).focused)
+            calibrate_x11_pointer(desk, chrome, target.address, verify)
         if args.wine:
             calibrate_wine(desk, args.output, verify)
-        after = parent_state()
-        verify("parent_cursor_unchanged", before["cursorpos"] == after["cursorpos"])
-        verify("parent_focus_unchanged", before["activewindow"].get("address") == after["activewindow"].get("address"))
     except Exception as error:
         checks["error"] = f"{type(error).__name__}: {error}"
         if desk and "target" in locals():
@@ -216,10 +257,33 @@ def main() -> int:  # noqa: PLR0915 - a bounded, sequential live calibration wit
             session.stop()
             if private_birth:
                 checks["private_compositor_stopped"] = session.birth(private_pid) != private_birth
+                assert isinstance(token, str)
+                checks["owned_processes_stopped"] = not session._tagged(token)
+            after = parent_state()
+            checks["parent_cursor_unchanged"] = before["cursorpos"] == after["cursorpos"]
+            checks["parent_focus_unchanged"] = before["activewindow"].get("address") == after["activewindow"].get(
+                "address"
+            )
         except Exception as error:
             checks["cleanup_error"] = str(error)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps({"agent": args.agent, "checks": checks}, indent=2) + "\n")
+        args.output.write_text(
+            json.dumps(
+                {
+                    "agent": args.agent,
+                    "checks": checks,
+                    "parent": {
+                        "before": {"cursor": before["cursorpos"], "focus": before["activewindow"].get("address")},
+                        "after": {
+                            "cursor": after.get("cursorpos"),
+                            "focus": after.get("activewindow", {}).get("address"),
+                        },
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
+        )
         print(args.output.read_text(), end="")
     return int(any(value is not True for value in checks.values()))
 

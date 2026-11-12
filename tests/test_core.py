@@ -1062,6 +1062,10 @@ def test_isolated_launch_forwards_private_bus_and_profile_without_parent_tokens(
     monkeypatch.setenv("AT_SPI_BUS_ADDRESS", "unix:path=/private/a11y")
     monkeypatch.setenv("CHROME_CONFIG_HOME", "/private/config")
     monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "user-token")
+    working = tmp_path / "working directory 'quoted'"
+    working.mkdir()
+    (working / "probe.py").write_text("from pathlib import Path; Path('seen').write_text(str(Path.cwd()))")
+    monkeypatch.chdir(working)
     original = desk.hypr._dispatch
 
     def opened(*args):
@@ -1069,11 +1073,14 @@ def test_isolated_launch_forwards_private_bus_and_profile_without_parent_tokens(
         fake.clients.append({**AGENT_CLIENT, "stableId": "new"})
 
     monkeypatch.setattr(desk.hypr, "_dispatch", opened)
-    assert desk.launch(["browser", "a b"]).address == AGENT_CLIENT["address"]
+    assert desk.launch(["python3", "probe.py"]).address == AGENT_CLIENT["address"]
     command = next(c[-1] for c in reversed(fake.calls) if c[0] == "dispatch")
     assert "AT_SPI_BUS_ADDRESS=unix:path=/private/a11y" in command
     assert "CHROME_CONFIG_HOME=/private/config" in command
     assert "user-token" not in command
+    shell_command = json.loads(command.removeprefix("hl.dsp.exec_cmd(").removesuffix(")")) if lua else command
+    subprocess.run(shell_command, shell=True, cwd=tmp_path, check=True)
+    assert (working / "seen").read_text() == str(working)
     assert plugin.calls == []
 
 

@@ -206,7 +206,7 @@ class Desk:
             "WINEPREFIX",
             "XDG_RUNTIME_DIR",
         )
-        argv = ["env", *[f"{k}={os.environ[k]}" for k in names if k in os.environ], *command]
+        argv = ["env", "--chdir", os.getcwd(), *[f"{k}={os.environ[k]}" for k in names if k in os.environ], *command]
         shell_command = shlex.join(argv)
         self.hypr._dispatch(f"hl.dsp.exec_cmd({json.dumps(shell_command)})", f"exec {shell_command}")
         deadline = time.monotonic() + timeout
