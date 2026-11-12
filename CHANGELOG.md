@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- `key` and `type` accept `--agent-keyboard` for native applications that support an independent keyboard seat.
+- Typing parentheses in Wine uses number-row chords instead of extended duplicate keys Wine cannot translate.
+
+- `--session` runs an agent's applications in a private desktop with a separate clipboard, accessibility bus and persistent profile, including XWayland applications.
+- Paste reaches every clipboard device of a multi-seat client, including GTK after an agent pointer click.
+- Hidden selection shortcuts preserve the user's clipboard and primary selection.
+
 - Nested test shutdown removes its owned runtime sockets and logs after verifying process exit, and refuses recycled process ids.
 
 - Captures use the same compositor as the target window, even when the inherited Wayland display differs.

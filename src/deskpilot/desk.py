@@ -9,7 +9,9 @@ uinput device, and `take_focus` focuses the window before its keys.
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -136,6 +138,9 @@ class Desk:
         which focuses it, since that switches the user's workspace or scrolls their layout."""
         if show and hidden:
             raise ValueError("show brings a window into view and hidden acts out of view: pass one")
+        if hidden and self._isolated():
+            hidden = False
+            show = True
         if hidden:
             agent = self._register()
             # A window the user moved there is still theirs: only the agent's launched apps carry its token.
@@ -174,8 +179,49 @@ class Desk:
         raise NotVisible(f"{win.cls} ({win.address}) did not come on screen within {SHOW_TIMEOUT}s of focusing it")
 
     @staticmethod
+    def _isolated() -> bool:
+        signature = os.environ.get("DESKPILOT_ISOLATED")
+        if not signature:
+            return False
+        from .session import verify_current
+
+        verify_current()
+        return True
+
+    def _launch_isolated(self, command: list[str], timeout: float) -> Window:
+        before = {(w.address, w.stable_id) for w in self.hypr.windows()}
+        names = (
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "AT_SPI_BUS_ADDRESS",
+            "NO_AT_BRIDGE",
+            "DESKPILOT_ISOLATED",
+            "DESKPILOT_AGENT",
+            "DESKPILOT_SESSION_TOKEN",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "CHROME_CONFIG_HOME",
+            "HOME",
+            "WINEPREFIX",
+            "XDG_RUNTIME_DIR",
+        )
+        argv = ["env", *[f"{k}={os.environ[k]}" for k in names if k in os.environ], *command]
+        shell_command = shlex.join(argv)
+        self.hypr._dispatch(f"hl.dsp.exec_cmd({json.dumps(shell_command)})", f"exec {shell_command}")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            new = [w for w in self.hypr.windows() if (w.address, w.stable_id) not in before]
+            if len(new) == 1:
+                return new[0]
+            if len(new) > 1:
+                raise AmbiguousWindow("launch opened several windows: choose an address from windows")
+            time.sleep(0.1)
+        raise TimeoutError(f"{command[0]} opened no window in the isolated session within {timeout:g}s")
+
+    @staticmethod
     def _check_identity(win: Window) -> None:
-        taken = screen.latest(win.address)
+        taken = screen.latest(win.address, instance=win.instance)
         if taken:
             taken.check_identity(win)
 
@@ -185,6 +231,8 @@ class Desk:
         hands its window to a copy already running for the user (a single-instance app) opens nothing here."""
         if not command:
             raise ValueError("name the app to launch")
+        if self._isolated():
+            return self._launch_isolated(command, timeout)
         agent = self._register()
         workspace = agent["workspace"]
         # Hyprland reuses a closed window's address, so a window is known by its stable id too.
@@ -221,12 +269,19 @@ class Desk:
     def show_agent(self) -> None:
         """Show the agent's hidden workspace on the user's focused monitor, or hide it again. Input the user gives
         there is theirs; the agent's actions go on and keep their refusals."""
+        if self._isolated():
+            raise ValueError("an isolated desktop has no window on the user's screen")
         self.hypr.toggle_special(self._register()["workspace"].removeprefix("special:"))
 
     def stop(self) -> None:
         """Close the agent's launched windows, as the user closing them would, and end its apps' processes left five
         seconds later."""
-        self.plugin.stop()
+        if self._isolated():
+            from .session import stop
+
+            stop()
+        else:
+            self.plugin.stop()
 
     def shot(
         self,
@@ -286,7 +341,7 @@ class Desk:
         if element is not None:
             return win, *self._element_point(win, element)
         assert x is not None and y is not None
-        taken = screen.load(shot) if shot else screen.latest(win.address)
+        taken = screen.load(shot) if shot else screen.latest(win.address, instance=win.instance)
         if taken and (shot or scale is None):
             taken.check(win)
         if scale is None:
@@ -315,11 +370,10 @@ class Desk:
             )
         return *screen.window_to_global(win, px, py), [f"s{popup.sx},{popup.sy}"]
 
-    @staticmethod
-    def _mode(hidden: bool, cursor: bool = True) -> str:
+    def _mode(self, hidden: bool, cursor: bool = True) -> str:
         """How the plugin reaches the window: hidden, or on screen with the agent cursor unless DESKPILOT_CURSOR=off
         or the action has none, as keys have not."""
-        if hidden:
+        if hidden and not self._isolated():
             return "hidden"
         return "plain" if not cursor or os.environ.get("DESKPILOT_CURSOR") == "off" else "shown"
 
@@ -492,14 +546,18 @@ class Desk:
         *,
         show: bool = False,
         hidden: bool = False,
+        agent_keyboard: bool = False,
     ) -> None:
         """Press a chord in a window without focusing it, or with take_focus after focusing it. With no window the
         keys go to the focused window. Each key is held `hold` seconds, up to 10, for an app that acts while a key is
         down (auto-repeat, a game's movement)."""
         if not 0 <= hold <= 10:
             raise ValueError("a key is held 0 to 10 seconds")
-        target = self._key_target(query, take_focus, show, hidden)
-        self.plugin.keys(target.address, keys.chord_words(combo), hold=hold, mode=self._mode(hidden, cursor=False))
+        if agent_keyboard and query is None:
+            raise ValueError("agent keyboard needs a named window")
+        target = self._key_target(query, take_focus, show, hidden, focus_private=not agent_keyboard)
+        mode = ("agent-hidden" if hidden else "agent") if agent_keyboard else self._mode(hidden, cursor=False)
+        self.plugin.keys(target.address, keys.chord_words(combo), hold=hold, mode=mode)
 
     def type(
         self,
@@ -510,13 +568,15 @@ class Desk:
         *,
         show: bool = False,
         hidden: bool = False,
+        agent_keyboard: bool = False,
     ) -> None:
         """Type text as written, on the user's own keymap. Each key is held `delay` seconds, and the next follows
         `delay` seconds later."""
-        target = self._key_target(query, take_focus, show, hidden)
-        self.plugin.keys(
-            target.address, keys.text_words(text), hold=delay, gap=delay, mode=self._mode(hidden, cursor=False)
-        )
+        if agent_keyboard and query is None:
+            raise ValueError("agent keyboard needs a named window")
+        target = self._key_target(query, take_focus, show, hidden, focus_private=not agent_keyboard)
+        mode = ("agent-hidden" if hidden else "agent") if agent_keyboard else self._mode(hidden, cursor=False)
+        self.plugin.keys(target.address, keys.text_words(text), hold=delay, gap=delay, mode=mode)
 
     def paste(
         self,
@@ -531,7 +591,11 @@ class Desk:
         """Paste text into a window: it becomes that window's clipboard alone, never the user's, and `combo` (the app's
         paste chord, ctrl+shift+v in most terminals) is pressed there. Any text pastes, whatever the keymap types."""
         target = self._key_target(query, take_focus, show, hidden)
-        self.plugin.keys(target.address, keys.chord_words(combo), paste=text, mode=self._mode(hidden, cursor=False))
+        if self._isolated() and target.xwayland:
+            clipboard.write(text)
+            self.plugin.keys(target.address, keys.chord_words(combo), mode="plain")
+        else:
+            self.plugin.keys(target.address, keys.chord_words(combo), paste=text, mode=self._mode(hidden, cursor=False))
 
     def clipboard(self) -> str:
         """The user's clipboard text."""
@@ -541,7 +605,15 @@ class Desk:
         """Replace the user's clipboard with text."""
         clipboard.write(text)
 
-    def _key_target(self, query: str | None, take_focus: bool, show: bool = False, hidden: bool = False) -> Window:
+    def _key_target(
+        self,
+        query: str | None,
+        take_focus: bool,
+        show: bool = False,
+        hidden: bool = False,
+        *,
+        focus_private: bool = True,
+    ) -> Window:
         """The window keys go to, resolved as for every other action: a named one must be on screen unless `show`
         brings it there, and hidden keys reach only the agent's launched windows. Hidden keys need a named window, since
         the focused one has the user's keyboard, and so does show, since the focused window is in view already and
@@ -560,7 +632,8 @@ class Desk:
                 raise WindowNotFound("no window has keyboard focus; name one with a window query")
             return focused
         win = self._target(query, show or take_focus, hidden)
-        if take_focus:
+        if take_focus or (focus_private and self._isolated()):
+            # Every window here belongs to the agent, so real private focus also reaches application-level shortcuts.
             self.hypr.focus(win)
         # A hidden target registered the agent already; keys to its window shown on screen mark it in use too.
         if not hidden and self.plugin.agent and win.workspace == f"special:agent-{self.plugin.agent}":

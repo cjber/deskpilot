@@ -49,6 +49,17 @@ agent's apps. They also close when the process named by `DESKPILOT_OWNER_PID` ex
 or with no owner after 30 minutes unused. For web pages and signed-in browsers use
 [fastbrowse](https://github.com/agent-labs-dev/fastbrowse), which drives Chrome over CDP.
 
+For an isolated desktop, use `DESKPILOT_AGENT=NAME deskpilot --session launch CMD...`, then put `--session`
+before each command that acts on it. This starts a private nested Hyprland with its own clipboard, keyboard,
+accessibility bus and persistent application profile. XWayland applications can run there without sharing the
+user's X server. Regular keyboard actions focus their target inside this private desktop, so application shortcuts
+work there. `--hidden` can bring a window into view inside that desktop without changing the user's view.
+`deskpilot --session stop` closes the desktop and its applications. With no owner it closes after 30 minutes unused;
+an MCP server started with `--session mcp` owns its desktop until it exits. Starting a desktop requires 2 GB of
+available memory, plus Hyprland, D-Bus, at-spi2-core, wayland-scanner, a C compiler and xkbcommon development files.
+Profiles, including a private home directory and Wine prefix, remain under deskpilot's data directory for the same agent name.
+The private desktop starts with a US keyboard layout.
+
 `--hidden` acts on one of the agent's launched windows, never the user's own, fully out of the user's view: no
 workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
 sends pointer input straight to that window's own client, and lets it draw while off screen so a screenshot after the
@@ -59,11 +70,16 @@ on, unless that app took the `deskpilot` seat, and a drag and drop the press sta
 app that hands its window to a copy the user already runs opens nothing for the agent.
 
 Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched windows, go to that window's own
-client and never hold the user's input: keys never use the `deskpilot` seat, so an XWayland window is refused, and so
+client and never hold the user's input. By default keys use the regular keyboard, so an XWayland window is refused, and so
 is a keystroke while the user's keyboard focus is in the window's app. A hidden `shot`, `hover` or
 `wait-for --changed` of a window that lies outside its monitor's area, such as a column of the agent's workspace that
 a scrolling layout puts off screen, is refused with `not_visible`: Hyprland sends no frame of it. A capture that gets
 no frame in 5 seconds fails with `timeout`.
+
+`key` and `type` offer `--agent-keyboard` for native apps that support independent seats. It sends keys through
+the `deskpilot` seat, using the active keyboard's keymap, without holding or entering the user's keyboard. It requires
+`--window` and a client that bound that seat's keyboard. GTK 4 supports it; Qt can bind the keyboard while discarding
+its events, so confirm the result with a fresh capture or accessibility tree. XWayland and paste use the regular route.
 
 Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
 the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
@@ -231,3 +247,14 @@ claude mcp add deskpilot -- deskpilot mcp
 [AGENTS.md](AGENTS.md) has the checks, the layout and the rules a change must keep, and
 [CONTRIBUTING.md](CONTRIBUTING.md) how to report a bug or send a change.
 [SECURITY.md](SECURITY.md) says how to report a vulnerability privately.
+
+For live input calibration, use an explicit parent compositor and a private desktop:
+
+```sh
+HYPRLAND_INSTANCE_SIGNATURE=... uv run python scripts/input_calibration.py --chrome --output /path/to/results.json
+```
+
+This checks GTK 3 pointer and paste input, GTK 4 independent keyboards, native Chrome, selections and parent
+focus/cursor preservation, then stops its desktop. It requires system Python with GTK 3 and GTK 4 introspection.
+`scripts/containment_calibration.py SIGNATURE` and its `--negative` control run only against a compositor owned by
+`scripts/nested.py`, testing agent-seat relative motion and pointer constraints.

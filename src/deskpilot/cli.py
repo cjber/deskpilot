@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -159,11 +160,27 @@ def _wait_command(sub) -> None:
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _keyboard_args(parser: argparse.ArgumentParser, focus_help: str) -> None:
+    parser.add_argument("--window", help="send keys to this window")
+    parser.add_argument("--take-focus", action="store_true", help=focus_help)
+    parser.add_argument(
+        "--agent-keyboard",
+        action="store_true",
+        help="use the independent keyboard in an app that supports multiple seats",
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deskpilot", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    p.add_argument("--session", action="store_true", help="use this agent's private compositor, clipboard and bus")
     p.add_argument("--json", action="store_true", help="print JSON")
+    return p
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = _parser()
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("windows", help="list mapped windows with geometry")
@@ -197,15 +214,13 @@ def build_parser() -> argparse.ArgumentParser:
     focus_help = "focus the window first and leave it focused, for an app that ignores keys while unfocused"
     s = sub.add_parser("key", help="press a key or chord, e.g. Return, ctrl+a, alt+F4")
     s.add_argument("combo")
-    s.add_argument("--window", help="press it in this window; without it the keys go to the focused window")
-    s.add_argument("--take-focus", action="store_true", help=focus_help)
+    _keyboard_args(s, focus_help)
     s.add_argument("--hold", type=float, default=0.0, help="seconds to hold each key down (up to 10)")
     _view_args(s)
 
     s = sub.add_parser("type", help="type text as written, on the user's keymap")
     s.add_argument("text")
-    s.add_argument("--window", help="type into this window; without it the keys go to the focused window")
-    s.add_argument("--take-focus", action="store_true", help=focus_help)
+    _keyboard_args(s, focus_help)
     s.add_argument(
         "--delay",
         type=float,
@@ -333,10 +348,26 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
                 return tree
             return [f"snapshot {tree['snapshot']}", *_tree(tree)] if "snapshot" in tree else _tree(tree)
         case "key":
-            desk.key(args.combo, args.window, args.take_focus, args.hold, show=args.show, hidden=args.hidden)
+            desk.key(
+                args.combo,
+                args.window,
+                args.take_focus,
+                args.hold,
+                show=args.show,
+                hidden=args.hidden,
+                agent_keyboard=args.agent_keyboard,
+            )
             return "ok"
         case "type":
-            desk.type(args.text, args.window, args.delay, args.take_focus, show=args.show, hidden=args.hidden)
+            desk.type(
+                args.text,
+                args.window,
+                args.delay,
+                args.take_focus,
+                show=args.show,
+                hidden=args.hidden,
+                agent_keyboard=args.agent_keyboard,
+            )
             return "ok"
         case "paste":
             desk.paste(_text(args.text), args.window, args.take_focus, args.keys, show=args.show, hidden=args.hidden)
@@ -378,6 +409,20 @@ def run(args: argparse.Namespace, desk: Desk) -> object:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.session:
+        from . import session
+
+        try:
+            if args.cmd == "mcp" and not os.environ.get("DESKPILOT_OWNER_PID"):
+                os.environ["DESKPILOT_OWNER_PID"] = str(os.getpid())
+            if args.cmd == "stop":
+                session.stop()
+                _print("ok", args.json)
+                return 0
+            os.environ.update(session.environment())
+        except EXPECTED as error:
+            print(f"deskpilot: {error_code(error)}: {error}", file=sys.stderr)
+            return 2
     if args.cmd == "mcp":
         from .mcp_server import serve
 

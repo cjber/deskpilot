@@ -1,4 +1,4 @@
-// The agent seat: a wl_seat named "deskpilot" with a pointer and nothing else, which the plugin drives instead of the
+// The agent seat: a wl_seat named "deskpilot" with independent pointer and keyboard resources, which the plugin drives instead of the
 // user's seat for a client that bound it (see "agent seat" in deskpilot.cpp).
 //
 // GTK 4 binds the seats it finds when it starts and never one announced later, so a seat that went with each plugin
@@ -9,13 +9,13 @@
 
 #pragma once
 
-#include <hyprland/protocols/wayland.hpp>
 #include <cstdint>
+#include <hyprland/protocols/wayland.hpp>
 #include <hyprutils/memory/WeakPtr.hpp>
 
 #include <vector>
 
-// Objects other protocols make for a wl_pointer, which an agent pointer gets in place of Hyprland's own.
+// Objects other protocols make for an agent pointer, which is independent of Hyprland's user pointer.
 enum class eInert : uint8_t { SWIPE, PINCH, HOLD, RELATIVE, LOCKED, CONFINED };
 
 struct SAgentSeat {
@@ -26,6 +26,8 @@ struct SAgentSeat {
     // Makes the client a protocol object it asked for with an agent pointer, which is never sent anything and goes
     // when the client destroys it.
     void (*inert)(eInert kind, wl_client* client, uint32_t version, uint32_t id);
+    std::vector<Hyprutils::Memory::CWeakPointer<CWlKeyboard>> (*keyboardsOf)(wl_client* client);
+    bool (*configureKeymap)(int fd, uint32_t size, int32_t repeatRate, int32_t repeatDelay);
 };
 
 // Advertises the seat on its first call and returns it; later calls, from any plugin build, return the same one.

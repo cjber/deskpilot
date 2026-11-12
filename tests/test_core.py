@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 import pytest
 from PIL import Image
 
-from deskpilot import a11y, clipboard, keys, screen
+from deskpilot import a11y, clipboard, keys, screen, session
 from deskpilot import desk as desk_module
 from deskpilot import plugin as plugin_module
 from deskpilot.desk import Desk, NotVisible, error_code
@@ -1028,3 +1028,106 @@ def test_keys_and_explicit_scale_refuse_reused_address(tmp_path, monkeypatch):
         with pytest.raises(screen.StaleShot, match="has changed"):
             action()
     assert plugin.calls == []
+
+
+def test_isolated_paste_uses_only_private_xwayland_clipboard(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "private")
+    monkeypatch.setenv("DESKPILOT_ISOLATED", "private")
+    monkeypatch.setattr(session, "verify_current", lambda: "private")
+    written = []
+    monkeypatch.setattr(clipboard, "write", written.append)
+    desk.paste("private text", "0xabc", hidden=True)
+    assert written == ["private text"]
+    assert plugin.calls == [("keys", "0xabc", keys.chord_words("ctrl+v"), {"mode": "plain"})]
+
+
+def test_isolation_marker_cannot_enable_private_clipboard_on_another_compositor(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "user")
+    monkeypatch.setenv("DESKPILOT_ISOLATED", "private")
+    monkeypatch.setattr(clipboard, "write", lambda text: pytest.fail("user clipboard changed"))
+    with pytest.raises(HyprctlError):
+        desk.paste("text", "0xabc")
+    assert plugin.calls == []
+
+
+@pytest.mark.parametrize("lua", [True, False])
+def test_isolated_launch_forwards_private_bus_and_profile_without_parent_tokens(tmp_path, monkeypatch, lua):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.lua = lua
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "private")
+    monkeypatch.setenv("DESKPILOT_ISOLATED", "private")
+    monkeypatch.setattr(session, "verify_current", lambda: "private")
+    monkeypatch.setenv("AT_SPI_BUS_ADDRESS", "unix:path=/private/a11y")
+    monkeypatch.setenv("CHROME_CONFIG_HOME", "/private/config")
+    monkeypatch.setenv("HL_INITIAL_WORKSPACE_TOKEN", "user-token")
+    original = desk.hypr._dispatch
+
+    def opened(*args):
+        original(*args)
+        fake.clients.append({**AGENT_CLIENT, "stableId": "new"})
+
+    monkeypatch.setattr(desk.hypr, "_dispatch", opened)
+    assert desk.launch(["browser", "a b"]).address == AGENT_CLIENT["address"]
+    command = next(c[-1] for c in reversed(fake.calls) if c[0] == "dispatch")
+    assert "AT_SPI_BUS_ADDRESS=unix:path=/private/a11y" in command
+    assert "CHROME_CONFIG_HOME=/private/config" in command
+    assert "user-token" not in command
+    assert plugin.calls == []
+
+
+def test_latest_shot_is_scoped_to_compositor(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    window = replace(win(), stable_id="same", instance="first")
+    fake_grim(monkeypatch, (window.width, window.height))
+    first = screen.capture(window)
+    other = replace(first, id="1-newer", instance="second")
+    (screen.shots_dir() / f"{other.id}.json").write_text(json.dumps(asdict(other)))
+    assert screen.latest(window.address, instance="first") == first
+    assert screen.latest(window.address, instance="second") == other
+    assert screen.latest(window.address, instance="third") is None
+
+
+@pytest.mark.parametrize("hidden,expected", [(False, "agent"), (True, "agent-hidden")])
+def test_independent_keyboard_is_explicit_and_preserves_hidden_ownership(tmp_path, monkeypatch, hidden, expected):
+    desk, fake, _, plugin = launched_desk(tmp_path, monkeypatch)
+    if not hidden:
+        fake.special = "special:agent-tester"
+    desk.key("ctrl+a", "0xdef", hidden=hidden, agent_keyboard=True)
+    desk.type("Text()", "0xdef", hidden=hidden, agent_keyboard=True)
+    assert [call[-1]["mode"] for call in plugin.calls if call[0] == "keys"] == [expected, expected]
+    with pytest.raises(WindowNotFound):
+        desk.type("Text", "user-window", hidden=True, agent_keyboard=True)
+
+
+def test_independent_keyboard_requires_an_explicit_target(tmp_path, monkeypatch):
+    desk, _, _, plugin = make_desk(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="named window"):
+        desk.key("a", agent_keyboard=True)
+    with pytest.raises(ValueError, match="named window"):
+        desk.type("a", agent_keyboard=True)
+    assert plugin.calls == []
+
+
+@pytest.mark.parametrize("command,value", [("key", "ctrl+a"), ("type", "Text()")])
+def test_cli_exposes_independent_keyboard(command, value):
+    from deskpilot.cli import build_parser
+
+    args = build_parser().parse_args([command, value, "--window", "0x1", "--agent-keyboard"])
+    assert args.agent_keyboard is True
+
+
+def test_window_snapshot_pins_one_compositor_across_queries(monkeypatch):
+    from deskpilot import hypr
+
+    selected = []
+    monkeypatch.setattr(hypr, "current_instance", lambda: "chosen")
+
+    def run(args, *, instance=None):
+        selected.append(instance)
+        return json.dumps([{"instance": "chosen", "wl_socket": "wayland-chosen"}]) if args[-1] == "instances" else "[]"
+
+    monkeypatch.setattr(hypr, "run_hyprctl", run)
+    assert hypr.Hyprland(run).windows() == []
+    assert selected == ["chosen"] * 4

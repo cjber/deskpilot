@@ -123,7 +123,7 @@ def _geometry(window: Window) -> str:
 def capture(window: Window, out: Path | None = None, max_width: int = DEFAULT_MAX_WIDTH) -> Shot:
     folder = shots_dir()
     folder.mkdir(parents=True, exist_ok=True)
-    shot_id = f"{window.address.removeprefix('0x')}-{time.time_ns() // 1_000_000}"
+    shot_id = f"{window.address.removeprefix('0x')}-{time.time_ns()}"
     path = out or folder / f"{shot_id}.png"
     _grim(window, path)
     with Image.open(path) as image:
@@ -152,7 +152,7 @@ def capture(window: Window, out: Path | None = None, max_width: int = DEFAULT_MA
 
 
 def _records(folder: Path, address: str) -> list[Path]:
-    """This window's shot records, oldest first. Ids end in milliseconds, so name order is time order."""
+    """This window's shot records, oldest first. Ids end in timestamps, so name order is time order."""
     return sorted(folder.glob(f"{address.removeprefix('0x')}-*.json"))
 
 
@@ -175,9 +175,13 @@ def load(shot_id: str, folder: Path | None = None) -> Shot:
         raise StaleShot(f"no shot {shot_id}: take a new one") from error
 
 
-def latest(address: str, folder: Path | None = None) -> Shot | None:
+def latest(address: str, folder: Path | None = None, *, instance: str | None = None) -> Shot | None:
     records = _records(shots_dir(folder), address)
-    return load(records[-1].stem, folder) if records else None
+    for record in reversed(records):
+        shot = load(record.stem, folder)
+        if instance is None or shot.instance == instance:
+            return shot
+    return None
 
 
 def to_global(window: Window, x: float, y: float, scale: float) -> tuple[int, int]:

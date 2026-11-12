@@ -57,6 +57,20 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
 
 Done when a fresh `shot` shows the state the user asked for.
 
+## Isolated desktops
+
+For an app that needs its own X server or clipboard, set `DESKPILOT_AGENT=NAME` and use
+`deskpilot --session launch CMD...`. Put `--session` before every later command for that desktop, including
+`shot`, `key`, `elements` and `stop`. Its compositor, clipboard, accessibility bus and application profiles are
+separate from the user's desktop. `--hidden` may focus a window inside it without changing the user's view.
+Use a stable agent name to reuse its persistent profile. Stop it with `deskpilot --session stop` when done.
+For browsers, prefer fastbrowse. A new isolated profile does not contain the user's signed-in browser sessions.
+
+For native GTK 4 apps, `key` and `type` support `--agent-keyboard` (`agent_keyboard` over MCP). This uses the
+independent seat's keyboard and the active keymap, including while the user's keyboard focus is in the same app.
+It requires a named window and a client that bound the keyboard. Confirm the result: Qt can bind it and discard
+the events. Use the regular route for Qt, Chromium, XWayland and paste.
+
 ## Taking the user's pointer or focus
 
 By default the user's pointer and keyboard focus stay where they are, so the user can keep working. Two flags take
