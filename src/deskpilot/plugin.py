@@ -234,6 +234,20 @@ class Plugin:
             return set()
         return set(self._call("agent", self._named(), "owns", *map(str, pids))["owned"])
 
+    def owned_windows(self, addresses: list[str]) -> set[str]:
+        """Launched windows and individually adopted windows, without claiming their shared process."""
+        if not addresses:
+            return set()
+        return set(self._call("agent", self._named(), "windows", *addresses)["owned"])
+
+    def adopt(self, address: str, stable_id: str) -> None:
+        """Hand one exact window to this agent, retaining its original workspace for release."""
+        self._call("agent", self._named(), "adopt", address, stable_id)
+
+    def release(self, address: str, stable_id: str) -> None:
+        """Return an adopted window without closing its client or its other windows."""
+        self._call("agent", self._named(), "release", address, stable_id)
+
     def stop(self) -> None:
         """Close this agent's windows, and end its apps' processes left five seconds later."""
         self._call("agent", self._named(), "stop")

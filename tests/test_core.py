@@ -247,7 +247,7 @@ class FakePlugin:
     def __init__(self):
         self.calls = []
         self.mapped: list[dict] = []  # the window's popups
-        self.owns: set[int] | None = None
+        self.owned_addresses: set[str] | None = None
         self.claim_error: Exception | None = None
 
     def register(self, owner=None):
@@ -260,9 +260,14 @@ class FakePlugin:
             raise self.claim_error
         return {"ok": True}
 
-    def owned(self, pids):
-        """The pids the plugin says the agent launched: all of them unless a test names which."""
-        return set(pids) if self.owns is None else set(pids) & self.owns
+    def owned_windows(self, addresses):
+        return set(addresses) if self.owned_addresses is None else set(addresses) & self.owned_addresses
+
+    def adopt(self, address, stable_id):
+        self.calls.append(("adopt", address, stable_id))
+
+    def release(self, address, stable_id):
+        self.calls.append(("release", address, stable_id))
 
     def stop(self):
         self.calls.append(("stop",))
@@ -341,7 +346,7 @@ def test_hidden_actions_drive_only_the_agent_s_launched_windows(tmp_path, monkey
     # A window the user moved onto the agent's workspace has no launch token.
     moved = {**CLIENT, "address": "0x123", "pid": 8, "workspace": {"name": "special:agent-tester"}}
     fake.clients += [AGENT_CLIENT, moved]
-    plugin.owns = {7}
+    plugin.owned_addresses = {"0xdef"}
     with pytest.raises(WindowNotFound, match="deskpilot launch"):
         desk.click("0x123", 100, 50, hidden=True)
     plugin.calls.clear()
@@ -483,6 +488,51 @@ def test_plugin_claims_and_asks_which_processes_are_owned():
         ["deskpilot", "agent", "tester", "pid=5150", "birth=987654"],
         ["deskpilot", "agent", "tester", "owns", "7", "8"],
     ]
+
+
+def test_hidden_ownership_is_per_window_even_when_the_browser_process_is_shared(tmp_path, monkeypatch):
+    desk, fake, _, plugin = launched_desk(tmp_path, monkeypatch)
+    fake.clients.append({**AGENT_CLIENT, "address": "0x123"})
+    plugin.owned_addresses = {"0xdef"}
+    assert desk._target("0xdef", False, True).pid == fake.clients[1]["pid"]
+    with pytest.raises(WindowNotFound, match="deskpilot adopt"):
+        desk._target("0x123", False, True)
+
+
+@pytest.mark.parametrize("method", ["adopt", "release"])
+def test_handoff_requires_exact_address_and_stable_window_identity(tmp_path, monkeypatch, method):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    handoff = getattr(desk, method)
+    with pytest.raises(ValueError, match="exact window address"):
+        handoff("Chrome")
+    with pytest.raises(PluginError, match="stable window identity") as error:
+        handoff("0xabc")
+    assert error.value.code == "unavailable"
+    assert not plugin.calls
+    fake.clients[0] = {**fake.clients[0], "stableId": "127"}
+    assert handoff("0xabc").address == "0xabc"
+    assert (method, "0xabc", "127") in plugin.calls
+
+
+def test_handoff_keeps_compositor_identity_refusals(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients[0] = {**fake.clients[0], "stableId": "127"}
+
+    def replaced(address, stable_id):
+        raise PluginError("window identity changed before adoption", "stale")
+
+    monkeypatch.setattr(plugin, "adopt", replaced)
+    with pytest.raises(PluginError) as error:
+        desk.adopt("0xabc")
+    assert error_code(error.value) == "stale"
+
+
+def test_handoff_never_resolves_a_stale_address_as_title_text(tmp_path, monkeypatch):
+    desk, fake, _, plugin = make_desk(tmp_path, monkeypatch)
+    fake.clients[0] = {**fake.clients[0], "title": "terminal showing 0xdead", "stableId": "127"}
+    with pytest.raises(WindowNotFound, match="exact address"):
+        desk.adopt("0xdead")
+    assert not plugin.calls
 
 
 def test_cursor_off_sends_plain_paths(tmp_path, monkeypatch):

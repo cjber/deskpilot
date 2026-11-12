@@ -96,6 +96,8 @@
 #include <hyprland/src/desktop/rule/Engine.hpp>
 #include <hyprland/src/desktop/rule/windowRule/WindowRule.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#include <hyprland/src/desktop/state/GlobalWindowController.hpp>
+#include <hyprland/src/desktop/view/window/WindowGroupMembership.hpp>
 #include <hyprland/src/desktop/state/ViewHitTester.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/Popup.hpp>
@@ -134,6 +136,10 @@
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/state/WorkspaceState.hpp>
+#include <hyprland/src/state/workspace/Resolver.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
+#include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/xwayland/XSurface.hpp>
 
 #include "seat.hpp"
@@ -3439,6 +3445,9 @@ namespace {
     // children) on the hidden special:agent-NAME workspace, silently and without taking focus. Hyprland's own exec
     // rules are not used: they place only the first window and expire a minute after launch, so a later dialog would
     // open on the user's workspace. A config reload clears every rule, so the plugin registers them again after it.
+    struct SGroupRules { friend constexpr auto member(SGroupRules); };
+    template struct SAccess<&Desktop::View::CWindowGroupMembership::m_rules, SGroupRules>;
+
     namespace agents {
         // An agent with no owner process is stopped after this long without a request naming it.
         constexpr auto IDLE = std::chrono::minutes(30);
@@ -3454,9 +3463,25 @@ namespace {
             SP<Desktop::Rule::CWindowRule> rule;
         };
 
+        // A window the user's own app opened that `adopt` moved onto the agent's workspace. Ownership has two sources:
+        // a process `launch` registered (every window it opens, by pid or token; see `owns`) and an exact adopted window
+        // (here). An adopted window's process is never the agent's: its pid is not registered, and adoption refuses a
+        // process some agent launched, so stopping the agent closes no adopted window and signals no adopted process.
+        // `window` is the exact window and `stableID` its metadata identity, which a reused address does not share.
+        // `origin` is the workspace it came from, held so it is not destroyed while the window is away, and `hidden` the
+        // agent's workspace it was moved to, to tell whether the user has moved it since. A floating window's box is
+        // kept, since a move between monitors would shift it; its floating state is never changed.
+        struct SAdopted {
+            PHLWINDOWREF        window;
+            uint64_t            stableID = 0;
+            PHLWORKSPACE        origin, hidden;
+            std::optional<CBox> box;
+        };
+
         struct SAgent {
             SP<Desktop::Rule::CWindowRule> rule;
             std::map<pid_t, SProcess>      processes;
+            std::vector<SAdopted>          adopted;
             // The process whose exit stops the agent; 0 stops it after IDLE instead.
             pid_t           owner = 0;
             Time::steady_tp used;
@@ -3538,6 +3563,78 @@ namespace {
             close(FD);
         }
 
+        // Whether the user's input is in the window: it has keyboard focus or the pointer, or the app does on another
+        // surface. Moving it would take that away.
+        bool userIn(const PHLWINDOW& window) {
+            const auto SURFACE = window->wlSurface() ? window->wlSurface()->resource() : nullptr;
+            const auto POINTER = g_pSeatManager->m_state.pointerFocus.lock();
+            return window == Desktop::focusState()->window() || userKeyboardIn(SURFACE) || (SURFACE && POINTER && POINTER->client() == SURFACE->client());
+        }
+
+        // The adoption record of a window in AGENT's list, if any.
+        SAdopted* adoption(SAgent& agent, const PHLWINDOW& window) {
+            const auto IT = std::ranges::find_if(agent.adopted, [&](const SAdopted& a) { return a.window.lock() == window && a.stableID == window->metadata().stableID(); });
+            return IT == agent.adopted.end() ? nullptr : &*IT;
+        }
+
+        // The name of the agent that has adopted the window, if any.
+        std::optional<std::string> adopter(const PHLWINDOW& window) {
+            for (auto& [name, agent] : g_agents) {
+                if (adoption(agent, window))
+                    return name;
+            }
+            return std::nullopt;
+        }
+
+        // Whether some agent launched the process, ours or another's.
+        bool launched(pid_t pid) {
+            return taggedAs(pid) || std::ranges::any_of(g_agents, [pid](const auto& entry) { return owns(entry.first, pid); });
+        }
+
+        // Moves the window to the workspace as Hyprland's `movetoworkspacesilent` does, which refocuses only a window
+        // that has focus; callers keep out the ones the user is in.
+        void relocate(const PHLWINDOW& window, const PHLWORKSPACE& workspace) {
+            // A handoff must not auto-join the user's existing group in the destination workspace.
+            auto& rules = window->grouping().*member(SGroupRules{});
+            struct SRestoreRules {
+                uint16_t& rules;
+                uint16_t before;
+                ~SRestoreRules() {
+                    if (rules == (before | Desktop::View::GROUP_DENY))
+                        rules = before;
+                }
+            } restore{rules, rules};
+            rules |= Desktop::View::GROUP_DENY;
+            g_pHyprRenderer->damageWindow(window);
+            Desktop::globalWindowController()->moveWindowToWorkspace(window, workspace);
+        }
+
+        // Ends an adoption. The window goes back where it came from only while it is still where `adopt` put it and the
+        // user is not in it; one the user moved is theirs as it is, and so is one they are in, which a return would take
+        // from them.
+        void giveBack(const SAdopted& adopted) {
+            const auto WINDOW = adopted.window.lock();
+            if (!WINDOW || !WINDOW->mapped() || WINDOW->m_workspace != adopted.hidden || userIn(WINDOW) || WINDOW->grouping().group())
+                return;
+            relocate(WINDOW, adopted.origin);
+            if (adopted.box && WINDOW->isFloating())
+                WINDOW->layoutTarget()->setPositionGlobal(*adopted.box);
+        }
+
+        void giveBackAll(SAgent& agent) {
+            for (const auto& adopted : agent.adopted)
+                giveBack(adopted);
+            agent.adopted.clear();
+        }
+
+        // Forgets the adoptions whose window has closed.
+        void dropClosed(SAgent& agent) {
+            std::erase_if(agent.adopted, [](const SAdopted& a) {
+                const auto WINDOW = a.window.lock();
+                return !WINDOW || !WINDOW->mapped();
+            });
+        }
+
         SP<Desktop::Rule::CWindowRule> makeRule(const std::string& name) {
             auto rule = Desktop::Rule::CWindowRule::buildFromExecString(
                 std::format("workspace {} silent;no_initial_focus 1;suppress_event activate activatefocus fullscreen maximize", workspace(name)));
@@ -3603,6 +3700,7 @@ namespace {
             if (IT == g_agents.end())
                 return;
             dropTimer(IT->second.stopping);
+            giveBackAll(IT->second);
             if (IT->second.rule)
                 Desktop::Rule::ruleEngine()->unregisterRule(IT->second.rule);
             for (auto& [pid, process] : IT->second.processes) {
@@ -3620,6 +3718,8 @@ namespace {
             auto& agent = g_agents.at(name);
             if (agent.stopping)
                 return;
+            // Adopted windows are the user's own: they go back, and are not among those closed below.
+            giveBackAll(agent);
             for (const auto& window : Desktop::windowState()->windows()) {
                 if (window->mapped() && owns(name, window->backend().pid()))
                     window->sendClose();
@@ -3668,13 +3768,16 @@ namespace {
             }
             for (const auto& name : due)
                 stop(name);
-            for (auto& [name, agent] : g_agents)
+            for (auto& [name, agent] : g_agents) {
                 dropEnded(agent);
+                dropClosed(agent);
+            }
             self->updateTimeout(CHECK);
         }
 
         // A reloaded plugin starts with no agents, while their apps run on: it takes them back from the apps' tokens,
         // so their next window still opens out of view. Their owners are not known again until they next register.
+        // Adopted windows are not taken back: shutdown returns them first, so none is left to recover.
         void init() {
             eachTagged([](pid_t, const std::string& name, uint64_t) {
                 if (agentcursor::validName(name) && !g_agents.contains(name))
@@ -3701,6 +3804,7 @@ namespace {
             g_reaper.reset();
             for (auto& [name, agent] : g_agents) {
                 dropTimer(agent.stopping);
+                giveBackAll(agent);
                 if (agent.rule)
                     Desktop::Rule::ruleEngine()->unregisterRule(agent.rule);
                 for (auto& [pid, process] : agent.processes) {
@@ -3711,13 +3815,129 @@ namespace {
             g_agents.clear();
         }
 
+        bool busy() {
+            return g_op || g_keyOp || g_gliding || !g_queue.empty();
+        }
+
+        // The window at ADDRESS, if it is mapped, and whether STABLE_ID is its own: an address Hyprland reused for another
+        // window does not carry it. Sets the refusal otherwise.
+        PHLWINDOW exactWindow(const std::string& addr, const std::string& id, std::optional<IPC::Socket1::SResponse>& refusal) {
+            const auto ADDRESS = address(addr);
+            uint64_t   stable  = 0;
+            const auto [END, ERROR] = std::from_chars(id.data(), id.data() + id.size(), stable, 16);
+            if (!ADDRESS || id.empty() || ERROR != std::errc() || END != id.data() + id.size()) {
+                refusal = refuse("usage: deskpilot agent <name> <adopt|release> <address> <stable id, hexadecimal>", "invalid");
+                return nullptr;
+            }
+            const auto WINDOW = Desktop::viewState()->query().selector(std::format("address:0x{:x}", *ADDRESS)).runWindow();
+            if (!WINDOW || !WINDOW->mapped()) {
+                refusal = refuse("no mapped window " + addr, "gone");
+                return nullptr;
+            }
+            if (WINDOW->metadata().stableID() != stable) {
+                refusal = refuse(std::format("{} is not the window with identity {}: the address was reused", describe(WINDOW), id), "stale");
+                return nullptr;
+            }
+            return WINDOW;
+        }
+
+        // `agent NAME adopt ADDRESS STABLE_ID`: moves one window of the user's, on a normal workspace of a native
+        // Wayland app, onto the agent's workspace without moving anything of theirs, so hidden actions reach it. Adopting
+        // it again is fine. Refused: a window the user is in, one of an XWayland app (hidden input cannot reach it), one
+        // on a special workspace, one that is another agent's, and a process an agent launched.
+        IPC::Socket1::SResponse adopt(const std::string& name, const std::string& addr, const std::string& id) {
+            if (busy())
+                return refuse("an action is running: adopt when it has finished", "busy");
+            if (const auto IT = g_agents.find(name); IT != g_agents.end() && IT->second.stopping)
+                return refuse(std::format("agent {} is stopping; try again in {} seconds", name, GRACE.count()), "busy");
+            std::optional<IPC::Socket1::SResponse> refusal;
+            const auto                             WINDOW = exactWindow(addr, id, refusal);
+            if (!WINDOW)
+                return *refusal;
+            const auto HIDDEN = [&](const auto& adopted) { return WINDOW->m_workspace == adopted.hidden; };
+            if (const auto IT = g_agents.find(name); IT != g_agents.end()) {
+                if (const auto ADOPTED = adoption(IT->second, WINDOW); ADOPTED && HIDDEN(*ADOPTED))
+                    return IPC::Socket1::SResponse(okReply());
+                std::erase_if(IT->second.adopted, [&](const SAdopted& a) { return a.window.lock() == WINDOW; }); // the user moved it
+            }
+            if (const auto OTHER = adopter(WINDOW))
+                return refuse(std::format("{} is adopted by agent {}", describe(WINDOW), *OTHER));
+            if (WINDOW->backend().isX11())
+                return refuse("an XWayland window cannot be reached while hidden, so it cannot be adopted");
+            if (WINDOW->grouping().group() || (WINDOW->m_state & Desktop::View::WINDOW_STATE_PINNED))
+                return refuse("a grouped or pinned window cannot be handed off independently");
+            if (!WINDOW->m_workspace || WINDOW->m_workspace->type() == Workspace::eWorkspaceType::SPECIAL)
+                return refuse(std::format("{} is not on a regular workspace", describe(WINDOW)));
+            if (launched(WINDOW->backend().pid()))
+                return refuse(std::format("{} belongs to an app an agent launched", describe(WINDOW)));
+            if (userIn(WINDOW))
+                return refuse(std::format("the user's focus or pointer is in {}, and moving it would take them from there", describe(WINDOW)));
+            const auto TARGET = State::Workspace::resolver()->getWorkspaceTargetFromString(workspace(name));
+            auto       hidden = State::Workspace::state()->find(TARGET);
+            if (!hidden) {
+                const auto MONITOR = WINDOW->m_monitor.lock() ? WINDOW->m_monitor.lock() : Desktop::focusState()->monitor();
+                hidden             = MONITOR ? State::Workspace::state()->create(TARGET, MONITOR) : nullptr;
+            }
+            if (!hidden || !ensure(name))
+                return refuse("could not get the workspace of agent " + name);
+            g_agents[name].adopted.push_back(
+                {WINDOW, WINDOW->metadata().stableID(), WINDOW->m_workspace, hidden, WINDOW->isFloating() ? std::optional(WINDOW->layoutTarget()->position()) : std::nullopt});
+            relocate(WINDOW, hidden);
+            if (WINDOW->m_workspace != hidden) {
+                g_agents[name].adopted.pop_back();
+                return refuse("the compositor did not move the window to the agent's workspace");
+            }
+            return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"workspace":{}}})", jsonString(workspace(name))));
+        }
+
+        // `agent NAME release ADDRESS STABLE_ID`: returns an adopted window to the workspace it came from. A window the
+        // user has moved since is theirs and only forgotten; one they are in is refused, as returning it would move it.
+        IPC::Socket1::SResponse release(const std::string& name, const std::string& addr, const std::string& id) {
+            if (busy())
+                return refuse("an action is running: release when it has finished", "busy");
+            std::optional<IPC::Socket1::SResponse> refusal;
+            const auto                             WINDOW = exactWindow(addr, id, refusal);
+            if (!WINDOW)
+                return *refusal;
+            const auto IT      = g_agents.find(name);
+            const auto ADOPTED = IT == g_agents.end() ? nullptr : adoption(IT->second, WINDOW);
+            if (!ADOPTED)
+                return refuse(std::format("{} is not adopted by agent {}", describe(WINDOW), name), "gone");
+            if (WINDOW->m_workspace == ADOPTED->hidden && userIn(WINDOW))
+                return refuse(std::format("the user's focus or pointer is in {}, and returning it would take them from there", describe(WINDOW)));
+            giveBack(*ADOPTED);
+            std::erase_if(IT->second.adopted, [&](const SAdopted& a) { return a.window.lock() == WINDOW; });
+            return IPC::Socket1::SResponse(okReply());
+        }
+
+        // `agent NAME windows ADDRESS...`: which of those windows the agent owns: one a process it launched opened, or one
+        // it adopted and the user has not moved. Another agent's adopted window is not, whatever its process.
+        IPC::Socket1::SResponse ownedWindows(const std::string& name, const std::vector<std::string>& addrs) {
+            std::string owned;
+            for (const auto& addr : addrs) {
+                const auto ADDRESS = address(addr);
+                if (!ADDRESS)
+                    return refuse("usage: deskpilot agent <name> windows <address>...", "invalid");
+                const auto WINDOW = Desktop::viewState()->query().selector(std::format("address:0x{:x}", *ADDRESS)).runWindow();
+                if (!WINDOW || !WINDOW->mapped())
+                    continue;
+                const auto IT      = g_agents.find(name);
+                const auto ADOPTED = IT == g_agents.end() ? nullptr : adoption(IT->second, WINDOW);
+                const bool OWNED   = ADOPTED ? WINDOW->m_workspace == ADOPTED->hidden : !adopter(WINDOW) && owns(name, WINDOW->backend().pid());
+                if (OWNED)
+                    owned += (owned.empty() ? "" : ",") + jsonString(addr);
+            }
+            return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"owned":[{}]}})", owned));
+        }
+
         // `agent NAME [owner=PID]` registers NAME's rule if it has none and marks it in use; an owner, once given, is
         // kept. `agent NAME pid=PID birth=TICKS` also registers the main process `launch` is holding at its gate, by its
         // start time (refused if PID no longer has it), so its windows are placed by pid when it scrubs the token from
         // its environment. `agent NAME owns PID...` answers which of those processes the agent launched.
-        // `agent NAME stop` stops it. All answer at once.
+        // `agent NAME adopt|release|windows ...` hands a window of the user's to the agent and back, and asks which windows it
+        // owns (see SAdopted). `agent NAME stop` stops it. All answer at once.
         IPC::Socket1::SResponse command(const std::vector<std::string>& args) {
-            constexpr auto USAGE = "usage: deskpilot agent <name> [owner=PID | pid=PID birth=TICKS | owns PID... | stop]";
+            constexpr auto USAGE = "usage: deskpilot agent <name> [owner=PID | pid=PID birth=TICKS | owns PID... | adopt ADDRESS ID | release ADDRESS ID | windows ADDRESS... | stop]";
             if (args.size() < 3)
                 return refuse(USAGE);
             const std::string& NAME = args[2];
@@ -3741,6 +3961,12 @@ namespace {
                 }
                 return IPC::Socket1::SResponse(std::format(R"({{"ok":true,"owned":[{}]}})", owned));
             }
+            if (args.size() == 6 && args[3] == "adopt")
+                return adopt(NAME, args[4], args[5]);
+            if (args.size() == 6 && args[3] == "release")
+                return release(NAME, args[4], args[5]);
+            if (args.size() > 4 && args[3] == "windows")
+                return ownedWindows(NAME, {args.begin() + 4, args.end()});
             pid_t    owner = 0;
             pid_t    registered = 0;
             uint64_t birth      = 0;
@@ -3902,7 +4128,7 @@ namespace {
         if (VERB == "popups")
             return popupsCommand(args);
         return refuse("usage: deskpilot path [agent=NAME] <window> <shown|plain|hidden> <step>... | cursor [agent=NAME] <x> <y> | keys <window> <plain|hidden> <hold-ms> <gap-ms> <txn|none> <key event>... | "
-                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|pid=PID birth=TICKS|owns PID...|stop] | "
+                      "paste <window> <plain|hidden> <file> <hold-ms> <gap-ms> <txn|none> <key event>... | stage <txn> <key event>... | popups <window> | agent <name> [owner=PID|pid=PID birth=TICKS|owns PID...|adopt ADDRESS ID|release ADDRESS ID|windows ADDRESS...|stop] | "
                       "end <ticket> | wait <ticket> | status; a key event is +code, -code, pHEX, rHEX or tHEX, and a path step sX,Y or s (first), mX,Y, pBUTTON, rBUTTON, wNOTCHES, dMS or n");
     }
 }

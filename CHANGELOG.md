@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- `adopt ADDRESS` hands one unfocused native window to an agent for hidden actions; `release ADDRESS`, stop and plugin unload return it without closing its shared application.
+
 - Identify popup grabs by their input serial so concurrent user input cannot give an agent-opened popup the user’s pointer or keyboard.
 
 - Keep held user modifiers out of XWayland pointer actions and preserve keyboard state when replaying input received during an action.

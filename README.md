@@ -60,7 +60,16 @@ available memory, plus Hyprland, D-Bus, at-spi2-core, wayland-scanner, a C compi
 Profiles, including a private home directory and Wine prefix, remain under deskpilot's data directory for the same agent name.
 The private desktop starts with a US keyboard layout.
 
-`--hidden` acts on one of the agent's launched windows, never the user's own, fully out of the user's view: no
+For an application already running, `DESKPILOT_AGENT=NAME deskpilot adopt ADDRESS` explicitly hands one existing
+native Wayland window to the agent. Use the exact address from `deskpilot windows`. Adoption refuses a client
+receiving the user's keyboard or pointer input, XWayland, grouped or pinned windows, and another agent's windows. It claims that
+window alone, even when a browser process also owns the user's other windows. `deskpilot release ADDRESS`,
+`deskpilot stop` and plugin unload return it to its original workspace without closing the application.
+A window the user moves out of the agent workspace or adds to a group is left where they put it. Adoption is for the regular
+desktop; a private `--session` already owns its applications. Launch does not guess which window an existing
+browser opened: use a private profile or explicitly adopt the chosen window.
+
+`--hidden` acts on one of the agent's launched or explicitly adopted windows, fully out of the user's view: no
 workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
 sends pointer input straight to that window's own client, and lets it draw while off screen so a screenshot after the
 action shows the result. Tooltips and menus it opens show in that screenshot and take its clicks, and they never
@@ -69,7 +78,7 @@ since X clients read the one X pointer only the user's pointer moves; so is a wi
 on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled. A single-instance
 app that hands its window to a copy the user already runs opens nothing for the agent.
 
-Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched windows, go to that window's own
+Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched or adopted windows, go to that window's own
 client and never hold the user's input. By default keys use the regular keyboard, so an XWayland window is refused, and so
 is a keystroke while the user's keyboard focus is in the window's app. A hidden `shot`, `hover` or
 `wait-for --changed` of a window that lies outside its monitor's area, such as a column of the agent's workspace that
@@ -215,7 +224,7 @@ is never interleaved with another's keys. Up to 32 wait behind the running one; 
 
 `deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
 id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`, `key`, `type_text`, `paste_text`,
-`clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
+`clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch`, `adopt`, `release` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
 `take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements`,
 `key`, `type_text`, `paste_text` and `wait_changed` take `hidden`, for windows from `launch`, and `key`, `type_text` and
 `paste_text` take `show`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
@@ -265,6 +274,10 @@ change the measured cursor or focus.
 agent popup after concurrent user input, genuine user popup grabs, and plugin unload/reload. It stops its private
 desktop and verifies owned-process cleanup and parent pointer/focus preservation. `--plugin /path/to/build.so`
 loads a baseline build in that private desktop for a red/green comparison.
+
+`scripts/adoption_calibration.py --output /path/to/adoption.json`, with the same explicit parent, checks exact-window
+handoff in a shared browser process, hidden typing, refusal while the user uses its client, release, stop and
+plugin unload. It verifies sibling isolation, user-moved windows, pointer/focus preservation and process cleanup.
 
 `scripts/containment_calibration.py SIGNATURE` and its `--negative` and `--negative-constraints` controls run only against a compositor owned by
 `scripts/nested.py`, testing agent-seat relative motion and pointer constraints.

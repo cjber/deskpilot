@@ -2,8 +2,8 @@
 
 Clicks, scrolls, drags, hovers and keys go through the deskpilot Hyprland plugin, which leaves the user's pointer and
 keyboard focus where they were; the agent cursor the plugin draws shows where they land. `hidden` acts on a window the
-agent launched with `launch`, on its own hidden workspace, with nothing shown and the user's pointer untouched; the
-user's own windows are never hidden targets. `take_pointer` instead moves the user's own pointer and clicks through the
+agent launched or explicitly adopted, on its own hidden workspace, with nothing shown and the user's pointer untouched.
+`take_pointer` instead moves the user's own pointer and clicks through the
 uinput device, and `take_focus` focuses the window before its keys.
 """
 
@@ -142,7 +142,7 @@ class Desk:
         return self.plugin.register(self.owner)
 
     def _target(self, query: str, show: bool, hidden: bool, refresh: bool = False) -> Window:
-        """The window to act on. A hidden action reaches only the agent's own launched windows, on its hidden
+        """The window to act on. A hidden action reaches only the agent's launched or adopted windows, on its hidden
         workspace. A visible action reaches only what is showing, so a window off screen is an error unless `show`,
         which focuses it, since that switches the user's workspace or scrolls their layout."""
         if show and hidden:
@@ -152,10 +152,10 @@ class Desk:
             show = True
         if hidden:
             agent = self._register()
-            # A window the user moved there is still theirs: the plugin says which processes the agent launched.
+            # Moving a window there does not claim it; ownership is launched-process or explicit, per-window handoff.
             there = [w for w in self.hypr.windows() if w.workspace == agent["workspace"]]
-            owned = self.plugin.owned(sorted({w.pid for w in there}))
-            mine = [w for w in there if w.pid in owned]
+            owned = self.plugin.owned_windows([w.address for w in there])
+            mine = [w for w in there if w.address in owned]
             try:
                 win = find_window(mine, query)
                 if not refresh:
@@ -164,7 +164,7 @@ class Desk:
             except WindowNotFound:
                 raise WindowNotFound(
                     f"no window of agent {self.plugin.agent} matches '{query}': hidden acts only on the apps the agent "
-                    "started with `deskpilot launch` (launch over MCP), never on the user's own windows"
+                    "started with `deskpilot launch` or explicitly took over with `deskpilot adopt`"
                 ) from None
         win = self.window(query)
         if not refresh:
@@ -298,9 +298,38 @@ class Desk:
             raise ValueError("an isolated desktop has no window on the user's screen")
         self.hypr.toggle_special(self._register()["workspace"].removeprefix("special:"))
 
+    def _handoff_window(self, address: str) -> Window:
+        if not address.startswith("0x"):
+            raise ValueError("give the exact window address from `deskpilot windows`")
+        if self._isolated():
+            raise ValueError("adopt and release apply to windows on the regular desktop, not a private --session")
+        win = next((w for w in self.windows() if w.address.lower() == address.lower()), None)
+        if win is None:
+            raise WindowNotFound(f"no window has the exact address '{address}'")
+        if not win.stable_id:
+            raise PluginError("this compositor reports no stable window identity for a handoff", "unavailable")
+        return win
+
+    def adopt(self, address: str) -> Window:
+        """Explicitly hand one unfocused native window to this agent for hidden actions.
+
+        Its original workspace is restored on release, stop or plugin unload. Its process and sibling windows
+        remain unclaimed. The compositor validates identity and user input focus before moving it.
+        """
+        win = self._handoff_window(address)
+        self._register()
+        self.plugin.adopt(win.address, win.stable_id)
+        return self.window(win.address)
+
+    def release(self, address: str) -> Window:
+        """Return one individually adopted window, leaving its process running."""
+        win = self._handoff_window(address)
+        self.plugin.release(win.address, win.stable_id)
+        return self.window(win.address)
+
     def stop(self) -> None:
         """Close the agent's launched windows, as the user closing them would, and end its apps' processes left five
-        seconds later."""
+        seconds later. Individually adopted windows return to their original workspace without closing."""
         if self._isolated():
             from .session import stop
 

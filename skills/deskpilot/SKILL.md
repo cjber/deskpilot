@@ -21,12 +21,18 @@ If `deskpilot` is not on `PATH`, ask the user before installing it with
    focuses it and moves the user's view, so ask the user before `--show`.
    To work out of the user's sight, set `DESKPILOT_AGENT` to a name and start your own copy of the app with
    `deskpilot launch CMD...`: it and every window it opens later stay on your hidden workspace, and `--hidden` acts
-   on them (only on them, never the user's windows) on `shot`, `click`, `scroll`, `drag`, `hover`, `elements`, `key`,
+   on them, or windows explicitly handed to you with `adopt ADDRESS`, on `shot`, `click`, `scroll`, `drag`, `hover`,
+   `elements`, `key`,
    `type`, `paste` and `wait-for --changed`. An XWayland window is refused hidden. Hidden keys need `--window` and
    are refused while the user's keyboard focus is in that window's app. A hidden `shot`, `hover` or
    `wait-for --changed` of a window scrolled outside its monitor's area is refused, since Hyprland sends no frame of
    it. `deskpilot stop` closes your apps when you are done; `deskpilot show` lets the user see them. For web pages
    and browsers use fastbrowse instead.
+   For an existing native app, `deskpilot adopt ADDRESS` hands only the exact window from `windows` to your agent.
+   It refuses XWayland, grouped or pinned windows, a client receiving the user's input, or another agent's window. Never infer a forwarded
+   launch's window from its title or timing. `deskpilot release ADDRESS`, stop and plugin unload return adopted
+   windows to their original workspace without closing their shared process. A user-moved or regrouped window stays where
+   the user put it. Adoption is unavailable inside `--session`.
 3. Run `deskpilot shot WINDOW`, read the image at the `path` it prints, and choose a point in that image. Note its
    `shot` id.
 4. Act with that point as given, passing the id: `deskpilot click WINDOW X Y --shot ID` (`--button right`,
@@ -92,7 +98,7 @@ Each error starts with a code: `deskpilot: CODE: message`, or in MCP the result'
 
 - "is not on screen": the window is on a hidden workspace or scrolled off. Ask the user before passing `--show`,
   or `deskpilot launch` your own copy of the app and act on it with `--hidden`.
-- `not_found` with `--hidden`: hidden acts only on apps you started with `deskpilot launch`.
+- `not_found` with `--hidden`: hidden acts only on windows you launched or explicitly adopted.
 - "take a new shot": the window changed size since the shot. Shoot again and pick the point anew.
 - A plugin build failure names the missing headers or compiler.
 - A stale `HYPRLAND_INSTANCE_SIGNATURE` is handled: deskpilot finds the live Hyprland, and stops with a list when
