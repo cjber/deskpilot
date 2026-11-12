@@ -7,77 +7,128 @@
 
 # deskpilot
 
-Desktop control for agents on Hyprland. An agent takes a screenshot of a window, picks a point in it, and clicks
-or types there, in any app: native Wayland, XWayland and Wine programs such as the Battle.net launcher and games.
+Desktop control for agents on Hyprland. Inspect a window, target an accessibility element or a screenshot point,
+and click, scroll or type while you keep working.
 
 [![ci](https://img.shields.io/github/actions/workflow/status/cjber/deskpilot/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/cjber/deskpilot/actions/workflows/ci.yml)
 [![pypi](https://img.shields.io/pypi/v/deskpilot?style=flat-square&color=3ECF8E)](https://pypi.org/project/deskpilot/)
 ![python](https://img.shields.io/badge/python-3.12%20%7C%203.14-475569?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-475569?style=flat-square)
 
-Deskpilot never blocks the user. Clicks, scrolls, drags and keys run inside the compositor through the deskpilot
-Hyprland plugin, which sends them straight to the target app's own pointer and keyboard: the user's pointer, cursor,
-keyboard focus and input are left alone while they keep working, and the target is not raised, even with
-`focus_on_activate` set. Two cases cannot work that way, and there the plugin briefly holds the user's mouse input,
-moves the seat's pointer onto the window, presses, and puts the pointer back, applying the motion the user made
-meanwhile: an XWayland window (X11 and Wine apps, which read the one X pointer), and a window of the app the user's
-pointer is on. Keys likewise hold the user's input for a stroke only when their keyboard focus is in the target's app
-or the target is an XWayland window. In those cases the plugin refuses a click when another window covers the point.
+![Deskpilot selects logo.svg, clicks Export selected, then confirms Export asset in a local demo app.](assets/walkthrough/walkthrough.gif)
 
-The plugin also adds a second seat named `deskpilot`, with a pointer only. GTK and Qt apps bind every seat they find
-at startup, and such an app takes pointer actions through that seat's pointer: the user's pointer can be anywhere,
-on the same app included, and nothing of theirs is held. Apps that bind only the first seat (Chromium, Electron,
-kitty), XWayland apps, and apps started before the plugin first loaded since login keep the routes above. Keys
-always use the routes above.
+A local demo app, operated by Deskpilot with its real cursor and click feedback.
+[Static image](assets/walkthrough/walkthrough.png) | [60 fps video](assets/walkthrough/walkthrough.mp4) |
+[Recording and source](assets/walkthrough/CAPTURE.md)
 
-An agent cursor shows where deskpilot acts: a flight-path marker, a ring with wings, centred on the point. The plugin
-draws it above every window, separate from the user's pointer: it glides along an arc to each point before the action
-starts, lock-on brackets close in around it as it lands, it shrinks and sends out a ring at each press, follows a drag
-as it moves, and fades after a few idle seconds. Window screenshots never include it. `DESKPILOT_CURSOR=off` turns it
-off.
+| What you need | What deskpilot gives you |
+|---|---|
+| Find a control | Live accessibility trees with element IDs, or a window screenshot with recorded coordinates |
+| Send input | Click, scroll, hover, drag, type, key chords and private paste |
+| Work out of sight | Launch your own native Wayland apps on an agent's hidden workspace |
+| Reduce round trips | CLI and MCP actions, plus a sequence of known steps in one batch |
 
-Several agents can work on one desktop at once, each with a cursor of its own. Set `DESKPILOT_AGENT` to a name (up to
-32 letters, digits, `-`, `_` or `.`), such as `DESKPILOT_AGENT=CLAUDE-1`, and that agent's cursor carries the name on a
-tag, in a colour taken from the name and kept apart from the other cursors on screen. Without it, actions share one
-unnamed cursor. Actions still run one at a time; the cursors show whose each one is.
+## Install
 
-An agent can run apps of its own out of the user's sight. `DESKPILOT_AGENT=NAME deskpilot launch CMD...` starts
-an app on the hidden special workspace `special:agent-NAME` and prints its first window. Every window the app opens,
-then or later, lands there without taking focus, so a dialog never pops up on the user's screen. `deskpilot show`
-toggles that workspace on the focused monitor for the user to watch or step in, and `deskpilot stop` closes the
-agent's apps. They also close when the process named by `DESKPILOT_OWNER_PID` exits (the MCP server names itself),
-or with no owner after 30 minutes unused. For web pages and signed-in browsers use
-[fastbrowse](https://github.com/agent-labs-dev/fastbrowse), which drives Chrome over CDP.
+```sh
+uv tool install deskpilot
+```
 
-`--hidden` acts on one of the agent's launched windows, never the user's own, fully out of the user's view: no
-workspace switch, no agent cursor, and the user's pointer, focus and screen stay as they are. The plugin
-sends pointer input straight to that window's own client, and lets it draw while off screen so a screenshot after the
-action shows the result. Tooltips and menus it opens show in that screenshot and take its clicks, and they never
-grab the user's input. It works for native Wayland windows. An XWayland window (X11 and Wine apps) is refused,
-since X clients read the one X pointer only the user's pointer moves; so is a window of the app the user's pointer is
-on, unless that app took the `deskpilot` seat, and a drag and drop the press starts is cancelled. A single-instance
-app that hands its window to a copy the user already runs opens nothing for the agent.
+The first input action builds and loads the plugin for your running Hyprland. Run `deskpilot plugin load` to
+prepare it ahead of time. The build needs the tools listed under [Requirements](#requirements).
 
-Hidden `key`, `type` and `paste` need `--window` naming one of the agent's launched windows, go to that window's own
-client and never hold the user's input: keys never use the `deskpilot` seat, so an XWayland window is refused, and so
-is a keystroke while the user's keyboard focus is in the window's app. A hidden `shot`, `hover` or
-`wait-for --changed` of a window that lies outside its monitor's area, such as a column of the agent's workspace that
-a scrolling layout puts off screen, is refused with `not_visible`: Hyprland sends no frame of it. A capture that gets
-no frame in 5 seconds fails with `timeout`.
+For Claude Code, install the agent skill:
 
-Keys sent to a window (`--window`) go to that window only, with each stroke complete before focus returns, and
-the user's modifiers never leak into them. X11 apps take keys only from the window with X input focus, so an
-XWayland target gets X focus for each stroke and sees a focus-in and focus-out around it; Hyprland's own focus
-does not move.
+```text
+/plugin install deskpilot --marketplace cjber/deskpilot
+```
 
-Text is typed as written on the user's own keymap, whatever its layout and with Caps Lock on: the plugin finds the
-key that gives each character on the active keyboard's keymap, which every client has, and presses that keymap's own
-modifier keys (Shift, AltGr) around it, as a physical keyboard does. A character no key on that keymap gives is an
-error rather than skipped.
+For MCP clients, run `deskpilot mcp` over stdio. In Claude Code:
 
-`--take-pointer` uses a virtual mouse made with `/dev/uinput` instead, which the compositor treats as real
-hardware. Tools that synthesize input another way, such as `xdotool` (XTest), are ignored by some clients:
-Battle.net drops `xdotool` clicks.
+```sh
+claude mcp add deskpilot -- deskpilot mcp
+```
+
+## Quickstart
+
+List your windows, then replace `WINDOW` below with one address from the output:
+
+```sh
+deskpilot windows
+deskpilot elements WINDOW
+```
+
+In an app with an accessibility tree, choose a control from the output and replace `ELEMENT` with its ID:
+
+```sh
+deskpilot click WINDOW --element ELEMENT
+```
+
+Deskpilot asks the app for that element's current position before clicking. Prefer the full `SNAPSHOT:e27` form
+from the reported snapshot and element ID, so a newer tree cannot reuse an old ID accidentally.
+
+For an app without a tree, capture its window:
+
+```sh
+deskpilot shot WINDOW
+```
+
+Read the image at the printed path, then click a point in that image with
+`deskpilot click WINDOW X Y --shot SHOT_ID`, replacing `X`, `Y` and `SHOT_ID` with the point and printed shot ID.
+A resized window or a point outside the recorded window is refused. Take a fresh shot to verify the result;
+use `wait-for WINDOW --changed SHOT_ID` when the app needs time to draw it.
+
+[More actions and targeting rules](docs/reference.md) | [Accessibility and popup handling](docs/reference.md#use)
+
+## Chain known actions
+
+Send a JSON array through a file or stdin to run up to 32 steps in one CLI process or MCP request:
+
+```sh
+deskpilot batch WINDOW --final-shot <<'JSON'
+[
+  {"action": "key", "combo": "ctrl+a"},
+  {"action": "type", "text": "Hello from deskpilot"}
+]
+JSON
+```
+
+This example replaces text in the target app's current field. Run it only after inspecting that field.
+Supported steps are `click`, `move`, `scroll`, `drag`, `key`, `type` and `paste`. Element IDs and shot IDs work
+on the corresponding pointer steps. `--final-shot` returns a capture after all steps succeed.
+
+The entire request is validated before input starts. Each step rechecks the pinned window and uses the same
+refusals as a single action. A failure stops the batch and reports the completed steps and failing index;
+earlier actions stay done. Other agents and the user can act between steps.
+
+[Batch format and results](docs/reference.md#batch)
+
+## Work on your own hidden window
+
+Set an agent name and launch a native Wayland app of your own:
+
+```sh
+export DESKPILOT_AGENT=demo
+deskpilot launch APP
+```
+
+Replace `APP` with an installed app and use the window it reports. Add `--hidden` to actions on those windows,
+including `batch`; hidden keys and text also need `--window`. `deskpilot stop` closes your agent's apps.
+`deskpilot show` intentionally brings the agent workspace into view for you to watch or step in.
+
+Hidden actions preserve your view, pointer and focus and only reach apps that agent launched. XWayland targets
+are refused hidden. For browser tasks, use [fastbrowse](https://github.com/agent-labs-dev/fastbrowse).
+
+[Hidden-window behaviour and client compatibility](docs/input-routing.md)
+
+## Your input stays yours
+
+The plugin sends input to the target client directly where supported. Some clients, including XWayland,
+require a seat-based route that briefly holds input, restores your pointer and focus, and replays intervening
+user input. A private paste preserves your clipboard; apps that cannot receive one are refused.
+
+`--take-pointer`, `--take-focus` and `--show` explicitly take your pointer, focus or view.
+[Input routes and their limits](docs/input-routing.md) explains the client-specific behaviour.
 
 ## Requirements
 
@@ -90,144 +141,10 @@ Battle.net drops `xdotool` clicks.
   `test -w /dev/uinput`.
 - Python 3.12 or later and `uv`.
 
-## Install
+## Documentation and contributing
 
-```sh
-uv tool install deskpilot
-```
-
-The agent skill, which teaches an agent the steps below, installs in Claude Code with:
-
-```text
-/plugin install deskpilot --marketplace cjber/deskpilot
-```
-
-## Use
-
-```sh
-deskpilot windows                         # every window: address, class, title, geometry, whether on screen
-deskpilot shot battle.net.exe             # screenshot; prints its id, image path and scale
-deskpilot click battle.net.exe 920 367 --shot ID    # a point in that screenshot
-deskpilot drag gimp 100 400 500 400       # press, move and release: sliders, selections, drag and drop
-deskpilot hover firefox 300 40 --wait 1   # rest the pointer there; prints a shot showing the tooltip
-deskpilot elements gedit                  # the app's accessibility tree, with ids
-deskpilot click gedit --element e12       # the centre of that element, where the app says it is now
-deskpilot key Right --window kitty --hold 2         # hold a key down two seconds
-deskpilot type "/reload" --window wow.exe --delay 0.12
-deskpilot key ctrl+a --window kitty
-deskpilot paste "Grüße, 日本" --window firefox    # any text, through a clipboard only that window sees
-deskpilot clipboard                       # the user's clipboard text; --set TEXT replaces it
-deskpilot wait-for wow.exe --timeout 120
-deskpilot wait-for wow.exe --changed ID --region 0 0 400 80   # until that part of shot ID looks different
-```
-
-A window is named by its address, its class, or a substring of its class or title. A name that matches more
-than one window is an error listing them, so a click never lands on a guessed window.
-
-`shot` captures the window itself, so a window on top does not show in it, and saves it under an id. `move`,
-`click` and `scroll` take pixels in the shot named by `--shot`, or the window's latest one, whatever scale it was
-taken at. A window resized since that shot is refused, as is a point outside the window. Pass `--scale 1` to give
-window pixels instead.
-
-An on-screen action is refused as `covered` at a point another window, bar or popup is over, since the user
-would see it land on that instead.
-
-A window on a hidden workspace or scrolled off its monitor is reported as `"visible": false`, and `shot`, `move`,
-`click`, `scroll`, `drag`, `hover`, `elements`, `key`, `type` and `paste` refuse it rather than move the user's
-view; `--show` focuses it to bring it on screen first.
-
-The first action that needs the plugin builds and loads it for the running Hyprland, so it comes back by itself
-after Hyprland restarts or upgrades. `deskpilot plugin load` does the same ahead of time.
-
-Some apps close a menu or dropdown as soon as it opens when their window is not the focused one, as Chrome does
-with many web page dropdowns. `click --take-focus` focuses the window first and leaves it focused, so the list stays
-open for the next click.
-
-`move` only shows the agent cursor. Pass `--take-pointer` to `move`, `click` or `scroll` to move the user's own
-pointer there and press through the input device instead.
-
-`drag` presses at one point, moves to another over `--duration` seconds (0.3 by default, up to 5) and releases, with
-the user's pointer left where it is: sliders, text selection, drawing, and drag and drop within the window. `hover`
-rests the pointer on a point for `--wait` seconds and prints a screenshot taken while it is there, so a tooltip or a
-hover state shows in it; `--click X Y` clicks a second point next instead, before the pointer leaves, for a menu
-that opens on hover. Both are bounded, and a drag or hover that fails, or whose window closes, still lets go of its
-button.
-
-`elements` prints the window's accessibility tree (AT-SPI): each element's id, role, name, states, text and bounds
-in window pixels. `click`, `move`, `scroll` and `hover` take `--element ID` instead of a point, and act on the
-element's centre where the app reports it at that moment. Each `elements` call prints a snapshot id, and
-`SNAPSHOT:e5` pins an id to that snapshot: it is refused as stale once a newer snapshot replaces it, since every
-snapshot numbers its elements afresh. An element whose role or name changed since is stale too, and one no longer
-showing is offscreen. `elements --peek` reads the tree without replacing the latest snapshot, so a program can check
-what changed before it acts on an id it already holds. An item of a GTK 3 popup menu (an open combo box, a menu or
-submenu) is placed on the popup it is in, so its bounds line up with a shot showing the popup and a click lands on it;
-when the popup cannot be told exactly the action is refused (`stale` once it closed, `ambiguous` when several could be
-it) and `elements` reports the item with zero bounds. An element's click is also refused `covered` when another
-surface, such as a submenu over its menu, takes the point. GTK and Qt apps expose a tree; Chromium, Electron and
-Firefox expose one only when started with accessibility on (`--force-renderer-accessibility` for Chromium and
-Electron), and Wine games expose none. An app with no tree is an error saying so, never a guessed one.
-
-A shell started before Hyprland restarted keeps a stale `HYPRLAND_INSTANCE_SIGNATURE`. deskpilot then talks to
-the one instance whose socket answers, and with several live instances it stops and names them.
-
-`key --hold SECONDS` holds each key down that long, up to 10, for auto-repeat or a game's movement.
-
-`key` and `type` without `--window` press keys into the focused window. `--take-focus` focuses the window first and
-leaves it focused, for an app that ignores keys while unfocused. Keys go to the window's client, not through the
-compositor, so they never trigger a Hyprland keybind: use `hyprctl dispatch` for those.
-
-`paste` hands text to a window as a clipboard only that window sees, then presses its paste chord (`--keys`,
-`ctrl+v` by default; most terminals want `ctrl+shift+v`). It pastes any text, including characters the keymap cannot
-type, and the user's clipboard stays as it is. XWayland windows share one clipboard, so `paste` refuses them: use
-`type`. An app that holds the user's clipboard, because they last copied in it, pastes its own copy instead, so a
-paste into any of its windows is refused with `owns_clipboard`: `type` the text (each newline becomes Return, which
-can submit a form), or ask the user to copy something in another app. `clipboard` reads the user's clipboard, and `clipboard --set` replaces it.
-
-`type` sends keys as fast as the app reads them, about 1 KB a second into Chrome. Games read keys once per frame,
-so type into them with `--delay 0.1` or more: each key is held that long, with the same gap before the next. For
-long text, `paste` is faster still.
-
-`wait-for` waits for a window to appear, or with `--gone` to close. `--focused`, `--title TEXT` and `--size WxH` also
-wait for it to have keyboard focus, a title containing TEXT or that size. `--changed SHOT` waits until the window
-looks different from one of its shots, in all of it or in `--region X Y W H` of that shot's pixels: any pixel
-difference counts, and it prints a shot of the change with the box that changed.
-
-Clicks, scrolls and keys from several agents at once run one after another in the order they arrive, so one `type`
-is never interleaved with another's keys. Up to 32 wait behind the running one; past that an action is refused.
-
-## MCP
-
-`deskpilot mcp` serves the same actions over stdio: `windows`, `focus`, `shot` (returns the image and its shot
-id), `click`, `move`, `scroll`, `hover` (returns the image), `drag`, `elements`, `key`, `type_text`, `paste_text`,
-`clipboard`, `copy_text`, `wait_for`, `wait_changed`, `launch` and `stop`. `click`, `move` and `scroll` take `shot`, `show` and
-`take_pointer`; `click`, `move`, `scroll` and `hover` take `element`; `shot`, `click`, `scroll`, `hover`, `drag`, `elements`,
-`key`, `type_text`, `paste_text` and `wait_changed` take `hidden`, for windows from `launch`, and `key`, `type_text` and
-`paste_text` take `show`; `click`, `key`, `type_text` and `paste_text` take `take_focus`; `key` takes `hold`. It
-keeps one input device open for the session, and the apps it launched close when it exits.
-
-Every expected failure has a code, one stable word to branch on: `not_found`, `ambiguous`, `not_visible`,
-`offscreen`, `stale`, `covered` (another window is over the point), `gone` (the window closed), `owns_clipboard`
-(a paste's target app holds the user's clipboard), `refused`, `busy`, `no_tree`, `unavailable`, `timeout` or
-`invalid`. The CLI prints `deskpilot: CODE: message`. An MCP tool returns an error result whose text is `CODE: message` and whose structured content is `{"code": ..., "message": ...}`.
-
-```sh
-claude mcp add deskpilot -- deskpilot mcp
-```
-
-## Limits
-
-- `type` can only send characters the active keymap types; a character it lacks (such as `é` on a US layout) is
-  an error rather than skipped. `paste` takes any text, except into XWayland windows and apps that hold the user's clipboard.
-- Hyprland plugins load only into the exact Hyprland they were built against, so `deskpilot plugin load` builds
-  one per Hyprland commit and plugin source under `~/.local/share/deskpilot`, and replaces a loaded build of
-  other source.
-- Each CLI action that uses the input device opens a new one and waits about a second for libinput to add it. The MCP server
-  avoids that wait.
-- `drag` stays within one window: a drag and drop into another app is not supported.
-- Hyprland only, Linux only.
-
-## Development
-
-[AGENTS.md](AGENTS.md) has the checks, the layout and the rules a change must keep, and
-[CONTRIBUTING.md](CONTRIBUTING.md) how to report a bug or send a change.
-[SECURITY.md](SECURITY.md) says how to report a vulnerability privately.
+- [Command guide](docs/reference.md): actions, screenshots, accessibility, MCP and error codes.
+- [Input routing](docs/input-routing.md): dedicated seats, keymaps, agent cursors and hidden windows.
+- [Contributing](CONTRIBUTING.md): setup, checks and bug reports.
+- [Security](SECURITY.md): report a vulnerability privately.
+- [Changelog](CHANGELOG.md): changes by release.
