@@ -1,7 +1,8 @@
 # deskpilot
 
-Desktop control for agents on Hyprland: screenshot a window, click or type at a point in it, and leave the user's
-own pointer and keyboard focus where they were. The CLI and the MCP server are thin layers over the same `Desk`.
+Desktop control for agents on Linux (Hyprland), Windows and macOS: screenshot a window, click or type at a point
+or element in it, and leave the user's own pointer and keyboard focus where they were. The CLI and the MCP server
+are thin layers over the desk `open_desk` picks: `Desk` on Hyprland, `NativeDesk` with a platform driver elsewhere.
 
 ## Checks
 
@@ -16,9 +17,18 @@ own pointer and keyboard focus where they were. The CLI and the MCP server are t
 
 ## Layout
 
-- `src/deskpilot/cli.py`: argument parsing and output; every command calls `Desk`
-- `src/deskpilot/mcp_server.py`: the same actions as MCP tools over stdio, one `Desk` for the session
-- `src/deskpilot/desk.py`: the actions an agent takes, shared by the CLI and the MCP server
+- `src/deskpilot/cli.py`: argument parsing and output; every command calls the desk from `open_desk`
+- `src/deskpilot/mcp_server.py`: the same actions as MCP tools over stdio, one desk for the session
+- `src/deskpilot/backend.py`: picks the desk for the platform; `hyprland_only` refuses Hyprland-only features
+- `src/deskpilot/base.py`: what every desk shares: batches and waits
+- `src/deskpilot/errors.py`: the expected failures and `error_code`
+- `src/deskpilot/desk.py`: the Hyprland desk
+- `src/deskpilot/native.py`: the Windows and macOS desk, over the `Driver` protocol, with element snapshots
+- `src/deskpilot/win32.py`: the Windows driver: window messages, PrintWindow, UI Automation
+- `src/deskpilot/macos.py`: the macOS driver: CoreGraphics events, screencapture, AX
+- `scripts/smoke_native.py`: every action through the CLI against a window that records the input it gets
+  (`scripts/smoke_app.py` in Tk; `scripts/smoke_app_macos.py` in Cocoa, since Aqua Tk ignores input posted to it), and
+  the platform editor, on the Windows and macOS CI runners
 - `src/deskpilot/hypr.py`: hyprctl: windows, monitors, focus, the cursor, and picking the live instance
 - `src/deskpilot/plugin.py`: builds, loads and talks to the compositor plugin
 - `src/deskpilot/plugin/deskpilot.cpp`: the Hyprland plugin that runs each pointer path and keystroke inside the
@@ -62,14 +72,20 @@ own pointer and keyboard focus where they were. The CLI and the MCP server are t
   A character no key on that keymap gives is an error, never skipped.
 - A paste offers its text to the target window's client alone and never sets the seat's selection, so the user's
   clipboard is untouched. A client that can only read the shared clipboard (XWayland) is refused.
+- On Windows and macOS, input goes to the target window or process without moving the user's pointer or focus
+  (posted window messages, CoreGraphics events to the pid). Seat input (`--take-pointer`, `--take-focus`) first
+  checks the target really is in front and refuses otherwise. An element click uses the app's own press action
+  when it has one. Hyprland-only features raise `Unavailable` there, never an approximation.
 - A pointer action (click, scroll, drag, hover) is bounded in steps and time, and it lets go of every button it
   pressed however it ends.
-- An element is targeted where the app reports it when the action runs, never from a stale snapshot. An app that
+- An element is targeted where the app reports it when the action runs, never from a stale snapshot: every node on
+  its path keeps its role and name, or it is `stale`. An app that
   exposes no accessibility tree is an error, never a guessed tree.
-- An expected failure carries a code (`error_code` in `desk.py`), set where the failure is produced, as the plugin
+- An expected failure carries a code (`error_code` in `errors.py`), set where the failure is produced, as the plugin
   does for `covered` and `gone`. Never derive a code from message text.
 - Tests never touch the real compositor, `/dev/uinput`, or `grim`. Pass fakes into `Desk` and
-  `Hyprland`, as `tests/test_core.py` does.
+  `Hyprland`, as `tests/test_core.py` does, and a fake `Driver` into `NativeDesk`, as `tests/test_native.py` does.
+  The Windows and macOS CI jobs run that file and the smoke script; the Linux gate cannot import their drivers.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`, and a command or flag change
   updates `README.md` and `skills/deskpilot/SKILL.md` too.
 

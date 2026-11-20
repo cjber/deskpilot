@@ -1,6 +1,6 @@
 ---
 name: deskpilot
-description: Click, scroll and type in desktop app windows on Hyprland with the deskpilot CLI or MCP server, while the user keeps their own pointer and keyboard focus. Works in native Wayland, XWayland and Wine apps such as the Battle.net launcher and games. Use for 'click the button in that app', 'type into the game', 'drive this desktop window', 'take a screenshot of a window', or any GUI task in a Hyprland session.
+description: Click, scroll and type in desktop app windows on Linux (Hyprland), Windows and macOS with the deskpilot CLI or MCP server, while the user keeps their own pointer and keyboard focus. On Hyprland it reaches native Wayland, XWayland and Wine apps, games included. Use for 'click the button in that app', 'type into the game', 'drive this desktop window', 'take a screenshot of a window', or any desktop GUI task.
 ---
 
 # deskpilot
@@ -13,7 +13,13 @@ actions are tools: `windows`, `focus`, `shot`, `click`, `move`, `scroll`, `hover
 If `deskpilot` is not on `PATH`, ask the user before installing it with
 `uv tool install deskpilot`.
 
-1. The first click, scroll or key loads the plugin for the running Hyprland, building it if needed, which can take
+On Windows and macOS there is no plugin, and hidden windows (`launch` stays visible, `--hidden`, `adopt`, `show`,
+`stop`), `paste`, `record`, `cursor_press`, `recipe run` and `--session` are `unavailable`. Input posted to a window that is not in front reaches most
+standard controls; when an app ignores it, ask the user before retrying with `--take-focus` or `--take-pointer`.
+Prefer `--element` clicks there, which use the app's own press action. macOS needs Accessibility and Screen
+Recording access for the app running deskpilot; an `unavailable` error names the missing one.
+
+1. On Hyprland, the first click, scroll or key loads the plugin for the running compositor, building it if needed, which can take
    a minute once per Hyprland version. `deskpilot plugin status` reports the loaded build.
 2. Run `deskpilot windows` and pick the target by address, class, or part of its class or title. A name that matches
    several windows is an error that lists them: pick one by address rather than guessing. `visible` is false for a

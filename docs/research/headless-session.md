@@ -1,6 +1,6 @@
 # Can a nested Hyprland run with no window in the user's session?
 
-Research for [#72](https://github.com/cjber/deskpilot/issues/72), part of [#71](https://github.com/cjber/deskpilot/issues/71).
+Research for [#72](https://github.com/agent-labs-dev/deskpilot/issues/72), part of [#71](https://github.com/agent-labs-dev/deskpilot/issues/71).
 
 ## Answer
 

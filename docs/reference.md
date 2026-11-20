@@ -130,7 +130,8 @@ claude mcp add deskpilot -- deskpilot mcp
 - Each CLI action that uses the input device opens a new one and waits about a second for libinput to add it. The MCP server
   avoids that wait.
 - `drag` stays within one window: a drag and drop into another app is not supported.
-- Hyprland only, Linux only.
+- On Windows and macOS there is no plugin: hidden windows, adoption, `paste`, `record`, `cursor_press`, `recipe run`
+  and `--session` report `unavailable` there.
 
 ## Recipes
 

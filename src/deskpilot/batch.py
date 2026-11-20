@@ -19,11 +19,12 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from . import keys, screen
-from .desk import EXPECTED, error_code
+from .errors import EXPECTED, error_code
 from .hypr import WindowNotFound
 
 if TYPE_CHECKING:
     from .desk import Desk
+    from .native import NativeDesk
 
 MAX_ACTIONS = 32
 
@@ -175,7 +176,7 @@ class BatchResult:
         }
 
 
-def run(desk: Desk, request: BatchRequest) -> BatchResult:
+def run(desk: Desk | NativeDesk, request: BatchRequest) -> BatchResult:
     """Run the steps in order on the pinned window, stopping at the first expected failure."""
     result = BatchResult(request.window)
     try:
@@ -207,7 +208,9 @@ def run(desk: Desk, request: BatchRequest) -> BatchResult:
     return result
 
 
-def _do(desk: Desk, step: Click | Move | Scroll | Drag | Key | Type | Paste, address: str, hidden: bool) -> dict:
+def _do(
+    desk: Desk | NativeDesk, step: Click | Move | Scroll | Drag | Key | Type | Paste, address: str, hidden: bool
+) -> dict:
     """One step through the Desk action of the same name, aimed at the pinned address."""
     match step:
         case Click():

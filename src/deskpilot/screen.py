@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -154,12 +155,19 @@ def _geometry(window: Window) -> str:
     return f"{window.x},{window.y} {window.width}x{window.height}"
 
 
-def capture(window: Window, out: Path | None = None, max_width: int = DEFAULT_MAX_WIDTH) -> Shot:
+def capture(
+    window: Window,
+    out: Path | None = None,
+    max_width: int = DEFAULT_MAX_WIDTH,
+    grab: Callable[[Window, Path], None] | None = None,
+) -> Shot:
+    """Capture the window to a recorded shot. `grab` writes the window's image to a path: grim on Hyprland, the
+    platform's own window capture elsewhere."""
     folder = shots_dir()
     folder.mkdir(parents=True, exist_ok=True)
     shot_id = f"{window.address.removeprefix('0x')}-{time.time_ns()}"
     path = out or folder / f"{shot_id}.png"
-    _grim(window, path)
+    (grab or _grim)(window, path)
     with Image.open(path) as image:
         width, height = image.size
         if width > max_width:

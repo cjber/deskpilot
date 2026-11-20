@@ -17,53 +17,17 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO
-
-from PIL import Image, ImageChops
+from typing import BinaryIO
 
 from . import a11y, clipboard, keys, screen
 from . import record as recording
-from .hypr import AmbiguousWindow, HyprctlError, Hyprland, Window, WindowNotFound, find_window
+from .backend import owner_from_env
+from .base import BaseDesk
+from .errors import EXPECTED, NotVisible, SessionLocked, error_code
+from .hypr import AmbiguousWindow, Hyprland, Window, WindowNotFound, find_window
 from .plugin import BUTTON_CODES, Plugin, PluginError
 
-if TYPE_CHECKING:
-    from .batch import BatchRequest, BatchResult
-
-
-class SessionLocked(RuntimeError):
-    code = "refused"
-
-
-class NotVisible(LookupError):
-    code = "not_visible"
-
-
-# Failures an agent should read and act on: a refusal, a missing window, a tool that failed. Anything else is a bug.
-EXPECTED = (
-    WindowNotFound,
-    AmbiguousWindow,
-    NotVisible,
-    HyprctlError,
-    PluginError,
-    ValueError,
-    TimeoutError,
-    RuntimeError,
-)
-
-
-def error_code(error: BaseException) -> str:
-    """The kind of an expected failure, one stable word a program branches on rather than reading the message:
-    not_found, ambiguous, not_visible, offscreen, stale, covered, gone, owns_clipboard, refused, busy, no_tree,
-    unavailable, timeout or invalid."""
-    code = getattr(error, "code", None)
-    if isinstance(code, str):
-        return code
-    if isinstance(error, TimeoutError):
-        return "timeout"
-    if isinstance(error, ValueError):
-        return "invalid"
-    return "refused"
-
+__all__ = ["EXPECTED", "Desk", "NotVisible", "SessionLocked", "error_code"]
 
 # How long `show` waits for a focused window to come on screen: a workspace switch or a scrolling layout's
 # animation has to finish before the window's area is its own.
@@ -102,15 +66,7 @@ def process_birth(pid: int) -> int | None:
     return int(fields[19]) if len(fields) > 19 and fields[19].isdigit() else None
 
 
-def owner_from_env() -> int | None:
-    """The process named by DESKPILOT_OWNER_PID, whose exit closes the agent's launched apps."""
-    value = os.environ.get("DESKPILOT_OWNER_PID") or None
-    if value is not None and not (value.isdigit() and int(value) > 1):
-        raise ValueError(f"DESKPILOT_OWNER_PID={value!r}: give a process id")
-    return int(value) if value else None
-
-
-class Desk:
+class Desk(BaseDesk):
     def __init__(self, hypr: Hyprland | None = None, input_factory=None, plugin=None, owner: int | None = None):
         self.hypr = hypr or Hyprland()
         self.plugin = plugin or Plugin()
@@ -140,6 +96,9 @@ class Desk:
 
     def window(self, query: str) -> Window:
         return self.hypr.find(query)
+
+    def cursor(self) -> tuple[int, int]:
+        return self.hypr.cursor()
 
     def focus(self, query: str) -> Window:
         win = self.window(query)
@@ -757,87 +716,5 @@ class Desk:
             self._register()
         return win
 
-    def batch(self, request: BatchRequest) -> BatchResult:
-        """Run a validated batch of actions on one window in order, stopping at the first expected failure (see
-        `batch`)."""
-        from . import batch
-
-        return batch.run(self, request)
-
-    def wait_for(
-        self,
-        query: str,
-        timeout: float = 60,
-        gone: bool = False,
-        focused: bool = False,
-        title: str | None = None,
-        size: tuple[int, int] | None = None,
-    ) -> Window | None:
-        """Wait until a window matching `query` exists (or, with gone, no longer does), and also has keyboard focus,
-        a title containing `title` or the size `size` when asked. Returns the window as it was when it matched."""
-        checks = [
-            (what, check)
-            for wanted, what, check in (
-                (focused, "focused", lambda w: w.focused),
-                (title is not None, f"titled with {title!r}", lambda w: title in w.title),
-                (size is not None, "x".join(map(str, size or ())), lambda w: (w.width, w.height) == size),
-            )
-            if wanted
-        ]
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                win = self.window(query)
-            except WindowNotFound:
-                win = None
-            if gone and win is None:
-                return None
-            unmet = [what for what, check in checks if win and not check(win)]
-            if not gone and win and not unmet:
-                return win
-            if time.monotonic() >= deadline:
-                if gone:
-                    raise TimeoutError(f"window '{query}' still open within {timeout:g}s")
-                if win is None:
-                    raise TimeoutError(f"window '{query}' did not appear within {timeout:g}s")
-                raise TimeoutError(f"window '{query}' is not {' and '.join(unmet)} after {timeout:g}s")
-            time.sleep(0.5)
-
-    def wait_changed(
-        self,
-        query: str,
-        shot: str,
-        timeout: float = 60,
-        region: tuple[int, int, int, int] | None = None,
-        hidden: bool = False,
-    ) -> tuple[screen.Shot, tuple[int, int, int, int]]:
-        """Wait until the window looks different from `shot`, in all of it or in `region` (x, y, width, height in
-        that shot's pixels). Returns a shot of the change and the box that changed in its pixels. A pixel counts as
-        changed when it differs at all; a window resized since the shot has changed everywhere."""
-        win = self._target(query, False, hidden)
-        base = screen.load(shot)
-        if win.address != base.address:
-            raise screen.StaleShot(f"shot {shot} is of window {base.address}, not {win.address}")
-        base.check_identity(win)
-        x, y, w, h = region or (0, 0, base.width, base.height)
-        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > base.width or y + h > base.height:
-            raise ValueError(f"region {x},{y} {w}x{h} is not inside shot {shot} ({base.width}x{base.height})")
-        box = (x, y, x + w, y + h)
-        with Image.open(base.path) as image:
-            before = image.convert("RGB").crop(box)
-        deadline = time.monotonic() + timeout
-        while True:
-            win = self._target(query, False, hidden)
-            now = screen.capture(self._shootable(win), max_width=base.width)
-            # A resize, or a move to a monitor of another scale, changes the whole image.
-            if (now.width, now.height) != (base.width, base.height):
-                return now, (0, 0, now.width, now.height)
-            with Image.open(now.path) as image:
-                diff = ImageChops.difference(before, image.convert("RGB").crop(box)).getbbox()
-            if diff:
-                return now, (x + diff[0], y + diff[1], x + diff[2], y + diff[3])
-            screen.discard(now)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"{win.cls} did not change from shot {shot} within {timeout:g}s")
-            time.sleep(min(0.5, remaining))
+    def _capture(self, win: Window, max_width: int) -> screen.Shot:
+        return screen.capture(win, max_width=max_width)

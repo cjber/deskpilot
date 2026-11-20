@@ -71,9 +71,9 @@ def social() -> str:
     box_width = ICON + GAP + width(BOLD, WORD, SIZE) + 10
     scale = 2.0
     x = (1280 - box_width * scale) / 2
-    tagline = "Desktop control for agents on Hyprland."
+    tagline = "Give your agent a desktop."
     tagline_path, _ = outline(REGULAR, tagline, (1280 - width(REGULAR, tagline, 34)) / 2, 480, 34)
-    stack = "HYPRLAND  ·  WAYLAND  ·  MCP"
+    stack = "LINUX  ·  WINDOWS  ·  MACOS  ·  MCP"
     stack_path, _ = outline(REGULAR, stack, (1280 - width(REGULAR, stack, 22)) / 2, 560, 22)
     body = (
         '<rect width="1280" height="640" fill="#17150f"/>'

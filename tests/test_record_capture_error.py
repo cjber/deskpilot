@@ -19,7 +19,7 @@ def failed_recording(*args, **kwargs):
 def test_record_cli_reports_failure_when_no_frame_was_captured(tmp_path, monkeypatch, capsys, stdout):
     desk, *_ = make_desk(tmp_path, monkeypatch)
     monkeypatch.setattr(desk, "record", failed_recording)
-    monkeypatch.setattr(cli, "Desk", lambda: desk)
+    monkeypatch.setattr(cli, "open_desk", lambda: desk)
     if stdout:
         # The CLI needs binary stdout for the frame stream.
         monkeypatch.setattr(cli.sys, "stdout", io.TextIOWrapper(io.BytesIO()))

@@ -7,6 +7,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+- Windows and macOS support: `windows`, `shot`, `elements`, `click`, `move`, `scroll`, `drag`, `hover`, `key`, `type`, `clipboard`, `launch` and the waits work there too, over UI Automation and window messages on Windows and AX and CoreGraphics events on macOS. An element click uses the app's own press action when it has one. Hidden windows, adoption, `paste`, `record`, `cursor_press`, `recipe run` and `--session` stay Hyprland only and report `unavailable` elsewhere.
+- deskpilot now lives at [agent-labs-dev/deskpilot](https://github.com/agent-labs-dev/deskpilot). Install the Claude Code plugin with `/plugin install deskpilot --marketplace agent-labs-dev/deskpilot`.
+
 ## [0.8.0] - 2026-11-19
 
 - `deskpilot record WINDOW` (MCP `record_start` and `record_stop`) films a window, hidden ones included, with the real agent cursor the plugin draws: brackets closing in as it lands and the marker squeezing on a press. It writes an mp4, or with `-o -` PPM frames at a constant rate on stdout for another encoder. Only a capture that asks for a cursor carries it, so `shot` stays cursor-free, and the user's own pointer is never in the frames. While a window is being filmed, a hidden action on it shows its cursor in the recording alone, never on screen.

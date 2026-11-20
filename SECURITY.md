@@ -14,7 +14,7 @@ was not asked to is a security issue. Relevant reports include:
 - A path that loads a plugin build other than one deskpilot built from its own source.
 
 Report a vulnerability through
-[GitHub private vulnerability reporting](https://github.com/cjber/deskpilot/security/advisories/new), not a public
+[GitHub private vulnerability reporting](https://github.com/agent-labs-dev/deskpilot/security/advisories/new), not a public
 issue. Include the version, your Hyprland version, the steps to reproduce it and what was affected. You will get a
 reply within a week.
 

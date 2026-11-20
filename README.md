@@ -1,33 +1,61 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/wordmark-dark.svg">
-    <img src="assets/wordmark.svg" alt="deskpilot: desktop control for agents on Hyprland" width="360">
-  </picture>
-</p>
+<div align="center">
 
-# deskpilot
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/wordmark-dark.svg">
+  <img src="assets/wordmark.svg" alt="deskpilot" width="360">
+</picture>
 
-Desktop control for agents on Hyprland. Inspect a window, target an accessibility element or a screenshot point,
-and click, scroll or type while you keep working.
+**Give your agent a desktop.**
 
-[![ci](https://img.shields.io/github/actions/workflow/status/cjber/deskpilot/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/cjber/deskpilot/actions/workflows/ci.yml)
+Screenshots, accessibility trees, clicks and keys in one app window, for coding agents and MCP clients on Linux
+(Hyprland), Windows and macOS, while your own pointer and keyboard stay with you.
+
+[![ci](https://img.shields.io/github/actions/workflow/status/agent-labs-dev/deskpilot/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/agent-labs-dev/deskpilot/actions/workflows/ci.yml)
 [![pypi](https://img.shields.io/pypi/v/deskpilot?style=flat-square&color=3ECF8E)](https://pypi.org/project/deskpilot/)
 ![python](https://img.shields.io/badge/python-3.12%20%7C%203.14-475569?style=flat-square)
 ![license](https://img.shields.io/badge/license-MIT-475569?style=flat-square)
 
+</div>
+
+---
+
+## Why deskpilot
+
+- **You keep working.** Input goes to the target app, not through your pointer and keyboard. Only
+  `--take-pointer`, `--take-focus` and `--show` move them, and only when you pass them.
+- **It never guesses a target.** A window name that matches two windows is an error listing both. A point is read
+  against a recorded screenshot of one window at one size, and a point under another window is refused.
+- **Elements, found live.** `elements` prints the app's accessibility tree with ids. An action finds the element
+  again where the app reports it then, and refuses it if it changed, rather than clicking where it used to be.
+- **Errors a program can branch on.** Every expected failure carries one code: `not_found`, `ambiguous`,
+  `covered`, `stale`, `unavailable` and so on.
+- **CLI, MCP and a skill.** The same actions as commands, as MCP tools over stdio, and as a Claude Code skill.
+  Browser tasks go to [fastbrowse](https://github.com/agent-labs-dev/fastbrowse), which calls deskpilot for
+  native apps.
+
 ![Deskpilot selects logo.svg, clicks Export selected, then confirms Export asset in a local demo app.](assets/walkthrough/walkthrough.gif)
 
-A local demo app, operated by Deskpilot with its real cursor and click feedback.
+A local demo app on Hyprland, operated by deskpilot with its agent cursor and click feedback.
 [Static image](assets/walkthrough/walkthrough.png) | [60 fps video](assets/walkthrough/walkthrough.mp4) |
 [Recording and source](assets/walkthrough/CAPTURE.md)
 
-| What you need | What deskpilot gives you |
-|---|---|
-| Find a control | Live accessibility trees with element IDs, or a window screenshot with recorded coordinates |
-| Send input | Click, scroll, hover, drag, type, key chords and private paste |
-| Work out of sight | Launch your own native Wayland apps on an agent's hidden workspace |
-| Reduce round trips | CLI and MCP actions, plus a sequence of known steps in one batch |
-| Record a demo | A saved recipe of steps replayed as an MP4, with reading beats between them |
+## Platforms
+
+| | Linux (Hyprland) | Windows 10 and 11 | macOS 13 and later |
+|---|---|---|---|
+| Windows, screenshots | grim | PrintWindow | screencapture |
+| Accessibility tree | AT-SPI | UI Automation | AX |
+| Click, scroll, drag, hover | in the compositor, to the app's own pointer | window messages posted to the window | events posted to the app's process |
+| Element click | at the element's centre | UI Automation Invoke, else its centre | AX Press, else its centre |
+| Keys and text | on your keymap, in the compositor | posted to the focused control, with its buttons and modifiers in the app's key state | posted to the app's process |
+| Hidden agent windows, adoption, private paste, `record`, recipes, `--session` | yes | no (`unavailable`) | no (`unavailable`) |
+
+On Hyprland every action is exact. On Windows and macOS, input posted to an app that is not in front reaches most
+standard controls. Some apps read the real keyboard or pointer and ignore it, such as games, many Electron and
+Chromium apps, and drag and drop. For those, pass `--take-focus`, which brings the window in front first, or
+`--take-pointer`, which uses your own pointer.
+macOS needs Accessibility and Screen Recording access for the app that runs deskpilot (your terminal, or the
+agent's app), granted in System Settings > Privacy & Security.
 
 ## Install
 
@@ -35,13 +63,14 @@ A local demo app, operated by Deskpilot with its real cursor and click feedback.
 uv tool install deskpilot
 ```
 
-The first input action builds and loads the plugin for your running Hyprland. Run `deskpilot plugin load` to
-prepare it ahead of time. The build needs the tools listed under [Requirements](#requirements).
+On Hyprland, the first input action builds and loads the plugin for your running compositor. Run
+`deskpilot plugin load` to prepare it ahead of time. The build needs the tools listed under
+[Requirements](#requirements). Windows and macOS need nothing beyond the package.
 
 For Claude Code, install the agent skill:
 
 ```text
-/plugin install deskpilot --marketplace cjber/deskpilot
+/plugin install deskpilot --marketplace agent-labs-dev/deskpilot
 ```
 
 For MCP clients, run `deskpilot mcp` over stdio. In Claude Code:
@@ -108,7 +137,7 @@ earlier actions stay done. Other agents and the user can act between steps.
 
 [Batch format and results](docs/reference.md#batch)
 
-## Record a demo from a recipe
+## Record a demo from a recipe (Hyprland)
 
 A recipe is a saved sequence of steps for one window, with the beats a viewer needs, recorded in one run:
 
@@ -124,7 +153,7 @@ file validates, and a failed step stops the run, keeps the recording and exits 2
 
 [Recipe format and recording](docs/recipes.md)
 
-## Work on your own hidden window
+## Work on your own hidden window (Hyprland)
 
 Set an agent name and launch a native Wayland app of your own:
 
@@ -181,6 +210,9 @@ user input. A private paste preserves your clipboard; apps that cannot receive o
 
 ## Requirements
 
+Python 3.12 or later and `uv` everywhere. On Windows and macOS that is all; macOS also needs the permissions under
+[Platforms](#platforms). On Linux:
+
 - Hyprland, with `hyprctl` on `PATH`. Version 0.57's Lua dispatchers and the older string ones both work.
 - The plugin build tools: a C++26 compiler, `make`, Hyprland's headers (`pkg-config hyprland`, shipped with
   Arch's `hyprland` package), `libxcb`, `libxkbcommon` and `cairo`.
@@ -188,7 +220,6 @@ user input. A private paste preserves your clipboard; apps that cannot receive o
 - `wl-clipboard` for `clipboard`.
 - For `--take-pointer`: write access to `/dev/uinput`, usually through the `input` group or a udev ACL. Check with
   `test -w /dev/uinput`.
-- Python 3.12 or later and `uv`.
 
 ## Documentation and contributing
 

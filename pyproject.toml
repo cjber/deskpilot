@@ -1,19 +1,29 @@
 [project]
 name = "deskpilot"
 version = "0.8.0"
-description = "Desktop control for agents on Hyprland: window-relative clicks that leave the user's pointer alone, and typing"
+description = "Give your agent a desktop: screenshots, accessibility trees, clicks and keys in a window, on Linux (Hyprland), Windows and macOS, without taking your pointer"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Cillian Berragan", email = "cjberragan@gmail.com" }]
 requires-python = ">=3.12"
-dependencies = ["evdev>=1.7", "jeepney>=0.8", "pillow>=10", "mcp>=2.3", "pydantic>=2.8"]
+dependencies = [
+  "evdev>=1.7; sys_platform == 'linux'",
+  "jeepney>=0.8",
+  "pillow>=10",
+  "mcp>=2.3",
+  "pydantic>=2.8",
+  "comtypes>=1.4; sys_platform == 'win32'",
+  "pyobjc-framework-Quartz>=11; sys_platform == 'darwin'",
+  "pyobjc-framework-ApplicationServices>=11; sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa>=11; sys_platform == 'darwin'",
+]
 
 [project.urls]
-Homepage = "https://github.com/cjber/deskpilot"
-Repository = "https://github.com/cjber/deskpilot"
-Issues = "https://github.com/cjber/deskpilot/issues"
-Changelog = "https://github.com/cjber/deskpilot/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/agent-labs-dev/deskpilot"
+Repository = "https://github.com/agent-labs-dev/deskpilot"
+Issues = "https://github.com/agent-labs-dev/deskpilot/issues"
+Changelog = "https://github.com/agent-labs-dev/deskpilot/blob/main/CHANGELOG.md"
 
 [project.scripts]
 deskpilot = "deskpilot.cli:main"
@@ -24,6 +34,12 @@ dev = ["fonttools>=4.58", "pytest>=8", "ruff>=0.12", "ty>=0.0.1"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Each driver uses its own platform's stdlib members and packages, which ty cannot see from Linux, where the gate
+# runs; the Windows and macOS CI jobs exercise them.
+[[tool.ty.overrides]]
+include = ["src/deskpilot/win32.py", "src/deskpilot/macos.py"]
+rules = { import-not-found = "ignore", missing-attribute = "ignore", missing-module-member = "ignore" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

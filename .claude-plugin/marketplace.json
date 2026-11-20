@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "deskpilot",
-  "description": "deskpilot: desktop control for agents on Hyprland, without taking the user's pointer.",
+  "description": "deskpilot: desktop control for agents on Linux, Windows and macOS, without taking the user's pointer.",
   "owner": {
     "name": "Cillian Berragan",
     "url": "https://github.com/cjber"
@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "deskpilot",
-      "description": "Click, scroll and type in Hyprland windows from a screenshot, in Wayland, XWayland and Wine apps, while the user keeps their pointer and focus.",
+      "description": "Click, scroll and type in desktop app windows from a screenshot or accessibility tree on Linux (Hyprland), Windows and macOS, while the user keeps their pointer and focus.",
       "source": "./",
       "category": "productivity"
     }

@@ -168,7 +168,7 @@ def test_a_failed_final_shot_keeps_the_completed_results(tmp_path, monkeypatch):
 
 
 def run_cli(monkeypatch, desk, argv, stdin=None):
-    monkeypatch.setattr(cli, "Desk", lambda: desk)
+    monkeypatch.setattr(cli, "open_desk", lambda: desk)
     if stdin is not None:
         monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
     return cli.main(["--json", "batch", *argv])
@@ -215,7 +215,7 @@ def test_the_cli_reports_a_missing_file_as_invalid(tmp_path, monkeypatch, capsys
 
 def test_a_cli_error_without_json_is_one_plain_line(tmp_path, monkeypatch, capsys):
     desk, _, _, _ = make_desk(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli, "Desk", lambda: desk)
+    monkeypatch.setattr(cli, "open_desk", lambda: desk)
     assert cli.main(["batch", "battle", str(tmp_path / "nope.json")]) == 2
     assert capsys.readouterr().err.startswith("deskpilot: invalid: cannot read")
 
